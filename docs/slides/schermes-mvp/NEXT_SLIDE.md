@@ -4,42 +4,51 @@ Read `docs/slides/schermes-mvp/OVERVIEW.md` (north star) and
 `docs/slides/schermes-mvp/PROGRESS.md` (what's already shipped) first.
 
 ## This slice
-Make the daemon exist. A Node 24 + TypeScript service under systemd that owns the single
-exposed port, persists to SQLite, forces the owner to set a password on first visit, and stores
-the model provider settings with the API key encrypted at rest. No agents, no desktops, no
-model calls yet — this slice is the spine everything later hangs off.
+Put agents under the daemon's control. Creating an agent through the API creates its Linux
+user, home layout and Xvnc desktop; the daemon knows which display belongs to which agent,
+survives a restart by adopting the desktops that are still alive, and respawns the ones that
+are not. This connects slice 1's shell scripts to slice 2's service.
+
+No model calls, no computer-use tools, no VNC in a browser yet — this slice is about the
+lifecycle and the ownership of a desktop, not about doing anything on it.
 
 ## Scope boundaries
 - Do:
-  - pnpm workspace at the repo root with `daemon` and `shared` packages, TypeScript strict.
-    (`ui` comes later; don't scaffold it now.)
-  - Hono HTTP server on one port (`SCHERMES_PORT`, default 7777), bound to `0.0.0.0` — it is
-    the only thing allowed off loopback. A `GET /api/health` that needs no auth.
-  - better-sqlite3 + Drizzle, migrations committed to the repo and applied on boot. Database at
-    `/var/lib/schermes/schermes.db`, owned by the `schermes` user.
-  - Owner auth: first visit to the API reports "setup required"; a setup endpoint sets the
-    single owner password (hashed with scrypt from `node:crypto` — no new dependency); a login
-    endpoint issues an HttpOnly session cookie; every other route requires it.
-  - Secrets: AES-GCM via `node:crypto`, master key in `/var/lib/schermes/master.key`, mode
-    0600, owned by `schermes`, generated on first boot. Settings endpoints for provider base
-    URL, model name and API key. The key must never come back in a response or reach a log.
-  - Structured JSON logging with a redaction step, so "no secrets in logs" is enforced in one
-    place rather than per call site.
-  - systemd unit installed by `infra/install.sh`, and the Docker entrypoint runs the daemon
-    instead of `sleep infinity`.
-  - Unit tests (node:test, no framework) for the secrets round-trip, the redaction step, and
-    the auth guard. A smoke script that curls health, setup, login and settings against the
-    running container.
+  - An `agents` table: name, display number, created timestamp, and whatever the desktop
+    supervisor needs to adopt a running display. Display numbers are allocated by the daemon
+    and unique per agent; `:0` stays reserved.
+  - A desktop module in the daemon that shells out to the existing
+    `infra/desktop/create-agent-user.sh` (via the `sudo` rule that already allows it) and
+    `infra/desktop/start-desktop.sh`, and probes a display with `xdpyinfo` to decide whether it
+    is alive. Reuse those scripts — do not reimplement their logic in TypeScript.
+  - Validate the agent name against `^[a-z0-9][a-z0-9-]{0,30}$` in the daemon before it reaches
+    a shell, even though the script validates too. Two boundaries, both cheap.
+  - REST behind the session guard: create an agent, list agents, fetch one. No delete — removing
+    a Linux user and its home is destructive and can wait until there is a UI to confirm it.
+  - On boot, reconcile: for every agent in the database, adopt its display if `xdpyinfo` answers
+    and respawn it if not. This is the same code path the daemon uses when creating an agent.
+  - Unit tests for name validation, display allocation (including reuse after a gap) and the
+    adopt-vs-respawn decision, with the spawn/probe boundary faked so they stay fast.
+  - Extend `infra/smoke.sh`, or add a sibling script, to create two agents through the API and
+    assert two live displays with distinct VNC ports — then assert the same after
+    `docker compose restart`, with the same process IDs, proving adoption rather than respawn.
 - Don't:
-  - Any UI, React or Vite. Any agent, desktop, worker or messaging code. Any real model call.
-  - Multi-user or roles — one owner, one password.
-  - TLS inside the product. Caddy in front stays the documented answer.
+  - Computer-use tools (screenshot, click, type), the terminal tool, or Chromium launching from
+    the daemon. Any model provider or agent loop. Messaging, task workers, the VNC WebSocket
+    proxy, noVNC, or any UI.
+  - Per-agent systemd units, or a desktop-per-container. The OVERVIEW's non-goals still hold.
+  - Widening `check.sh`'s loopback assertion. VNC stays on 127.0.0.1.
 
 ## Done when
-`docker compose up -d` starts the daemon, and the smoke script exits 0 against it: health
-responds, setup sets a password, login returns a session cookie, settings round-trip the base
-URL and model, and reading settings back never exposes the API key. `docker compose restart`
-preserves the password and settings. Unit tests pass. `check.sh` from slice 1 still exits 0,
-and the loopback assertion in it still holds with the daemon's port excluded explicitly.
+Two `POST`s to the agents endpoint produce two Linux users with their own homes and their own
+Xvnc displays, both listed by the API and both visible in `ss` on loopback-only VNC ports.
+`docker compose restart` brings the daemon back with both desktops adopted, not restarted, and
+killing one desktop before a restart gets it respawned. Unit tests pass, `pnpm check` is clean,
+`./infra/smoke.sh` exits 0, and
+`docker compose exec schermes /opt/schermes/infra/desktop/check.sh` still exits 0.
+
+Note: the Docker VM was at ~93% disk at the end of slice 2. If the image build fails on space,
+`docker builder prune -f` is the safe lever; leave images and volumes alone, they belong to
+other projects.
 
 When finished, run `/handoff`.
