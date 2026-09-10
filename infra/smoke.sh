@@ -162,14 +162,26 @@ wait_desktop() {
   fail "agent $name has no live desktop on :$display after 90s"
 }
 
+agent_home() { in_container sh -c "getent passwd agent-$1 | cut -d: -f6" | tr -d '\r'; }
+
 assert_desktops() {
-  local pair name display socket
+  local pair name display socket home
   for pair in "$agent_one:$display_one" "$agent_two:$display_two"; do
     name=${pair%:*} display=${pair#*:}
     wait_desktop "$name" "$display"
+
+    home=$(agent_home "$name")
+    [ -n "$home" ] || fail "agent $name has no linux user"
+    in_container test -d "$home/workspace" || fail "agent $name has no workspace in $home"
+    in_container test -d "$home/uploads" || fail "agent $name has no uploads dir in $home"
+    [ -n "$(in_container sh -c "pgrep -u agent-$name -f openbox | head -1")" ] \
+      || fail "agent $name has an X server but no window manager"
+
     socket=$(vnc_socket "$display")
     case "$socket" in
-      127.0.0.1:*) echo "   $name  :$display  vnc $socket  pid $(xvnc_pid "$name" "$display")" ;;
+      127.0.0.1:*)
+        echo "   $name  :$display  vnc $socket  pid $(xvnc_pid "$name" "$display")  home $home"
+        ;;
       *) fail "agent $name: vnc listens on $socket, which is not loopback" ;;
     esac
   done
