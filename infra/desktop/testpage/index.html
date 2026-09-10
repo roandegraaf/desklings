@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>schermes</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{background:#101820;color:#f2f5f7;display:flex;align-items:center;justify-content:center;
+       font:700 40px/1.35 system-ui,sans-serif;text-align:center;white-space:pre-line;
+       overflow-wrap:anywhere;padding:0 40px}
+</style>
+<div id="out">loading</div>
+<script>
+  var q = new URLSearchParams(location.search);
+  var agent = q.get("agent") || "?";
+  var want = q.get("set");
+  // The cookie name carries the nonce: names are stored in plaintext in the profile's
+  // Cookies database, so check.sh can tell when Chromium has committed the write to disk.
+  if (want) document.cookie = "schermes_" + want + "=1; max-age=86400; path=/";
+  var names = document.cookie.split(/;\s*/)
+    .map(function (c) { return c.split("=")[0]; })
+    .filter(function (n) { return n.indexOf("schermes_") === 0; })
+    .sort().join(",");
+  document.title = "SCHERMES agent=" + agent + " cookie=[" + names + "]";
+  document.getElementById("out").textContent = agent + "\n" + (names || "-");
+</script>

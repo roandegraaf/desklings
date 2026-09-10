@@ -1,0 +1,11 @@
+services:
+  schermes:
+    build: .
+    container_name: schermes
+    # tini reaps the detached Xvnc/Chromium processes that setsid reparents to PID 1.
+    init: true
+    shm_size: 1gb
+    # Chromium's own sandbox needs unshare(CLONE_NEWNET), which Docker's default seccomp
+    # profile denies. Relaxing the container is preferable to running Chromium --no-sandbox.
+    security_opt:
+      - seccomp=unconfined
