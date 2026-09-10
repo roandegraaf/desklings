@@ -4,51 +4,63 @@ Read `docs/slides/schermes-mvp/OVERVIEW.md` (north star) and
 `docs/slides/schermes-mvp/PROGRESS.md` (what's already shipped) first.
 
 ## This slice
-Put agents under the daemon's control. Creating an agent through the API creates its Linux
-user, home layout and Xvnc desktop; the daemon knows which display belongs to which agent,
-survives a restart by adopting the desktops that are still alive, and respawns the ones that
-are not. This connects slice 1's shell scripts to slice 2's service.
+Give the daemon hands. An agent's desktop and shell become things the daemon can act on:
+screenshot, mouse, keyboard, clipboard, and running a command as the agent user. These are the
+two tool interfaces the OVERVIEW names as boundaries, and everything after this slice — the
+agent loop, the browser, human takeover — calls through them.
 
-No model calls, no computer-use tools, no VNC in a browser yet — this slice is about the
-lifecycle and the ownership of a desktop, not about doing anything on it.
+Slice 3 gave every agent a Linux user and a live X display. Nothing has touched either yet.
+
+No model calls, no agent loop, no UI.
 
 ## Scope boundaries
 - Do:
-  - An `agents` table: name, display number, created timestamp, and whatever the desktop
-    supervisor needs to adopt a running display. Display numbers are allocated by the daemon
-    and unique per agent; `:0` stays reserved.
-  - A desktop module in the daemon that shells out to the existing
-    `infra/desktop/create-agent-user.sh` (via the `sudo` rule that already allows it) and
-    `infra/desktop/start-desktop.sh`, and probes a display with `xdpyinfo` to decide whether it
-    is alive. Reuse those scripts — do not reimplement their logic in TypeScript.
-  - Validate the agent name against `^[a-z0-9][a-z0-9-]{0,30}$` in the daemon before it reaches
-    a shell, even though the script validates too. Two boundaries, both cheap.
-  - REST behind the session guard: create an agent, list agents, fetch one. No delete — removing
-    a Linux user and its home is destructive and can wait until there is a UI to confirm it.
-  - On boot, reconcile: for every agent in the database, adopt its display if `xdpyinfo` answers
-    and respawn it if not. This is the same code path the daemon uses when creating an agent.
-  - Unit tests for name validation, display allocation (including reuse after a gap) and the
-    adopt-vs-respawn decision, with the spawn/probe boundary faked so they stay fast.
-  - Extend `infra/smoke.sh`, or add a sibling script, to create two agents through the API and
-    assert two live displays with distinct VNC ports — then assert the same after
-    `docker compose restart`, with the same process IDs, proving adoption rather than respawn.
+  - A computer-use module in the daemon: `screenshot`, `move`, `click`, `drag`, `scroll`,
+    `type`, `key`, and clipboard read/write, driven by `xdotool`, `scrot` and `xclip`, which
+    `install.sh` already provisions. One implementation behind a small interface, because the
+    OVERVIEW names this as a provider-agnostic boundary.
+  - A terminal module: run a command as the agent user, return stdout, stderr and the exit
+    code, enforce a timeout that actually kills the process, and support a background option
+    that returns without waiting. `sudo` strips the environment, so every invocation carries
+    `HOME`, `USER`, `LOGNAME`, `DISPLAY` and `XAUTHORITY` explicitly — the same rule
+    `start-desktop.sh` follows.
+  - Decide once how a screenshot crosses the API (base64 in JSON, or an image response) and
+    record the choice in `docs/architecture.md`. Whichever it is, the bytes must not go through
+    the logger.
+  - REST behind the session guard, per agent: one endpoint for a computer action and one for a
+    command. A request for an unknown agent is a 404; a request whose action or command is
+    malformed is a 400, decided in the daemon before anything reaches a shell.
+  - Unit tests with the spawn boundary faked: action validation (including rejecting an
+    unknown action and out-of-range coordinates), the argument list each action produces, the
+    timeout path, and a non-zero exit code being reported rather than thrown.
+  - Extend `infra/smoke.sh`: through the API, screenshot one of the smoke agents, perform an
+    action that visibly changes its desktop, screenshot again, and assert the two images
+    differ. Run a command and check its output and exit code; run one that exceeds its timeout
+    and check it is killed; run one in the background and check the call returns immediately.
+    `apt-get install` of a small package belongs here too — the sudoers rule already allows it
+    and the OVERVIEW's Definition of Done names it.
 - Don't:
-  - Computer-use tools (screenshot, click, type), the terminal tool, or Chromium launching from
-    the daemon. Any model provider or agent loop. Messaging, task workers, the VNC WebSocket
-    proxy, noVNC, or any UI.
-  - Per-agent systemd units, or a desktop-per-container. The OVERVIEW's non-goals still hold.
-  - Widening `check.sh`'s loopback assertion. VNC stays on 127.0.0.1.
+  - Any model provider or agent loop. Messaging, task workers, the VNC WebSocket proxy, noVNC,
+    or any UI. Input ownership and human takeover — that is its own slice and this one must not
+    guess at its shape.
+  - A browser tool or Chromium CDP. Launching Chromium is a use of the terminal tool, not a new
+    capability, and CDP is deferred in the OVERVIEW.
+  - tmux-backed persistent terminals. The OVERVIEW defers them; one command at a time is the
+    contract.
+  - Widening the sudoers rules. Everything this slice needs is already allowed: the daemon may
+    become any `agents` member, and agent users have passwordless sudo.
+  - Spawning desktops from anywhere new. If something in this slice needs its own display, it
+    needs its own range — the daemon owns `:1` upwards and `check.sh` owns `:101`-`:103`.
 
 ## Done when
-Two `POST`s to the agents endpoint produce two Linux users with their own homes and their own
-Xvnc displays, both listed by the API and both visible in `ss` on loopback-only VNC ports.
-`docker compose restart` brings the daemon back with both desktops adopted, not restarted, and
-killing one desktop before a restart gets it respawned. Unit tests pass, `pnpm check` is clean,
+Through the API, a caller with a session can take a screenshot of a running agent's desktop,
+drive its mouse and keyboard so that a second screenshot differs from the first, read and write
+its clipboard, run a shell command and get its output and exit code, have a command killed at
+its timeout, and install a package with `apt-get`. Unit tests pass, `pnpm check` is clean,
 `./infra/smoke.sh` exits 0, and
 `docker compose exec schermes /opt/schermes/infra/desktop/check.sh` still exits 0.
 
-Note: the Docker VM was at ~93% disk at the end of slice 2. If the image build fails on space,
-`docker builder prune -f` is the safe lever; leave images and volumes alone, they belong to
-other projects.
+Note: the Docker VM sits near 90% disk. `docker builder prune -f` is the safe lever; leave
+images and volumes alone, they belong to other projects.
 
 When finished, run `/handoff`.

@@ -71,6 +71,9 @@ Chromium CDP automation (deferred, optional add-on), desktop idle shutdown (defe
   messaging, secrets).
 - Project name is `schermes`. Use the term `task worker` everywhere.
 - Every slice keeps `docker compose up` working end to end.
+- Anything that must survive a daemon restart cannot be verified with `docker compose restart`:
+  that destroys the container's pid namespace, so detached processes die with it. Verify by
+  starting a second daemon against the same database, the way `systemctl restart schermes` does.
 
 ## Preconditions & external dependencies
 - Docker on the dev Mac (present, 29.x). Docker container will run Xvnc/Chromium; no GPU needed.
@@ -121,5 +124,6 @@ Chromium CDP automation (deferred, optional add-on), desktop idle shutdown (defe
 - [ ] Deployed and verified on the Unraid VM `[user-gated]`
 
 ## Open questions
-- Window manager choice (Openbox vs XFCE minimal) is decided in slice 1 by what works in Docker with lowest footprint.
-- Whether the daemon needs a small privileged helper (setuid or sudo wrapper) vs plain sudoers rules; decided in slice 1.
+Both questions this task opened are closed. Slice 1 chose **Openbox** over XFCE minimal by
+measurement, and **plain sudoers rules** over a privileged helper: two lines cover everything
+the daemon needs.
