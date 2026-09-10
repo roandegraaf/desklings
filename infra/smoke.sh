@@ -268,4 +268,163 @@ after_one=$(xvnc_pid "$agent_one" "$display_one")
 assert_desktops
 echo "   $agent_one respawned as pid $after_one, $agent_two untouched"
 
-printf '\nOK: health, setup, login, auth guard, settings, and two agents with adopted desktops\n'
+# ---------------------------------------------------------------- the tool layer
+
+computer() {
+  req POST "/api/agents/$agent_one/computer" "$1"
+}
+
+run_cmd() {
+  local cmd=$1 timeout=${2:-120000} background=${3:-false}
+  req POST "/api/agents/$agent_one/command" \
+    "$(jq -nc --arg c "$cmd" --argjson t "$timeout" --argjson b "$background" \
+       '{command: $c, timeoutMs: $t, background: $b}')"
+}
+
+screenshot() {
+  computer '{"action":"screenshot"}'
+  expect 200 "screenshot"
+  jq -r '.image.base64' "$tmp/body"
+}
+
+# Polls a command until it succeeds. Used instead of a flat sleep for anything the X server
+# does asynchronously, like mapping a new window.
+until_ok() {
+  local cmd=$1 tries=${2:-30} _
+  for _ in $(seq "$tries"); do
+    run_cmd "$cmd" 10000
+    jq -e '.exitCode == 0' "$tmp/body" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+say "the tool routes refuse what they cannot make sense of"
+req POST "/api/agents/nobody/computer" '{"action":"screenshot"}'
+expect 404 "computer on an unknown agent"
+req POST "/api/agents/nobody/command" '{"command":"id"}'
+expect 404 "command on an unknown agent"
+computer '{"action":"explode"}'
+expect 400 "unknown action"
+computer '{"action":"move","x":99999,"y":0}'
+expect 400 "out-of-range coordinates"
+computer '{"action":"key","keys":"ctrl+l; rm -rf /"}'
+expect 400 "a keystroke that is not a keystroke"
+run_cmd ""
+expect 400 "an empty command"
+req POST "/api/agents/$agent_one/command" '{"command":"id","timeoutMs":0}'
+expect 400 "a timeout below the floor"
+echo "   404s and 400s all behave"
+
+proof=.schermes-typed-proof
+say "resetting $agent_one's desktop so the run is repeatable"
+run_cmd "pkill -x xterm || true; rm -f ~/$proof"
+expect 200 "reset"
+sleep 2
+
+say "screenshot of the bare desktop"
+shot_bare=$(screenshot)
+case $shot_bare in
+  iVBORw0KGgo*) echo "   ${#shot_bare} base64 chars, PNG magic present" ;;
+  *) fail "the screenshot is not a PNG (starts with ${shot_bare:0:16})" ;;
+esac
+
+say "launching xterm in the background returns immediately"
+started=$(date +%s)
+run_cmd 'xterm -geometry 80x24+40+40' 5000 true
+expect 200 "background xterm"
+jq -e '.background == true and .exitCode == 0 and .stdout == ""' "$tmp/body" >/dev/null \
+  || fail "the background launch did not report as backgrounded: $(body)"
+elapsed=$(( $(date +%s) - started ))
+[ "$elapsed" -le 5 ] || fail "a background command took ${elapsed}s to return"
+echo "   returned in ${elapsed}s"
+
+until_ok 'xdotool search --onlyvisible --class xterm' \
+  || fail "xterm never mapped a window on $agent_one's desktop"
+# Keyboard actions go to the display, not to a window, so the target must hold focus first.
+until_ok 'xdotool search --onlyvisible --class xterm windowactivate --sync %1' \
+  || fail "could not activate the xterm window"
+
+say "the new window visibly changed the desktop"
+shot_xterm=$(screenshot)
+[ "$shot_xterm" != "$shot_bare" ] || fail "the screenshot did not change after xterm opened"
+echo "   ${#shot_bare} -> ${#shot_xterm} base64 chars, and the images differ"
+
+say "typed keystrokes reach the focused window"
+computer "$(jq -nc --arg t "touch ~/$proof" '{action: "type", text: $t}')"
+expect 200 "type"
+computer '{"action":"key","keys":"Return"}'
+expect 200 "key"
+until_ok "test -f ~/$proof" || fail "typing never produced ~/$proof, so the keys went nowhere"
+echo "   ~/$proof exists, so the keystrokes landed in the shell running in xterm"
+
+shot_typed=$(screenshot)
+[ "$shot_typed" != "$shot_xterm" ] || fail "the screenshot did not change after typing"
+[ "${#shot_typed}" -gt 5000 ] || fail "the screenshot looks blank (${#shot_typed} base64 chars)"
+
+say "mouse actions are accepted by the display"
+computer '{"action":"move","x":640,"y":400}'
+expect 200 "move"
+computer '{"action":"click","x":640,"y":400,"button":1}'
+expect 200 "click"
+computer '{"action":"drag","x":100,"y":100,"toX":300,"toY":300}'
+expect 200 "drag"
+computer '{"action":"scroll","x":640,"y":400,"direction":"down","amount":2}'
+expect 200 "scroll"
+echo "   move, click, drag and scroll all accepted"
+
+say "the clipboard round-trips"
+clip="schermes-clip-$$-$(date +%s)"
+computer "$(jq -nc --arg t "$clip" '{action: "clipboard_write", text: $t}')"
+expect 200 "clipboard write"
+computer '{"action":"clipboard_read"}'
+expect 200 "clipboard read"
+jq -e --arg c "$clip" '.text == $c' "$tmp/body" >/dev/null \
+  || fail "the clipboard did not round-trip: $(body)"
+echo "   read back $clip"
+
+say "a command reports its output and its exit code"
+run_cmd 'echo hello-stdout; echo hello-stderr >&2; exit 3'
+expect 200 "command with a non-zero exit"
+jq -e '.exitCode == 3 and .timedOut == false
+       and (.stdout | contains("hello-stdout"))
+       and (.stderr | contains("hello-stderr"))' "$tmp/body" >/dev/null \
+  || fail "the command result is wrong: $(body)"
+echo "   exit 3 reported as data, not as an error"
+
+say "the agent can create and edit a file in its workspace"
+run_cmd 'printf "one\n" > ~/workspace/smoke.txt && sed -i s/one/two/ ~/workspace/smoke.txt && cat ~/workspace/smoke.txt'
+expect 200 "file edit"
+jq -e '.exitCode == 0 and (.stdout | contains("two"))' "$tmp/body" >/dev/null \
+  || fail "the file was not created and edited: $(body)"
+
+say "a command that outruns its timeout is killed, children and all"
+started=$(date +%s)
+run_cmd 'sleep 300 | cat' 3000
+expect 200 "timed-out command"
+elapsed=$(( $(date +%s) - started ))
+jq -e '.timedOut == true and .exitCode == 124' "$tmp/body" >/dev/null \
+  || fail "the command was not reported as timed out: $(body)"
+[ "$elapsed" -le 20 ] || fail "the timeout took ${elapsed}s to fire"
+# `timeout` signals the whole process group, so the sleep must be gone too. Matched by process
+# name so the bash wrapper carrying the same text in its cmdline cannot be mistaken for it.
+sleep 2
+run_cmd 'pgrep -u $(id -un) -x sleep | wc -l'
+expect 200 "leftover sleep count"
+jq -e '(.stdout | ltrimstr(" ") | tonumber) == 0' "$tmp/body" >/dev/null \
+  || fail "the timeout left a child process behind: $(body)"
+echo "   killed after ${elapsed}s with nothing left running"
+
+say "the agent can install a package with apt-get"
+run_cmd 'sudo -n apt-get update -qq && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y hello' 300000
+expect 200 "apt-get install"
+jq -e '.exitCode == 0' "$tmp/body" >/dev/null || fail "apt-get install failed: $(body)"
+run_cmd 'hello' 10000
+expect 200 "run the installed package"
+jq -e '.exitCode == 0 and (.stdout | test("Hello"))' "$tmp/body" >/dev/null \
+  || fail "the installed package does not run: $(body)"
+echo "   installed hello and ran it"
+
+printf '\nOK: health, setup, login, auth guard, settings, two agents with adopted desktops,\n'
+printf '    and a tool layer that screenshots, drives input, uses the clipboard and runs commands\n'
+

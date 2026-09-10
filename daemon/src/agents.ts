@@ -6,6 +6,7 @@ import { config } from './config.ts';
 import { log } from './log.ts';
 import { agents } from './schema.ts';
 import type { Db } from './db.ts';
+import type { Exec } from './exec.ts';
 
 const run = promisify(execFile);
 
@@ -26,11 +27,51 @@ export const systemDesktop: DesktopOps = {
     const { stdout } = await run(
       `${config.desktopScripts}/start-desktop.sh`,
       [name, String(display)],
-      { env: { ...process.env, SCHERMES_STATE_DIR: config.dataDir } },
+      {
+        env: {
+          ...process.env,
+          SCHERMES_STATE_DIR: config.dataDir,
+          SCHERMES_GEOMETRY: `${config.screen.width}x${config.screen.height}`,
+        },
+      },
     );
     return stdout.startsWith('adopted') ? 'adopted' : 'started';
   },
 };
+
+/** Everything needed to act as an agent: who to become, where it lives, which display it owns. */
+export type AgentTarget = { user: string; home: string; display: number };
+
+export async function agentTarget(exec: Exec, agent: Agent): Promise<AgentTarget> {
+  const user = `agent-${agent.name}`;
+  const { code, stdout } = await exec('getent', ['passwd', user]);
+  const home = stdout.toString().trim().split(':')[5];
+  if (code !== 0 || home === undefined || home === '') {
+    throw new Error(`no home directory for ${user}`);
+  }
+  return { user, home, display: agent.display };
+}
+
+/**
+ * The argv that turns a command into that command run as the agent. `sudo` strips the
+ * environment, so all five variables an X client needs are passed explicitly, and `--chdir`
+ * comes before them because `env` treats the first non-assignment operand as the command.
+ */
+export function asAgent(target: AgentTarget, argv: readonly string[]): string[] {
+  return [
+    '-n',
+    '-u',
+    target.user,
+    'env',
+    `--chdir=${target.home}`,
+    `HOME=${target.home}`,
+    `USER=${target.user}`,
+    `LOGNAME=${target.user}`,
+    `DISPLAY=:${target.display}`,
+    `XAUTHORITY=${target.home}/.Xauthority`,
+    ...argv,
+  ];
+}
 
 export function listAgents(db: Db): Agent[] {
   return db.select().from(agents).orderBy(asc(agents.display)).all();

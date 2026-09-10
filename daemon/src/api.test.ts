@@ -9,6 +9,7 @@ import { openDb } from './db.ts';
 import { hashPassword, verifyPassword } from './auth.ts';
 import { loadMasterKey } from './secrets.ts';
 import { readApiKey } from './settings.ts';
+import type { Exec } from './exec.ts';
 
 const MIGRATIONS = resolve(import.meta.dirname, '../migrations');
 const PASSWORD = 'correct-horse-battery';
@@ -24,7 +25,19 @@ function fixture() {
       return Promise.resolve('started' as const);
     },
   };
-  return { db, masterKey, spawned, app: createApp({ db, masterKey, desktop }) };
+
+  const ran: string[][] = [];
+  const exec: Exec = (file, args) => {
+    ran.push([file, ...args]);
+    const user = String(args[1]);
+    const stdout =
+      file === 'getent'
+        ? Buffer.from(`${user}:x:1001:1001::/home/${user}:/bin/bash\n`)
+        : Buffer.from('tool output');
+    return Promise.resolve({ code: 0, stdout, stderr: '', truncated: false });
+  };
+
+  return { db, masterKey, spawned, ran, app: createApp({ db, masterKey, desktop, exec }) };
 }
 
 type App = ReturnType<typeof createApp>;
@@ -191,4 +204,57 @@ test('the agent routes are behind the session guard', async () => {
   await post(app, '/api/auth/setup', { password: PASSWORD });
   assert.equal((await app.request('/api/agents')).status, 401);
   assert.equal((await post(app, '/api/agents', { name: 'alpha' })).status, 401);
+  assert.equal((await post(app, '/api/agents/alpha/computer', { action: 'screenshot' })).status, 401);
+  assert.equal((await post(app, '/api/agents/alpha/command', { command: 'id' })).status, 401);
+});
+
+test('the tool routes run as the agent, 404 an unknown one and 400 a malformed request', async () => {
+  const { app, ran } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  await post(app, '/api/agents', { name: 'alpha' }, cookie);
+
+  const shot = await post(app, '/api/agents/alpha/computer', { action: 'screenshot' }, cookie);
+  assert.equal(shot.status, 200);
+  assert.deepEqual(await json(shot), {
+    action: 'screenshot',
+    image: { mediaType: 'image/png', base64: Buffer.from('tool output').toString('base64') },
+  });
+
+  const command = await post(app, '/api/agents/alpha/command', { command: 'id' }, cookie);
+  assert.equal(command.status, 200);
+  assert.deepEqual(await json(command), {
+    exitCode: 0,
+    stdout: 'tool output',
+    stderr: '',
+    timedOut: false,
+    background: false,
+  });
+
+  const sudoed = ran.filter(([file]) => file === 'sudo');
+  assert.equal(sudoed.length, 2);
+  for (const argv of sudoed) {
+    assert.deepEqual(argv.slice(0, 4), ['sudo', '-n', '-u', 'agent-alpha']);
+    assert.ok(argv.includes('DISPLAY=:1'), 'the agent display is passed through');
+  }
+
+  for (const path of ['/api/agents/nobody/computer', '/api/agents/nobody/command']) {
+    assert.equal((await post(app, path, { action: 'screenshot', command: 'id' }, cookie)).status, 404);
+  }
+
+  assert.equal(
+    (await post(app, '/api/agents/alpha/computer', { action: 'explode' }, cookie)).status,
+    400,
+  );
+  assert.equal(
+    (await post(app, '/api/agents/alpha/computer', { action: 'move', x: 99999, y: 0 }, cookie)).status,
+    400,
+  );
+  assert.equal((await post(app, '/api/agents/alpha/command', { command: '' }, cookie)).status, 400);
+});
+
+test('an unknown agent is refused before the daemon shells out at all', async () => {
+  const { app, ran } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  await post(app, '/api/agents/nobody/command', { command: 'id' }, cookie);
+  assert.deepEqual(ran, []);
 });

@@ -169,6 +169,57 @@ boot. Only `systemctl restart schermes` on a real host leaves desktops running f
 adopt. `infra/smoke.sh` therefore exercises adoption by starting a second daemon against the
 same database while the first one's desktops are up, which is the situation systemd creates.
 
+### Computer use and the terminal
+
+**Requirement** — the daemon can act on an agent's desktop and shell. Both are provider-agnostic
+interfaces the rest of the system calls through: the agent loop, the browser and human takeover
+all end up here rather than shelling out for themselves.
+
+- **Requirement** — one spawn boundary, `daemon/src/exec.ts`. Every module above it takes it as
+  a parameter, so unit tests assert on the argument list a request produces without spawning
+  anything. It caps collected output, because a command the agent chose could otherwise pour
+  `/dev/urandom` into the daemon's heap, and truncation is reported in the output the caller
+  sees rather than silently.
+- **Requirement** — every invocation carries `HOME`, `USER`, `LOGNAME`, `DISPLAY` and
+  `XAUTHORITY` explicitly, because `sudo` strips the environment. `env --chdir` sets the working
+  directory to the agent's home and must come before the assignments, or `env` reads it as the
+  command to run.
+- **Requirement** — a screenshot crosses the API as base64 PNG in the JSON body, not as an image
+  response. The model provider wants exactly that encoding for a vision message, so returning
+  bytes would mean encoding them again one layer up, and every action then shares one response
+  shape. The bytes never reach the logger: routes log the action name and the exit code, never
+  the result, and `redact()` has no `Buffer` branch, so a result object passed to it would
+  explode into per-byte JSON.
+- `scrot -` writes to `/dev/stdout` **by path**, which the agent user cannot open across the uid
+  change, so the capture lands in the agent's own home and `cat` returns it over the inherited
+  descriptor. Typed text and clipboard writes travel on stdin — `xdotool type --file -` and
+  `xclip -i` — so free text never needs shell quoting and never appears in the process list.
+- `xclip` forks into the background to own the selection, which is what makes the clipboard
+  persist. Its stdio is redirected inside the shell; otherwise that fork holds the daemon's
+  pipe open and the call never returns. An empty clipboard makes `xclip -o` exit non-zero, which
+  the daemon reports as empty text rather than as a failure.
+- **Requirement** — a command's timeout is enforced by GNU `timeout` inside the sudo, not by
+  killing the process from Node. `timeout` runs the command in its own process group and signals
+  the group, so a command that spawned children does not leave them behind; killing `sudo` from
+  outside would not reach them. Exit 124 is reported as `timedOut`. The daemon keeps a longer
+  timer as a backstop against a wedged `sudo`, nothing more.
+- A background command is `setsid --fork bash -c 'exec >/dev/null 2>&1 </dev/null; ...'`. The
+  redirect has to be an `exec`, not a redirect on the command: bash keeps its own descriptors
+  for its whole lifetime, so redirecting only the command leaves the shell holding the daemon's
+  stdout pipe until the detached job finishes, and the request never completes. `close` fires on
+  stdio EOF, not on exit, so the daemon also drops the pipes two seconds after a process exits
+  rather than waiting on a grandchild forever. A background command's output is the caller's to
+  redirect; the daemon does not collect it.
+- **Requirement** — actions are validated in the daemon before anything reaches a shell:
+  an unknown action, a coordinate outside the screen, a button that is not 1-3, or a keystroke
+  that does not look like `Return` or `ctrl+shift+t` is a 400. `SCHERMES_GEOMETRY` is the single
+  source of both the size Xvnc is started with and the bound coordinates are checked against,
+  so the two cannot drift. A desktop adopted from an older geometry can still differ, so treat
+  the bound as a filter for garbage rather than a promise the pixel exists; xdotool clamps.
+- **Deferred** — persistent terminals. One command at a time is the contract; a tmux-backed
+  session is a later slice if it is ever needed. Launching Chromium is a use of the terminal
+  tool, not a capability of its own.
+
 ### Secrets and logging
 
 - **Requirement** — the provider API key is AES-256-GCM encrypted with a 32-byte master key at

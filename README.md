@@ -8,15 +8,18 @@ MIT licensed. One repository. No Kubernetes, no container per agent, no cloud ac
 
 ## Status
 
-Early. Three pieces work. The desktop foundation: `install.sh` provisions a Debian 13 host, and
+Early. Four pieces work. The desktop foundation: `install.sh` provisions a Debian 13 host, and
 several agents run concurrent Xvnc desktops with their own Chromium profiles, controllable
 through xdotool and observable through scrot. The daemon: a Node service under systemd that
 owns the single web port, persists to SQLite, makes you set an owner password on first visit,
 and stores the model provider settings with the API key encrypted at rest. Agent lifecycle:
 creating an agent through the API creates its Linux user, home layout and X display, and a
-restarted daemon adopts the desktops that are still running instead of respawning them.
+restarted daemon adopts the desktops that are still running instead of respawning them. The
+tool layer: through the API you can screenshot an agent's desktop, drive its mouse and keyboard,
+read and write its clipboard, and run shell commands as it, with a timeout that kills the whole
+process group and a background option that returns straight away.
 
-Model calls, computer use and the UI are not built yet.
+Model calls, messaging and the UI are not built yet.
 
 ## Try the dev harness
 
@@ -35,7 +38,10 @@ refused, an unauthenticated request being rejected, login, and the settings roun
 API key going in but never coming back. It then creates two agents and proves they get their own
 desktops on loopback-only VNC ports, that they survive a container restart, that a second daemon
 adopts them rather than respawning them, and that a desktop killed underneath the daemon comes
-back.
+back. Finally it drives one of those agents: a screenshot of the bare desktop, an xterm launched
+in the background, a second screenshot that differs, keystrokes that create a file inside that
+xterm, a clipboard round-trip, a command reporting a non-zero exit code, a command killed at its
+timeout with nothing left running, and `apt-get install`.
 
 `check.sh` creates three agents, gives each a desktop and a Chromium profile, types a URL into
 each browser, captures a screenshot per desktop, verifies a cookie survives a Chromium restart,
@@ -53,10 +59,11 @@ pnpm check   # TypeScript, strict
 
 ## Configuration
 
-| Variable             | Default              | Meaning                             |
-| -------------------- | -------------------- | ----------------------------------- |
-| `SCHERMES_PORT`      | `7777`               | The one port schermes exposes       |
-| `SCHERMES_DATA_DIR`  | `/var/lib/schermes`  | SQLite database and the master key   |
+| Variable            | Default             | Meaning                                |
+| ------------------- | ------------------- | -------------------------------------- |
+| `SCHERMES_PORT`     | `7777`              | The one port schermes exposes          |
+| `SCHERMES_DATA_DIR` | `/var/lib/schermes` | SQLite database and the master key     |
+| `SCHERMES_GEOMETRY` | `1280x800`          | Desktop size, and the coordinate bound |
 
 schermes speaks plain HTTP. Put Caddy or nginx in front of it for TLS.
 

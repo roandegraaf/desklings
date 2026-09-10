@@ -21,12 +21,17 @@ import {
 } from './settings.ts';
 import {
   AGENT_NAME,
+  agentTarget,
   findAgent,
   forgetAgent,
   insertAgent,
   listAgents,
 } from './agents.ts';
 import type { DesktopOps } from './agents.ts';
+import { parseComputerAction, performComputerAction } from './computer.ts';
+import { parseCommand, runCommand } from './terminal.ts';
+import { config } from './config.ts';
+import type { Exec } from './exec.ts';
 import { log } from './log.ts';
 
 const PUBLIC_PATHS = new Set(['/api/health', '/api/auth/setup', '/api/auth/login']);
@@ -55,9 +60,9 @@ function validBaseUrl(value: string): boolean {
   }
 }
 
-export type AppDeps = { db: Db; masterKey: Buffer; desktop: DesktopOps };
+export type AppDeps = { db: Db; masterKey: Buffer; desktop: DesktopOps; exec: Exec };
 
-export function createApp({ db, masterKey, desktop }: AppDeps) {
+export function createApp({ db, masterKey, desktop, exec }: AppDeps) {
   const app = new Hono();
 
   // Registered before any route so unlisted paths are denied by default.
@@ -140,6 +145,46 @@ export function createApp({ db, masterKey, desktop }: AppDeps) {
     }
 
     return c.json(agent, 201);
+  });
+
+  app.post('/api/agents/:name/computer', async (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
+
+    const action = parseComputerAction(await jsonBody(c), config.screen);
+    if ('error' in action) return c.json({ error: action.error }, 400);
+
+    try {
+      const target = await agentTarget(exec, agent);
+      // The result carries screenshot bytes, so it never goes near the logger.
+      return c.json(await performComputerAction(exec, target, action));
+    } catch (error) {
+      log.error('computer action failed', { agent: agent.name, action: action.action, error });
+      return c.json({ error: 'computer action failed' }, 500);
+    }
+  });
+
+  app.post('/api/agents/:name/command', async (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
+
+    const request = parseCommand(await jsonBody(c));
+    if ('error' in request) return c.json({ error: request.error }, 400);
+
+    try {
+      const result = await runCommand(exec, await agentTarget(exec, agent), request);
+      // Neither the command nor its output is logged: both are free text the agent chose.
+      log.info('command run', {
+        agent: agent.name,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        background: result.background,
+      });
+      return c.json(result);
+    } catch (error) {
+      log.error('command failed', { agent: agent.name, error });
+      return c.json({ error: 'command failed' }, 500);
+    }
   });
 
   return app;

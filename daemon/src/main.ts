@@ -6,12 +6,13 @@ import { loadMasterKey } from './secrets.ts';
 import { log } from './log.ts';
 import { openDb } from './db.ts';
 import { reconcileDesktops, systemDesktop } from './agents.ts';
+import { systemExec } from './exec.ts';
 
 mkdirSync(config.dataDir, { recursive: true });
 
 const db = openDb(config.dbPath, config.migrationsDir);
 const masterKey = loadMasterKey(config.masterKeyPath);
-const app = createApp({ db, masterKey, desktop: systemDesktop });
+const app = createApp({ db, masterKey, desktop: systemDesktop, exec: systemExec });
 
 const server = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, (info) => {
   log.info('daemon listening', { host: config.host, port: info.port, dataDir: config.dataDir });

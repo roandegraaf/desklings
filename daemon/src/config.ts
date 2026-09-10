@@ -9,6 +9,19 @@ function port(): number {
   return value;
 }
 
+// Both the size Xvnc is started with and the bound coordinates are validated against, so the
+// two cannot drift apart.
+function screen(): { width: number; height: number } {
+  const raw = process.env['SCHERMES_GEOMETRY'] ?? '1280x800';
+  const match = /^(\d{2,5})x(\d{2,5})$/.exec(raw);
+  const width = Number(match?.[1]);
+  const height = Number(match?.[2]);
+  if (!Number.isInteger(width) || !Number.isInteger(height)) {
+    throw new Error(`SCHERMES_GEOMETRY must be WIDTHxHEIGHT, got ${JSON.stringify(raw)}`);
+  }
+  return { width, height };
+}
+
 const dataDir = process.env['SCHERMES_DATA_DIR'] ?? '/var/lib/schermes';
 
 export const config = {
@@ -16,6 +29,7 @@ export const config = {
   // The web port is the one thing schermes exposes; everything else stays on loopback.
   host: '0.0.0.0',
   dataDir,
+  screen: screen(),
   dbPath: resolve(dataDir, 'schermes.db'),
   masterKeyPath: resolve(dataDir, 'master.key'),
   migrationsDir: resolve(import.meta.dirname, '../migrations'),
