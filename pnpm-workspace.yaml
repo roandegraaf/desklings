@@ -1,0 +1,9 @@
+packages:
+  - shared
+  - daemon
+
+# better-sqlite3 fetches its prebuilt binary and drizzle-kit's esbuild links its own;
+# pnpm blocks postinstall scripts unless they are listed here.
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true

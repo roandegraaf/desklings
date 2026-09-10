@@ -7,7 +7,7 @@
 set -euo pipefail
 
 if [ "$(id -u)" -eq 0 ]; then
-  exec sudo -u schermes -H "$0" "$@"
+  exec sudo -u schermes -H env SCHERMES_PORT="${SCHERMES_PORT:-7777}" "$0" "$@"
 fi
 
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -149,13 +149,25 @@ for i in "${!agents[@]}"; do
   esac
 done
 
-say "nothing listens outside loopback"
-ss -ltnH | awk '{print $4}' | sed 's/:[0-9]*$//' | sort -u | while read -r addr; do
-  case "$addr" in
-    127.*|'[::1]'|::1) echo "   ok   $addr" ;;
-    *) echo "   BAD  $addr"; exit 1 ;;
+say "only the schermes web port listens outside loopback"
+# Compare the whole addr:port. Stripping the port would let a later slice bind something like
+# 0.0.0.0:5900 and still pass, which is exactly what this assertion exists to catch.
+web_port=${SCHERMES_PORT:-7777}
+ss -ltnH | awk '{print $4}' | sort -u | while read -r sock; do
+  case "${sock%:*}" in
+    127.*|'[::1]'|::1|'[::ffff:127.0.0.1]')
+      echo "   ok   $sock"
+      ;;
+    *)
+      if [ "${sock##*:}" = "$web_port" ]; then
+        echo "   ok   $sock (schermes web port)"
+      else
+        echo "   BAD  $sock"
+        exit 1
+      fi
+      ;;
   esac
 done || fail "a listening socket is bound outside loopback"
 
-printf '\nOK: %d desktops, %d chromium profiles, cookies persisted, loopback only\n' \
-  "${#agents[@]}" "${#agents[@]}"
+printf '\nOK: %d desktops, %d chromium profiles, cookies persisted, only :%s off loopback\n' \
+  "${#agents[@]}" "${#agents[@]}" "$web_port"

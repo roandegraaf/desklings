@@ -1,0 +1,25 @@
+{
+  "name": "@schermes/daemon",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.ts",
+    "dev": "node --watch src/main.ts",
+    "check": "tsc -p tsconfig.json",
+    "test": "node --test src/*.test.ts",
+    "migrations": "drizzle-kit generate"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "@schermes/shared": "workspace:*",
+    "better-sqlite3": "^13.0.3",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.13.7"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "drizzle-kit": "^0.31.10",
+    "typescript": "^7.0.2"
+  }
+}

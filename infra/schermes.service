@@ -1,0 +1,19 @@
+[Unit]
+Description=schermes daemon
+After=network.target
+
+[Service]
+Type=simple
+User=schermes
+Group=schermes
+WorkingDirectory=/opt/schermes
+Environment=NODE_ENV=production
+# Node 24 strips TypeScript types on load, so the daemon runs from source with no build step.
+ExecStart=/usr/local/bin/node /opt/schermes/daemon/src/main.ts
+Restart=always
+RestartSec=2
+
+# Deliberately no NoNewPrivileges: the daemon reaches agent users through sudo.
+
+[Install]
+WantedBy=multi-user.target

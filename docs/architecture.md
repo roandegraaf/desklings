@@ -83,16 +83,84 @@ UI, Hono for HTTP and WebSockets, better-sqlite3 with Drizzle for persistence, p
 No Next.js and no SSR: the UI is a static bundle the daemon serves.
 
 Node is installed from the official tarball into `/opt/node` rather than from Debian, which
-ships an older major. `install.sh` resolves the current 24.x release at install time.
+ships an older major. `install.sh` resolves the current 24.x release at install time and
+symlinks `node`, `npm`, `npx` and `pnpm` into `/usr/local/bin`. pnpm is pinned to the version
+in the root `package.json`'s `packageManager` field, so the installer and the committed
+lockfile cannot disagree; change both together.
 
 The host also carries the tools an agent is expected to reach for: Python with `uv`, git, ssh,
 build-essential, jq, ripgrep, poppler-utils, ImageMagick, and an xterm.
+
+## Daemon
+
+The daemon is the only process that listens off loopback. It owns the database and the
+settings today, and the agents, desktops and messaging from later slices.
+
+- **Requirement** — one HTTP port, `SCHERMES_PORT` (default 7777), bound to `0.0.0.0`. Nothing
+  else in the product may bind off loopback. `infra/desktop/check.sh` asserts that by comparing
+  the whole `address:port` of every listening socket and allowing exactly that one entry.
+  Comparing the address alone would let a later slice expose a VNC port and still pass.
+- **Recommendation** — no build step. Node 24 strips TypeScript types on load, so systemd and
+  the container both run `daemon/src/main.ts` from source. `tsc` is used only for `--noEmit`
+  checking. That removes a `dist/` tree and, with it, the class of bug where a path resolved
+  against the working directory works in development and breaks under systemd, which starts
+  services from `/`.
+- **Requirement** — Drizzle migrations are committed under `daemon/migrations/` and applied on
+  boot. The folder is resolved from `import.meta.dirname`, never from the working directory.
+- **Requirement** — durable state is `/var/lib/schermes/schermes.db`, inside the service user's
+  home. The Docker harness deliberately gives it no volume: a fresh volume would mask the
+  directories `install.sh` creates with the right ownership, and the daemon is unprivileged, so
+  it could not repair them.
+
+### Owner authentication
+
+**Requirement** — one owner, one password, no user table. First contact with the API reports
+`setupRequired`; a one-time setup endpoint claims the owner row; everything except health,
+setup and login needs a session.
+
+- Setup necessarily sits outside the session guard, which makes it the sharpest edge in the
+  daemon. It claims the owner row with a conditional insert rather than a read-then-write, so
+  it cannot be raced, and it fails with 409 once an owner exists. Otherwise it would be an
+  unauthenticated password reset.
+- The guard is registered before any route and denies by default. A path that is not on the
+  short public allowlist needs a session, including paths that do not exist.
+- Passwords are scrypt from `node:crypto`. `N=16384` is chosen to stay inside Node's default
+  32 MiB `maxmem`; a larger cost parameter throws instead of hashing. Comparison is
+  `timingSafeEqual` after a length check, which that function requires.
+- **Requirement** — the session cookie is `HttpOnly` and `SameSite=Lax` but deliberately not
+  `Secure`. schermes speaks plain HTTP by design and TLS terminates in a proxy in front of it.
+  A `Secure` cookie would be dropped over plain HTTP and login would fail with no visible error.
+- Sessions live in SQLite rather than daemon memory, so restarting the daemon does not log the
+  owner out, and later slices get session rows they can reason about.
+
+### Secrets and logging
+
+- **Requirement** — the provider API key is AES-256-GCM encrypted with a 32-byte master key at
+  `/var/lib/schermes/master.key`, mode 0600, owned by `schermes`, generated on first boot. The
+  file is created with an exclusive open, so two daemons starting at once cannot both generate
+  a key and leave one of them unable to decrypt.
+- **Requirement** — the API key is never returned by the API. Reading settings reports
+  `apiKeySet` as a boolean and nothing else.
+- **Requirement** — logs are structured JSON written through one function that recursively
+  redacts secret-looking field names before serialising. Redaction is by key name, which cannot
+  catch a secret pasted into free text, so routes do not log request bodies at all. That keeps
+  the settings endpoint off the leak path entirely rather than relying on the filter.
 
 ## Docker dev harness
 
 **Recommendation** — the harness is a convenience for developing on macOS, not a deployment
 target. It builds `debian:trixie`, runs the real `infra/install.sh`, and is therefore the same
 machine a VM would be.
+
+`install.sh` stays the single provisioning path, but the image splits the dependency install
+out of it. `install.sh` runs first and on its own layer, because it is a full apt cycle plus a
+Node download and must not be invalidated by a source edit; the manifests and `pnpm install`
+come next; the sources come last. `install.sh` installs dependencies itself only when the
+repository is already present, which is true on a real host and false in the image, so neither
+path does it twice.
+
+The container command drops to the `schermes` user with `setpriv` rather than `su`. It execs in
+place, so signals from `docker compose stop` reach the daemon instead of a shell.
 
 Two container settings are load-bearing:
 

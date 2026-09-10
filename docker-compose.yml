@@ -9,3 +9,8 @@ services:
     # profile denies. Relaxing the container is preferable to running Chromium --no-sandbox.
     security_opt:
       - seccomp=unconfined
+    # The web port is the only thing schermes exposes.
+    ports:
+      - "127.0.0.1:${SCHERMES_PORT:-7777}:${SCHERMES_PORT:-7777}"
+    environment:
+      SCHERMES_PORT: "${SCHERMES_PORT:-7777}"

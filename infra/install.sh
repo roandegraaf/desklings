@@ -6,8 +6,11 @@ set -euo pipefail
 SCHERMES_HOME=/var/lib/schermes
 SHARED_DIR=/srv/schermes/shared
 NODE_MAJOR=24
+PNPM_VERSION=11.15.1
 
 log() { printf '\n== %s\n' "$*"; }
+
+here=$(cd -- "$(dirname -- "$0")" && pwd)
 
 [ "$(id -u)" -eq 0 ] || { echo "install.sh must run as root" >&2; exit 1; }
 
@@ -25,7 +28,7 @@ apt-get install -y --no-install-recommends \
 rm -rf /var/lib/apt/lists/*
 
 log "node ${NODE_MAJOR} + pnpm"
-if ! node --version 2>/dev/null | grep -q "^v${NODE_MAJOR}\."; then
+if ! /opt/node/bin/node --version 2>/dev/null | grep -q "^v${NODE_MAJOR}\."; then
   case "$(uname -m)" in
     aarch64|arm64) node_arch=arm64 ;;
     x86_64|amd64)  node_arch=x64 ;;
@@ -38,11 +41,15 @@ if ! node --version 2>/dev/null | grep -q "^v${NODE_MAJOR}\."; then
   mkdir -p /opt/node
   curl -fsSL "https://nodejs.org/dist/latest-v${NODE_MAJOR}.x/${tarball}" \
     | tar -xJ -C /opt/node --strip-components=1
-  ln -sfn /opt/node/bin/node /usr/local/bin/node
-  ln -sfn /opt/node/bin/npm /usr/local/bin/npm
-  ln -sfn /opt/node/bin/npx /usr/local/bin/npx
 fi
-command -v pnpm >/dev/null || npm install -g --silent pnpm
+# Linking outside the block above keeps the symlinks correct after a node upgrade.
+for bin in node npm npx; do ln -sfn "/opt/node/bin/$bin" "/usr/local/bin/$bin"; done
+# Pinned to the packageManager field of the repo's package.json, so the lockfile and the
+# installer agree. Update both together.
+pnpm --version 2>/dev/null | grep -qx "$PNPM_VERSION" \
+  || npm install -g --silent "pnpm@${PNPM_VERSION}"
+# npm installs pnpm into /opt/node/bin, which is not on PATH.
+ln -sfn /opt/node/bin/pnpm /usr/local/bin/pnpm
 
 log "uv"
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh \
@@ -74,5 +81,19 @@ for f in schermes agents; do
   install -o root -g root -m 0440 "/etc/sudoers.d/$f.tmp" "/etc/sudoers.d/$f"
   rm -f "/etc/sudoers.d/$f.tmp"
 done
+
+log "daemon"
+install -o root -g root -m 0644 "$here/schermes.service" /etc/systemd/system/schermes.service
+# In the Docker image this runs before any source exists, so it is a no-op there and the
+# Dockerfile installs dependencies in its own cache-friendly layer instead. On a real host the
+# repository is already in place, which makes install.sh the single provisioning path.
+if [ -f /opt/schermes/package.json ]; then
+  ( cd /opt/schermes && pnpm install --frozen-lockfile --prod )
+fi
+# systemctl is unavailable in the Docker harness, where the daemon is the container command.
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload
+  systemctl enable schermes.service
+fi
 
 log "done: $(node --version), $(chromium --version), openbox $(openbox --version | head -1 | awk '{print $2}')"
