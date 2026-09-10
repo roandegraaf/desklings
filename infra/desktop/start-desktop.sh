@@ -29,6 +29,12 @@ if as_agent xdpyinfo >/dev/null 2>&1; then
   exit 0
 fi
 
+# The probe above proved nothing is serving this display, so any lock left here is stale. The
+# X server clears a stale lock only when the pid inside it is dead, and pids recycle — after a
+# container restart a leftover lock can name a pid that now belongs to something else, which
+# aborts Xvnc with "server is already active".
+as_agent rm -f "/tmp/.X$display-lock" "/tmp/.X11-unix/X$display" || true
+
 as_agent sh -c 'touch "$XAUTHORITY" && xauth -q -f "$XAUTHORITY" add "$DISPLAY" . "$(mcookie)"'
 
 as_agent setsid --fork Xvnc ":$display" \

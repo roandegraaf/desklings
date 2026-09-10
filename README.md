@@ -8,13 +8,15 @@ MIT licensed. One repository. No Kubernetes, no container per agent, no cloud ac
 
 ## Status
 
-Early. Two pieces work. The desktop foundation: `install.sh` provisions a Debian 13 host, and
+Early. Three pieces work. The desktop foundation: `install.sh` provisions a Debian 13 host, and
 several agents run concurrent Xvnc desktops with their own Chromium profiles, controllable
 through xdotool and observable through scrot. The daemon: a Node service under systemd that
 owns the single web port, persists to SQLite, makes you set an owner password on first visit,
-and stores the model provider settings with the API key encrypted at rest.
+and stores the model provider settings with the API key encrypted at rest. Agent lifecycle:
+creating an agent through the API creates its Linux user, home layout and X display, and a
+restarted daemon adopts the desktops that are still running instead of respawning them.
 
-Agents, desktop supervision, model calls and the UI are not built yet.
+Model calls, computer use and the UI are not built yet.
 
 ## Try the dev harness
 
@@ -30,7 +32,10 @@ docker compose exec schermes /opt/schermes/infra/desktop/check.sh # the desktops
 
 `smoke.sh` walks the API: health, the first-run password, the second setup attempt being
 refused, an unauthenticated request being rejected, login, and the settings round-trip with the
-API key going in but never coming back.
+API key going in but never coming back. It then creates two agents and proves they get their own
+desktops on loopback-only VNC ports, that they survive a container restart, that a second daemon
+adopts them rather than respawning them, and that a desktop killed underneath the daemon comes
+back.
 
 `check.sh` creates three agents, gives each a desktop and a Chromium profile, types a URL into
 each browser, captures a screenshot per desktop, verifies a cookie survives a Chromium restart,
@@ -58,7 +63,7 @@ schermes speaks plain HTTP. Put Caddy or nginx in front of it for TLS.
 ## Layout
 
 ```
-daemon/src/                          the service: HTTP, auth, secrets, persistence
+daemon/src/                          the service: HTTP, auth, secrets, agents, persistence
 daemon/migrations/                   Drizzle migrations, committed and applied on boot
 shared/src/                          types the daemon and the future UI both use
 infra/install.sh                     idempotent Debian 13 provisioning

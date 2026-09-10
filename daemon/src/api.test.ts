@@ -16,7 +16,15 @@ const PASSWORD = 'correct-horse-battery';
 function fixture() {
   const db = openDb(':memory:', MIGRATIONS);
   const masterKey = loadMasterKey(join(mkdtempSync(join(tmpdir(), 'schermes-api-')), 'master.key'));
-  return { db, masterKey, app: createApp({ db, masterKey }) };
+  const spawned: string[] = [];
+  const desktop = {
+    ensure(name: string) {
+      if (name === 'unspawnable') return Promise.reject(new Error('Xvnc did not come up'));
+      spawned.push(name);
+      return Promise.resolve('started' as const);
+    },
+  };
+  return { db, masterKey, spawned, app: createApp({ db, masterKey, desktop }) };
 }
 
 type App = ReturnType<typeof createApp>;
@@ -124,4 +132,63 @@ test('a password verifies only against its own hash', () => {
   assert.ok(!verifyPassword('wrong', stored));
   assert.ok(!verifyPassword(PASSWORD, 'garbage'));
   assert.ok(!verifyPassword(PASSWORD, `${stored}$extra`));
+});
+
+test('creating an agent allocates a display and gives it a desktop', async () => {
+  const { app, spawned } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+
+  const created = await post(app, '/api/agents', { name: 'alpha' }, cookie);
+  assert.equal(created.status, 201);
+  const alpha = await json(created);
+  assert.equal(alpha['name'], 'alpha');
+  assert.equal(alpha['display'], 1);
+  assert.deepEqual(spawned, ['alpha']);
+
+  assert.equal((await post(app, '/api/agents', { name: 'bravo' }, cookie)).status, 201);
+  const listed = (await (await app.request('/api/agents', { headers: { cookie } })).json()) as {
+    name: string;
+    display: number;
+  }[];
+  assert.deepEqual(listed.map((agent) => [agent.name, agent.display]), [
+    ['alpha', 1],
+    ['bravo', 2],
+  ]);
+
+  const fetched = await app.request('/api/agents/alpha', { headers: { cookie } });
+  assert.deepEqual(await json(fetched), alpha);
+  assert.equal((await app.request('/api/agents/nobody', { headers: { cookie } })).status, 404);
+});
+
+test('agent creation refuses a name that could reach a shell, and a duplicate', async () => {
+  const { app, spawned } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+
+  for (const name of ['Alpha', 'has space', 'rm -rf /', '../escape', '$(id)', '']) {
+    const res = await post(app, '/api/agents', { name }, cookie);
+    assert.equal(res.status, 400, `${JSON.stringify(name)} should be rejected`);
+  }
+  assert.deepEqual(spawned, [], 'no name reached the desktop layer');
+
+  assert.equal((await post(app, '/api/agents', { name: 'alpha' }, cookie)).status, 201);
+  assert.equal((await post(app, '/api/agents', { name: 'alpha' }, cookie)).status, 409);
+});
+
+test('an agent whose desktop will not start is not left half-created', async () => {
+  const { app } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+
+  assert.equal((await post(app, '/api/agents', { name: 'unspawnable' }, cookie)).status, 500);
+  assert.deepEqual(await json(await app.request('/api/agents', { headers: { cookie } })), []);
+
+  // The freed display goes to the next agent instead of being stranded.
+  const next = await post(app, '/api/agents', { name: 'alpha' }, cookie);
+  assert.equal((await json(next))['display'], 1);
+});
+
+test('the agent routes are behind the session guard', async () => {
+  const { app } = fixture();
+  await post(app, '/api/auth/setup', { password: PASSWORD });
+  assert.equal((await app.request('/api/agents')).status, 401);
+  assert.equal((await post(app, '/api/agents', { name: 'alpha' })).status, 401);
 });

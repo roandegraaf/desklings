@@ -19,4 +19,7 @@ export const config = {
   dbPath: resolve(dataDir, 'schermes.db'),
   masterKeyPath: resolve(dataDir, 'master.key'),
   migrationsDir: resolve(import.meta.dirname, '../migrations'),
+  // Resolves to /opt/schermes/infra/desktop on a real host, which is the path the sudoers
+  // rule for create-agent-user.sh names literally. The two must keep agreeing.
+  desktopScripts: resolve(import.meta.dirname, '../../infra/desktop'),
 } as const;

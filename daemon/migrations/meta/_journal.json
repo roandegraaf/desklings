@@ -8,6 +8,13 @@
       "when": 1789032649374,
       "tag": "0000_keen_arclight",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1789033927517,
+      "tag": "0001_lethal_blue_shield",
+      "breakpoints": true
     }
   ]
 }

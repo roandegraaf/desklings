@@ -18,3 +18,10 @@ export const settings = sqliteTable('settings', {
   value: text('value').notNull(),
   encrypted: integer('encrypted', { mode: 'boolean' }).notNull().default(false),
 });
+
+export const agents = sqliteTable('agents', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull().unique(),
+  display: integer('display').notNull().unique(),
+  createdAt: integer('created_at').notNull(),
+});

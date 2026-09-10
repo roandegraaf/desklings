@@ -12,7 +12,9 @@ fi
 
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 agents=(alpha bravo charlie)
-displays=(1 2 3)
+# High display numbers on purpose: these agents are not in the daemon's database, and the
+# daemon allocates from :1 upwards. Overlapping would put two X servers on one display.
+displays=(101 102 103)
 port=${SCHERMES_CHECK_PORT:-8899}
 out=/tmp/schermes-check
 base="http://127.0.0.1:$port"

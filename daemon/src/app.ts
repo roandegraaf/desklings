@@ -19,6 +19,15 @@ import {
   writeBaseUrl,
   writeModel,
 } from './settings.ts';
+import {
+  AGENT_NAME,
+  findAgent,
+  forgetAgent,
+  insertAgent,
+  listAgents,
+} from './agents.ts';
+import type { DesktopOps } from './agents.ts';
+import { log } from './log.ts';
 
 const PUBLIC_PATHS = new Set(['/api/health', '/api/auth/setup', '/api/auth/login']);
 
@@ -46,9 +55,9 @@ function validBaseUrl(value: string): boolean {
   }
 }
 
-export type AppDeps = { db: Db; masterKey: Buffer };
+export type AppDeps = { db: Db; masterKey: Buffer; desktop: DesktopOps };
 
-export function createApp({ db, masterKey }: AppDeps) {
+export function createApp({ db, masterKey, desktop }: AppDeps) {
   const app = new Hono();
 
   // Registered before any route so unlisted paths are denied by default.
@@ -103,6 +112,34 @@ export function createApp({ db, masterKey }: AppDeps) {
     if (apiKey !== undefined) writeApiKey(db, masterKey, apiKey);
 
     return c.json(readProviderSettings(db));
+  });
+
+  app.get('/api/agents', (c) => c.json(listAgents(db)));
+
+  app.get('/api/agents/:name', (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    return agent === undefined ? c.json({ error: 'no such agent' }, 404) : c.json(agent);
+  });
+
+  app.post('/api/agents', async (c) => {
+    const name = stringField(await jsonBody(c), 'name') ?? '';
+    // The scripts validate too; this keeps an unchecked name from reaching a shell at all.
+    if (!AGENT_NAME.test(name)) {
+      return c.json({ error: `name must match ${AGENT_NAME.source}` }, 400);
+    }
+
+    const agent = insertAgent(db, name);
+    if (agent === undefined) return c.json({ error: 'agent already exists' }, 409);
+
+    try {
+      await desktop.ensure(agent.name, agent.display);
+    } catch (error) {
+      forgetAgent(db, name);
+      log.error('agent creation failed', { agent: name, display: agent.display, error });
+      return c.json({ error: 'could not start the agent desktop' }, 500);
+    }
+
+    return c.json(agent, 201);
   });
 
   return app;

@@ -133,6 +133,42 @@ setup and login needs a session.
 - Sessions live in SQLite rather than daemon memory, so restarting the daemon does not log the
   owner out, and later slices get session rows they can reason about.
 
+### Agents and their desktops
+
+**Requirement** — an agent is a row in `agents`, a Linux user `agent-<name>`, and one X display
+that belongs to it for as long as the row exists. Creating one through the API does all three.
+
+- **Requirement** — the daemon allocates display numbers, lowest free first from `:1`. `:0` is
+  reserved for a physical console. Reusing the gap a removed agent leaves keeps the numbers
+  dense, which matters because the VNC port is `5900 + display` and later slices proxy it.
+- **Requirement** — the name is validated against `^[a-z0-9][a-z0-9-]{0,30}$` in the daemon and
+  again in the shell scripts. The daemon's check is what stops an unchecked name reaching a
+  shell at all; the scripts' check is what makes them safe to run by hand.
+- **Requirement** — the daemon shells out to `create-agent-user.sh` and `start-desktop.sh`
+  rather than reimplementing them. `start-desktop.sh` probes the display with `xdpyinfo` and
+  prints `adopted` or `started`; the daemon reads that word and does not run a probe of its own.
+  One implementation of the decision, in the place that already had it.
+- **Requirement** — the daemon reconciles every agent on boot, which is the same call it makes
+  when creating one. Desktops outlive the daemon, so a restart adopts the ones still answering
+  and respawns the rest. A desktop that will not come up is logged and skipped; it does not stop
+  the daemon or the other agents.
+- Creating an agent whose desktop fails to start drops the row again. The Linux user and its
+  home survive, so a retry reuses them, and the display goes back in the pool rather than being
+  stranded by a half-created agent.
+- A killed X server leaves `/tmp/.X<n>-lock` behind. The X server clears a stale lock only when
+  the pid inside it is dead, and pids recycle — after a container restart a leftover lock can
+  name a pid that now belongs to something else, which aborts Xvnc with "server is already
+  active". `start-desktop.sh` removes the lock in the branch where the probe has already proved
+  nothing is serving that display.
+- `check.sh` runs its own agents on `:101`-`:103`, deliberately out of the daemon's range. Its
+  agents are not in the database, and two X servers on one display is a collision, not a race.
+
+**Restarting in the harness is not restarting on a host.** `docker compose restart` destroys the
+container's pid namespace, so every desktop dies with it and the daemon respawns all of them on
+boot. Only `systemctl restart schermes` on a real host leaves desktops running for the daemon to
+adopt. `infra/smoke.sh` therefore exercises adoption by starting a second daemon against the
+same database while the first one's desktops are up, which is the situation systemd creates.
+
 ### Secrets and logging
 
 - **Requirement** — the provider API key is AES-256-GCM encrypted with a 32-byte master key at
