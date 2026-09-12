@@ -13,6 +13,6 @@ usermod --append --groups agents "$user"
 
 home=$(getent passwd "$user" | cut -d: -f6)
 install -d -o "$user" -g "$user" -m 0755 \
-  "$home/workspace" "$home/uploads" "$home/.chromium-profile"
+  "$home/workspace" "$home/uploads" "$home/.chromium-profile" "$home/memory" "$home/skills"
 
 echo "$user $home"

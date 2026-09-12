@@ -6,10 +6,13 @@ import {
   AGENT_NAME,
   forgetAgent,
   insertAgent,
+  insertWorker,
   listAgents,
   nextDisplay,
+  nextWorkerName,
   reconcileDesktops,
 } from './agents.ts';
+import type { Agent } from '@schermes/shared';
 import type { DesktopOps, DesktopOutcome } from './agents.ts';
 
 const MIGRATIONS = resolve(import.meta.dirname, '../migrations');
@@ -24,6 +27,10 @@ function fakeDesktop(alive: Set<number>, broken = new Set<string>()) {
       alive.add(display);
       calls.push({ name, display, outcome });
       return Promise.resolve(outcome);
+    },
+    stop(name) {
+      alive.delete(calls.findLast((call) => call.name === name)?.display ?? -1);
+      return Promise.resolve();
     },
   };
   return { ops, calls };
@@ -114,4 +121,19 @@ test('one unreachable desktop does not stop the daemon reconciling the rest', as
   const { ops, calls } = fakeDesktop(new Set(), new Set(['alpha']));
   await reconcileDesktops(db, ops);
   assert.deepEqual(calls, [{ name: 'bravo', display: 2, outcome: 'started' }]);
+});
+
+test('a task worker is never handed to the desktop layer', async () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const worker = insertWorker(db, alpha, nextWorkerName(db, alpha) as string, 1);
+
+  const { ops, calls } = fakeDesktop(new Set());
+  await reconcileDesktops(db, ops);
+
+  // It has no Linux user and no display: start-desktop.sh takes three digits at most, so its
+  // placeholder number reaching that script would break the boot rather than start anything.
+  assert.deepEqual(calls, [{ name: 'alpha', display: 1, outcome: 'started' }]);
+  assert.ok(worker.display > 999, 'and its number is outside the range a desktop can use');
+  assert.equal(nextWorkerName(db, alpha), 'alpha-w2', 'names count every worker ever born');
 });

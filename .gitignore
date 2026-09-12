@@ -10,3 +10,7 @@ data/
 *.sqlite
 *.sqlite-*
 graphify-out/
+
+# Reference bundle from github.com/jeremy-prt/bloub; the Swift port is asserted against
+# the goldens in apple/SchermesTests/BloubGoldens.swift, which name its upstream commit.
+bloub.js

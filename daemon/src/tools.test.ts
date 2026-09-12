@@ -1,17 +1,32 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { asAgent } from './agents.ts';
+import { resolve } from 'node:path';
+import { asAgent, findAgent, insertAgent } from './agents.ts';
 import type { AgentTarget } from './agents.ts';
+import { openDb } from './db.ts';
+import { conversationFor } from './conversations.ts';
+import {
+  describeApproval,
+  insertApproval,
+  listApprovals,
+  parseDeletionRequest,
+  requestDeletionToolDef,
+} from './approvals.ts';
 import { systemExec } from './exec.ts';
 import type { Exec, ExecOptions, ExecResult } from './exec.ts';
 import {
   computerCommand,
+  computerToolDef,
   parseComputerAction,
   performComputerAction,
 } from './computer.ts';
-import { commandArgv, parseCommand, runCommand } from './terminal.ts';
+import { commandArgv, commandToolDef, parseCommand, runCommand } from './terminal.ts';
+import { HOME_APPEND, parseRemember, remember, rememberToolDef } from './home.ts';
+import { nextRun, parseSchedule, parseScheduleId, scheduleTaskToolDef } from './schedules.ts';
+import { COMPUTER_ACTIONS } from '@schermes/shared';
+import type { Agent } from '@schermes/shared';
 
-const SCREEN = { width: 1280, height: 800 };
+const SCREEN = { width: 1280, height: 800, display: { width: 1280, height: 800 } };
 const TARGET: AgentTarget = { user: 'agent-alpha', home: '/home/agent-alpha', display: 3 };
 
 type Call = { file: string; args: readonly string[]; options: ExecOptions };
@@ -95,7 +110,7 @@ test('the other action fields are validated too', () => {
 });
 
 test('every action becomes the argv it should, run as the agent', () => {
-  const argv = (body: Record<string, unknown>) => computerCommand(parsed(body)).argv;
+  const argv = (body: Record<string, unknown>) => computerCommand(parsed(body), SCREEN).argv;
 
   assert.deepEqual(argv({ action: 'move', x: 10, y: 20 }), [
     'xdotool', 'mousemove', '--sync', '10', '20',
@@ -122,12 +137,24 @@ test('every action becomes the argv it should, run as the agent', () => {
   ]);
 
   // Free text rides in on stdin, so it never needs quoting and never lands in the process list.
-  const typed = computerCommand(parsed({ action: 'type', text: '$(id) -- "quoted"' }));
+  const typed = computerCommand(parsed({ action: 'type', text: '$(id) -- "quoted"' }), SCREEN);
   assert.deepEqual(typed.argv, [
     'xdotool', 'type', '--clearmodifiers', '--delay', '12', '--file', '-',
   ]);
   assert.equal(typed.input, '$(id) -- "quoted"');
-  assert.equal(computerCommand(parsed({ action: 'clipboard_write', text: 'hi' })).input, 'hi');
+  assert.equal(computerCommand(parsed({ action: 'clipboard_write', text: 'hi' }), SCREEN).input, 'hi');
+});
+
+test('a display larger than the view is shrunk for the model and its clicks mapped back', () => {
+  const large = { ...SCREEN, display: { width: 1920, height: 1200 } };
+  const argv = (body: Record<string, unknown>) => computerCommand(parsed(body), large).argv;
+
+  assert.deepEqual(argv({ action: 'move', x: 640, y: 400 }), [
+    'xdotool', 'mousemove', '--sync', '960', '600',
+  ]);
+  assert.deepEqual(argv({ action: 'move', x: 1279, y: 799 }).slice(-2), ['1919', '1199']);
+  assert.deepEqual(argv({ action: 'drag', x: 0, y: 0, toX: 2, toY: 2 }).slice(10, 12), ['3', '3']);
+  assert.match(String(argv({ action: 'screenshot' }).at(-1)), / -resize 1280x800! /);
 });
 
 test('the sudo prefix carries every variable sudo strips', () => {
@@ -150,7 +177,7 @@ test('a screenshot comes back as base64 and the raw bytes stay out of the result
   const png = Buffer.from('\x89PNG\r\n\x1a\nfake', 'binary');
   const { exec, calls } = fakeExec({ stdout: png });
 
-  const result = await performComputerAction(exec, TARGET, { action: 'screenshot' });
+  const result = await performComputerAction(exec, TARGET, { action: 'screenshot' }, SCREEN);
   assert.deepEqual(result, {
     action: 'screenshot',
     image: { mediaType: 'image/png', base64: png.toString('base64') },
@@ -162,12 +189,12 @@ test('a screenshot comes back as base64 and the raw bytes stay out of the result
 test('a failed action is reported as a failure, but an empty clipboard is not', async () => {
   const broken = fakeExec({ code: 1, stderr: 'Can\'t open display' });
   await assert.rejects(
-    performComputerAction(broken.exec, TARGET, { action: 'move', x: 1, y: 1 }),
+    performComputerAction(broken.exec, TARGET, { action: 'move', x: 1, y: 1 }, SCREEN),
     /move: Can't open display/,
   );
 
   const empty = fakeExec({ code: 1, stderr: 'Error: target STRING not available' });
-  assert.deepEqual(await performComputerAction(empty.exec, TARGET, { action: 'clipboard_read' }), {
+  assert.deepEqual(await performComputerAction(empty.exec, TARGET, { action: 'clipboard_read' }, SCREEN), {
     action: 'clipboard_read',
     text: '',
   });
@@ -176,7 +203,7 @@ test('a failed action is reported as a failure, but an empty clipboard is not', 
 test('a truncated screenshot is refused rather than returned corrupt', async () => {
   const { exec } = fakeExec({ stdout: Buffer.from('half a png'), truncated: true });
   await assert.rejects(
-    performComputerAction(exec, TARGET, { action: 'screenshot' }),
+    performComputerAction(exec, TARGET, { action: 'screenshot' }, SCREEN),
     /size limit/,
   );
 });
@@ -268,4 +295,187 @@ test('the spawn boundary feeds stdin, caps output, and does not wait on a detach
   assert.equal(orphaned.code, 7);
   assert.equal(orphaned.stdout.toString(), 'hi\n');
   assert.ok(Date.now() - started < 8_000, 'resolved without waiting for the detached child');
+});
+
+// The tool schema is what the model is told it may send; the parser is what the daemon will
+// accept. These are built from the same constants, and this is the check that they stayed that
+// way — a schema that promises more than the parser allows turns into a refused tool call.
+function schema(def: { parameters: Record<string, unknown> }): Record<string, Record<string, unknown>> {
+  return def.parameters['properties'] as Record<string, Record<string, unknown>>;
+}
+
+test('every action the computer tool advertises is an action the parser accepts', () => {
+  const props = schema(computerToolDef(SCREEN));
+  const sample: Record<string, Record<string, unknown>> = {
+    screenshot: {},
+    move: { x: 1, y: 1 },
+    click: { x: 1, y: 1 },
+    drag: { x: 1, y: 1, toX: 2, toY: 2 },
+    scroll: { x: 1, y: 1, direction: 'down' },
+    type: { text: 'hi' },
+    key: { keys: 'Return' },
+    clipboard_read: {},
+    clipboard_write: { text: 'hi' },
+  };
+
+  const advertised = props['action']?.['enum'] as string[];
+  assert.deepEqual([...advertised].sort(), [...COMPUTER_ACTIONS].sort());
+  for (const action of advertised) {
+    parsed({ action, ...sample[action] });
+  }
+});
+
+test('the computer schema bounds are the bounds the parser enforces', () => {
+  const props = schema(computerToolDef(SCREEN));
+
+  for (const [axis, limit] of [['x', SCREEN.width], ['y', SCREEN.height]] as const) {
+    assert.equal(props[axis]?.['maximum'], limit - 1);
+    assert.equal(props[axis]?.['minimum'], 0);
+  }
+  parsed({ action: 'move', x: Number(props['x']?.['maximum']), y: Number(props['y']?.['maximum']) });
+  rejected({ action: 'move', x: Number(props['x']?.['maximum']) + 1, y: 0 });
+
+  for (const button of props['button']?.['enum'] as number[]) parsed({ action: 'click', x: 1, y: 1, button });
+  rejected({ action: 'click', x: 1, y: 1, button: (props['button']?.['enum'] as number[]).length + 1 });
+
+  for (const direction of props['direction']?.['enum'] as string[]) {
+    parsed({ action: 'scroll', x: 1, y: 1, direction });
+  }
+
+  const [min, max] = [props['amount']?.['minimum'], props['amount']?.['maximum']];
+  parsed({ action: 'scroll', x: 1, y: 1, direction: 'up', amount: Number(min) });
+  parsed({ action: 'scroll', x: 1, y: 1, direction: 'up', amount: Number(max) });
+  rejected({ action: 'scroll', x: 1, y: 1, direction: 'up', amount: Number(max) + 1 });
+  rejected({ action: 'scroll', x: 1, y: 1, direction: 'up', amount: Number(min) - 1 });
+});
+
+test('the run_command schema bounds are the bounds the parser enforces', () => {
+  const props = schema(commandToolDef());
+  const timeout = props['timeoutMs'] as Record<string, number>;
+
+  assert.ok('error' in parseCommand({ command: 'ls', timeoutMs: timeout['minimum']! - 1 }));
+  assert.ok('error' in parseCommand({ command: 'ls', timeoutMs: timeout['maximum']! + 1 }));
+  assert.ok(!('error' in parseCommand({ command: 'ls', timeoutMs: timeout['minimum']! })));
+  assert.ok(!('error' in parseCommand({ command: 'ls', timeoutMs: timeout['maximum']! })));
+
+  const longest = Number(props['command']?.['maxLength']);
+  assert.ok(!('error' in parseCommand({ command: 'x'.repeat(longest) })));
+  assert.ok('error' in parseCommand({ command: 'x'.repeat(longest + 1) }));
+});
+
+test('a remembered line is validated and flattened to one line', () => {
+  const props = schema(rememberToolDef());
+  const longest = Number(props['text']?.['maxLength']);
+
+  assert.ok('error' in parseRemember({ text: '   ', scope: 'lasting' }));
+  assert.ok('error' in parseRemember({ text: 'x', scope: 'somewhere' }));
+  assert.ok('error' in parseRemember({ text: 'x' }), 'the model has to choose which file');
+  assert.ok('error' in parseRemember({ text: 'x'.repeat(longest + 1), scope: 'today' }));
+  assert.ok(!('error' in parseRemember({ text: 'x'.repeat(longest), scope: 'today' })));
+
+  for (const scope of props['scope']?.['enum'] as string[]) {
+    assert.ok(!('error' in parseRemember({ text: 'a fact', scope })));
+  }
+
+  const flattened = parseRemember({ text: '  two\n\nlines  ', scope: 'lasting' });
+  assert.deepEqual(flattened, { text: 'two lines', scope: 'lasting' });
+});
+
+test('a remembered line reaches the file on stdin, never as an argument', async () => {
+  const { exec, calls } = fakeExec();
+  const written = await remember(exec, TARGET, { text: 'rm -rf / $(whoami)', scope: 'lasting' });
+
+  assert.deepEqual(written, { path: '/home/agent-alpha/memory/MEMORY.md' });
+  const call = calls[0];
+  assert.equal(call?.file, 'sudo');
+  assert.equal(call?.options.input, '- rm -rf / $(whoami)\n');
+  assert.deepEqual(call?.args.slice(-3), [HOME_APPEND, '/home/agent-alpha/memory', 'MEMORY.md']);
+  assert.ok(
+    !call?.args.some((arg) => arg.includes('whoami')),
+    'nothing the model wrote is in the argv',
+  );
+});
+
+test('a failed append is reported rather than silently lost', async () => {
+  const { exec } = fakeExec({ code: 1, stderr: 'Read-only file system' });
+  const written = await remember(exec, TARGET, { text: 'a fact', scope: 'today' });
+
+  assert.ok('error' in written);
+  assert.match(written.error, /Read-only file system/);
+});
+
+test('a schedule is validated against the same bounds the tool advertises', () => {
+  const props = schema(scheduleTaskToolDef());
+  const longestCron = Number(props['cron']?.['maxLength']);
+  const longestPrompt = Number(props['prompt']?.['maxLength']);
+  const job = { cron: '0 9 * * 1-5', prompt: 'read the overnight logs' };
+
+  assert.deepEqual(parseSchedule(job), job);
+  assert.ok(!('error' in parseSchedule({ ...job, cron: '*/30 * * * * *' })), 'six fields too');
+  assert.ok('error' in parseSchedule({ ...job, cron: '  ' }));
+  assert.ok('error' in parseSchedule({ ...job, prompt: '  ' }));
+  assert.ok('error' in parseSchedule({ ...job, cron: 'every weekday at nine' }), 'no prose');
+  // Syntactically fine and never due: a row for it would sit permanently past its next run.
+  assert.ok('error' in parseSchedule({ ...job, cron: '0 0 30 2 *' }), 'february the 30th');
+  assert.ok('error' in parseSchedule({ ...job, cron: 'x'.repeat(longestCron + 1) }));
+  assert.ok('error' in parseSchedule({ ...job, prompt: 'x'.repeat(longestPrompt + 1) }));
+  assert.ok(!('error' in parseSchedule({ ...job, prompt: 'x'.repeat(longestPrompt) })));
+
+  // An id never reaches a query as anything but a whole number.
+  assert.deepEqual(parseScheduleId({ id: '3' }), { error: 'id must be a schedule id' });
+  assert.ok(typeof parseScheduleId({ id: 1.5 }) === 'object');
+  assert.equal(parseScheduleId({ id: 3 }), 3);
+});
+
+test('a cron expression is resolved against a given moment, never the wall clock', () => {
+  const noon = Date.UTC(2026, 0, 1, 12, 0, 0);
+  // Strictly after the moment it is handed, which is what stops a fired row firing again, and
+  // no further away than the expression's own period.
+  const hourly = nextRun('0 * * * *', noon) as number;
+  assert.ok(hourly > noon && hourly <= noon + 3_600_000);
+  const often = nextRun('*/5 * * * * *', noon) as number;
+  assert.ok(often > noon && often <= noon + 5_000);
+  assert.equal(nextRun('nonsense', noon), undefined);
+  assert.equal(nextRun('0 0 30 2 *', noon), undefined);
+});
+
+test('a deletion request is checked before it can stand, and names an agent that exists', () => {
+  const db = openDb(':memory:', resolve(import.meta.dirname, '../migrations'));
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  insertAgent(db, 'bravo');
+
+  const refuse = (args: Record<string, unknown>): string => {
+    const parsed = parseDeletionRequest(db, alpha, args);
+    assert.ok('error' in parsed, `expected ${JSON.stringify(args)} to be refused`);
+    return parsed.error;
+  };
+  assert.match(refuse({ what: 'agent', agent: 'bravo' }), /reason/);
+  assert.match(refuse({ what: 'agent', agent: 'bravo', reason: '  ' }), /reason/);
+  assert.match(refuse({ what: 'everything', reason: 'tidying up' }), /'agent' or 'conversation'/);
+  assert.match(refuse({ what: 'agent', reason: 'tidying up' }), /agent must be/);
+  assert.match(refuse({ what: 'agent', agent: '../etc', reason: 'tidying up' }), /agent must be/);
+  assert.match(refuse({ what: 'agent', agent: 'nobody', reason: 'tidying up' }), /no agent named/);
+
+  assert.deepEqual(parseDeletionRequest(db, alpha, { what: 'agent', agent: 'bravo', reason: 'done' }), {
+    kind: 'agent',
+    target: 'bravo',
+    reason: 'done',
+  });
+  // A thread carries no target from the model: the one it is in is the only one it can name.
+  assert.deepEqual(parseDeletionRequest(db, alpha, { what: 'conversation', reason: 'finished' }), {
+    kind: 'conversation',
+    target: '',
+    reason: 'finished',
+  });
+
+  // Its own name is allowed, and reads as itself on the owner's screen.
+  const itself = parseDeletionRequest(db, alpha, { what: 'agent', agent: 'alpha', reason: 'done' });
+  assert.ok(!('error' in itself));
+  const standing = insertApproval(db, alpha, conversationFor(db, alpha.id), itself);
+  assert.equal(describeApproval(standing), 'delete itself (alpha)');
+  assert.equal(findAgent(db, 'alpha')?.name, 'alpha', 'asking deletes nothing');
+  assert.equal(listApprovals(db).length, 1);
+
+  const schema = requestDeletionToolDef().parameters as Record<string, unknown>;
+  assert.deepEqual(schema['required'], ['what', 'reason']);
 });

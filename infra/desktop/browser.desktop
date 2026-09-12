@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Chromium
+Exec=sh -c 'exec chromium --user-data-dir="$HOME/.chromium-profile"'
+Icon=chromium

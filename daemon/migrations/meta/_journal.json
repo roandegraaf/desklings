@@ -15,6 +15,48 @@
       "when": 1789033927517,
       "tag": "0001_lethal_blue_shield",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1789037601626,
+      "tag": "0002_wide_thanos",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1789041276828,
+      "tag": "0003_short_captain_marvel",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1789043963751,
+      "tag": "0004_naive_big_bertha",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1789111553131,
+      "tag": "0005_hesitant_invaders",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1789112963963,
+      "tag": "0006_shocking_kulan_gath",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1789196669502,
+      "tag": "0007_strange_stardust",
+      "breakpoints": true
     }
   ]
 }

@@ -12,13 +12,19 @@
   },
   "dependencies": {
     "@hono/node-server": "^2.1.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@schermes/shared": "workspace:*",
     "better-sqlite3": "^13.0.3",
+    "croner": "^10.0.1",
     "drizzle-orm": "^0.45.2",
-    "hono": "^4.13.7"
+    "hono": "^4.13.7",
+    "html-to-text": "^10.0.1",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
+    "@types/html-to-text": "^9.0.4",
+    "@types/ws": "^8.18.1",
     "drizzle-kit": "^0.31.10",
     "typescript": "^7.0.2"
   }

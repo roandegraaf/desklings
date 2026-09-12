@@ -1,0 +1,91 @@
+name: Schermes
+
+options:
+  bundleIdPrefix: dev.schermes
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "26.0"
+    macOS: "26.0"
+
+# Ad-hoc, so a clone builds and runs in the simulator and on this Mac with no Apple account.
+# Target level, not project level: XcodeGen writes `CODE_SIGN_IDENTITY = "iPhone Developer"` onto
+# every iOS-capable target, and a target setting beats a project one. A physical iPhone needs a
+# real team; set one in Xcode's Signing & Capabilities.
+signing: &signing
+  CODE_SIGN_STYLE: Manual
+  CODE_SIGN_IDENTITY: "-"
+  PROVISIONING_PROFILE_SPECIFIER: ""
+  DEVELOPMENT_TEAM: ""
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    SWIFT_APPROACHABLE_CONCURRENCY: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  Schermes:
+    type: application
+    supportedDestinations: [iOS, macOS]
+    sources:
+      - path: Schermes
+    info:
+      path: Schermes/Info.plist
+      properties:
+        CFBundleDisplayName: Schermes
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        ITSAppUsesNonExemptEncryption: false
+        # The daemon speaks plain HTTP by design; TLS belongs to a proxy in front of it.
+        # See apple/README.md.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        # A daemon on the LAN is the ordinary case, and iOS asks before the first connection to
+        # one. Without this the prompt gives no reason for the app's own main path.
+        NSLocalNetworkUsageDescription:
+          Schermes connects to your daemon, which usually runs on this network.
+    settings:
+      base:
+        <<: *signing
+        PRODUCT_BUNDLE_IDENTIFIER: dev.schermes.Schermes
+        ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: NO
+        # One 1024 rendered from the app's own avatar engine; see apple/README.md.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # `import zlib` resolves against the SDK's own module, but nothing links libz for us.
+        # ZRLE is one continuous inflate stream, which is what zlib gives and the Compression
+        # framework's raw-deflate API does not.
+        OTHER_LDFLAGS: "-lz"
+
+  SchermesTests:
+    type: bundle.unit-test
+    supportedDestinations: [iOS, macOS]
+    sources:
+      - path: SchermesTests
+    dependencies:
+      - target: Schermes
+    settings:
+      base:
+        <<: *signing
+        PRODUCT_BUNDLE_IDENTIFIER: dev.schermes.SchermesTests
+        GENERATE_INFOPLIST_FILE: YES
+        # The ZRLE test deflates its own fixtures, so this target imports zlib too.
+        OTHER_LDFLAGS: "-lz"
+        # XcodeGen writes the iOS shape of this for a multiplatform target; a Mac app keeps its
+        # executable inside the bundle.
+        TEST_HOST[sdk=macosx*]: "$(BUILT_PRODUCTS_DIR)/Schermes.app/Contents/MacOS/Schermes"
+
+schemes:
+  Schermes:
+    build:
+      targets:
+        Schermes: all
+        SchermesTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - SchermesTests

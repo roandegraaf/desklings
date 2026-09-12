@@ -22,10 +22,23 @@ apt-get install -y --no-install-recommends \
   build-essential python3 python3-venv python3-pip \
   jq ripgrep htop zip unzip tar xz-utils file poppler-utils imagemagick \
   tigervnc-standalone-server openbox xterm dbus-x11 \
+  tint2 pcmanfm lxterminal hsetroot \
   x11-utils x11-xserver-utils xdotool scrot xclip xauth \
   chromium \
   fonts-dejavu fonts-liberation fonts-noto-color-emoji
 rm -rf /var/lib/apt/lists/*
+
+log "chromium defaults"
+# Chromium caps a new window at 1050px wide whatever the screen size, which gets sites to serve
+# their tablet layout. The Debian launcher sources every file in /etc/chromium.d.
+# The debugging port is 9222 + display, loopback only; daemon/src/browser.ts derives the same
+# number. It is honoured only with an explicit --user-data-dir, which every launcher here passes.
+cat > /etc/chromium.d/schermes <<'EOF'
+export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --start-maximized"
+case "$DISPLAY" in
+  :[0-9]*) d="${DISPLAY#:}"; export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --remote-debugging-port=$((9222 + ${d%%.*}))" ;;
+esac
+EOF
 
 log "node ${NODE_MAJOR} + pnpm"
 if ! /opt/node/bin/node --version 2>/dev/null | grep -q "^v${NODE_MAJOR}\."; then
@@ -61,7 +74,7 @@ id -u schermes >/dev/null 2>&1 || \
   useradd --system --create-home --home-dir "$SCHERMES_HOME" --shell /bin/bash schermes
 install -d -o schermes -g schermes -m 0755 \
   "$SCHERMES_HOME/desktops" "$SCHERMES_HOME/logs"
-install -d -o root -g agents -m 2775 /srv/schermes "$SHARED_DIR"
+install -d -o root -g agents -m 2775 /srv/schermes "$SHARED_DIR" "$SHARED_DIR/skills"
 # X clients need this before the first Xvnc starts; an unprivileged Xvnc cannot create it.
 install -d -m 1777 /tmp/.X11-unix
 
@@ -85,10 +98,14 @@ done
 log "daemon"
 install -o root -g root -m 0644 "$here/schermes.service" /etc/systemd/system/schermes.service
 # In the Docker image this runs before any source exists, so it is a no-op there and the
-# Dockerfile installs dependencies in its own cache-friendly layer instead. On a real host the
-# repository is already in place, which makes install.sh the single provisioning path.
+# Dockerfile installs dependencies in a stage of its own instead. On a real host the repository
+# is already in place, which makes install.sh the single provisioning path.
+# CI=true because a re-run changes which projects have a modules directory, and pnpm refuses to
+# remove one without a TTY unless it is told it is unattended. It is.
 if [ -f /opt/schermes/package.json ]; then
-  ( cd /opt/schermes && pnpm install --frozen-lockfile --prod )
+  ( cd /opt/schermes
+    export CI=true
+    pnpm install --frozen-lockfile --prod )
 fi
 # systemctl is unavailable in the Docker harness, where the daemon is the container command.
 if [ -d /run/systemd/system ]; then

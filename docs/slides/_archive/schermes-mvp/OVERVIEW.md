@@ -1,3 +1,5 @@
+> Completed (pending acceptance: 4 items, see ACCEPTANCE.md)
+
 # schermes — self-hosted AI agent computer (MVP)
 
 ## Goal
@@ -12,7 +14,12 @@ open the UI, and agents work. Open source, MIT, one repository.
 - Docker dev harness (Debian container built by the same script) for local iteration on macOS.
 - One Linux user + one X display (Xvnc + lightweight WM) + Chromium profile per permanent agent.
 - Daemon (Node 24, TypeScript) under systemd: agent loops, task workers, desktop
-  supervision, VNC WebSocket proxy, HTTP API, WebSocket events, SQLite persistence.
+  supervision, VNC WebSocket proxy, HTTP API, SQLite persistence.
+  *Reversed in slice 11: the planned WebSocket event stream is polling instead. The daemon has
+  no push side, so a stream would be a new module, a subscription registry and a reconnect story
+  on both ends; a timer is none of those and keeps "closing the browser does not stop agent
+  work" true by construction. The only WebSocket is the VNC proxy. Reasoning in
+  `docs/architecture.md` under Web UI.*
 - Computer-use tool interface: screenshot, move, click, drag, scroll, type, key, clipboard
   (xdotool + scrot), provider-agnostic.
 - Terminal tool: run command as agent user, streamed output, timeout, background option, sudo.
@@ -100,26 +107,26 @@ Chromium CDP automation (deferred, optional add-on), desktop idle shutdown (defe
 - Docs and tests
 
 ## Definition of Done
-- [ ] `docker compose up` builds a Debian image via `infra/install.sh` and starts the daemon
-- [ ] `install.sh` runs idempotently on a fresh Debian 13 (verified in Docker; VM run `[user-gated]`)
+- [x] `docker compose up` builds a Debian image via `infra/install.sh` and starts the daemon
+- [x] `install.sh` runs idempotently on a fresh Debian 13 (verified in Docker; VM run `[user-gated]`) — Docker half verified; VM half stays open
 - [ ] Packer template in repo builds a qcow2 (`[user-gated]`, needs Packer + QEMU on a Linux host)
-- [ ] Owner sets password on first visit and must log in afterwards
-- [ ] Settings UI stores base URL, encrypted API key and model; key never appears in logs or API responses
-- [ ] Creating an agent creates a Linux user, home, workspace, Xvnc display and WM; two agents run concurrently
-- [ ] Agent can take a screenshot and perform mouse/keyboard actions that visibly change its desktop (integration test)
-- [ ] Agent can open Chromium, and cookies persist across a Chromium restart (integration test)
-- [ ] Agent can run shell commands, create/edit files, and `apt-get install` a package (integration test)
-- [ ] Agent view shows live desktop; Take control blocks agent input (agent enters waiting-for-user); Return control resumes it (test on ownership state + integration test)
-- [ ] Conversations, messages, events and agent config survive daemon restart and reboot of the container
-- [ ] Daemon restart mid tool-call marks it interrupted and the agent resumes from persisted history (test)
-- [ ] Permanent agent spawns a task worker; worker activity and result appear in the UI and the parent receives the result (test)
-- [ ] Group conversation with two agents: both receive and reply to a user message (test)
-- [ ] Closing the browser does not stop agent work; reconnecting shows current state and history
-- [ ] Agent-to-agent direct message visible in the UI
-- [ ] Resource caps enforced: worker request above cap fails with a clear error (test)
-- [ ] Only the web port is bound to non-loopback interfaces (checked by a script in the harness)
-- [ ] Unit tests cover state machine, worker lifecycle, messaging, persistence, provider abstraction, ownership
-- [ ] Docs listed under Scope exist and match the code
+- [x] Owner sets password on first visit and must log in afterwards
+- [x] Settings UI stores base URL, encrypted API key and model; key never appears in logs or API responses
+- [x] Creating an agent creates a Linux user, home, workspace, Xvnc display and WM; two agents run concurrently
+- [x] Agent can take a screenshot and perform mouse/keyboard actions that visibly change its desktop (integration test)
+- [x] Agent can open Chromium, and cookies persist across a Chromium restart (integration test)
+- [x] Agent can run shell commands, create/edit files, and `apt-get install` a package (integration test)
+- [x] Agent view shows live desktop; Take control blocks agent input (agent enters waiting-for-user); Return control resumes it (test on ownership state + integration test)
+- [x] Conversations, messages, events and agent config survive daemon restart and reboot of the container
+- [x] Daemon restart mid tool-call marks it interrupted and the agent resumes from persisted history (test)
+- [x] Permanent agent spawns a task worker; worker activity and result appear in the UI and the parent receives the result (test)
+- [x] Group conversation with two agents: both receive and reply to a user message (test)
+- [x] Closing the browser does not stop agent work; reconnecting shows current state and history
+- [x] Agent-to-agent direct message visible in the UI
+- [x] Resource caps enforced: worker request above cap fails with a clear error (test)
+- [x] Only the web port is bound to non-loopback interfaces (checked by a script in the harness)
+- [x] Unit tests cover state machine, worker lifecycle, messaging, persistence, provider abstraction, ownership
+- [x] Docs listed under Scope exist and match the code
 - [ ] One end-to-end run against a real OpenAI-compatible endpoint `[user-gated]`
 - [ ] Deployed and verified on the Unraid VM `[user-gated]`
 

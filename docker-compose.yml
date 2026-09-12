@@ -14,3 +14,11 @@ services:
       - "127.0.0.1:${SCHERMES_PORT:-7777}:${SCHERMES_PORT:-7777}"
     environment:
       SCHERMES_PORT: "${SCHERMES_PORT:-7777}"
+    # The database, the master key and the desktop state directory. Named rather than bound, so
+    # a fresh volume inherits the image's ownership and modes and master.key stays 0600 under
+    # the schermes user. Without it every rebuild silently starts on an empty database.
+    volumes:
+      - schermes-data:/var/lib/schermes
+
+volumes:
+  schermes-data:

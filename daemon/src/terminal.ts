@@ -2,6 +2,7 @@ import type { CommandRequest, CommandResult } from '@schermes/shared';
 import { asAgent } from './agents.ts';
 import type { AgentTarget } from './agents.ts';
 import type { Exec } from './exec.ts';
+import type { ToolDef } from './provider.ts';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MIN_TIMEOUT_MS = 1_000;
@@ -39,6 +40,35 @@ export function parseCommand(body: Record<string, unknown>): ResolvedCommand | {
   if (typeof background !== 'boolean') return { error: 'background must be a boolean' };
 
   return { command, timeoutMs, background };
+}
+
+/** Built from the constants `parseCommand` enforces, so the two cannot disagree. */
+export function commandToolDef(): ToolDef {
+  return {
+    name: 'run_command',
+    description:
+      'Run a shell command as your own Linux user, from your home directory. Returns stdout, ' +
+      'stderr and the exit code. Use it to read and write files, install packages with sudo ' +
+      'apt-get, and launch desktop applications (with background true, so they keep running).',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', maxLength: MAX_COMMAND_CHARS },
+        timeoutMs: {
+          type: 'integer',
+          minimum: MIN_TIMEOUT_MS,
+          maximum: MAX_TIMEOUT_MS,
+          description: `how long to wait before killing it, ${DEFAULT_TIMEOUT_MS} by default`,
+        },
+        background: {
+          type: 'boolean',
+          description: 'detach the command and return at once, discarding its output',
+        },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  };
 }
 
 export function commandArgv(request: ResolvedCommand): string[] {

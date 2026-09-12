@@ -1,0 +1,5 @@
+Schermes.xcodeproj/
+DerivedData/
+build/
+# Written by xcodegen from the `info:` block in project.yml, which is the source of truth.
+Schermes/Info.plist

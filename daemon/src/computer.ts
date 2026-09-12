@@ -1,11 +1,15 @@
+import { COMPUTER_ACTIONS } from '@schermes/shared';
 import type { ComputerAction, ComputerResult, ScrollDirection } from '@schermes/shared';
 import { asAgent } from './agents.ts';
 import type { AgentTarget } from './agents.ts';
 import type { Exec } from './exec.ts';
+import type { ToolDef } from './provider.ts';
 
 const MAX_TYPE_CHARS = 2000;
 const MAX_CLIPBOARD_CHARS = 64 * 1024;
 const MAX_KEYSTROKES = 10;
+const MIN_SCROLL = 1;
+const MAX_SCROLL = 20;
 const TYPE_DELAY_MS = 12;
 const ACTION_TIMEOUT_MS = 60_000;
 const SCREENSHOT_MAX_BYTES = 32 * 1024 * 1024;
@@ -19,14 +23,13 @@ const SCROLL_BUTTON = { up: '4', down: '5', left: '6', right: '7' } as const;
 // so the capture lands in its own home and `cat` hands the bytes back over the inherited fd.
 // ponytail: one file per agent, so two concurrent screenshots for the same agent race. An agent
 // has one loop; give it a unique name if that ever stops being true.
-const SCREENSHOT_SH =
-  'scrot -o -F "$HOME/.schermes-screenshot.png" && cat "$HOME/.schermes-screenshot.png"';
+const SCREENSHOT = '"$HOME/.schermes-screenshot.png"';
 
 // xclip forks into the background to own the selection; without the redirect that fork keeps
 // the daemon's stdout pipe open and the call never returns.
 const CLIPBOARD_WRITE_SH = 'xclip -selection clipboard -i >/dev/null 2>&1';
 
-export type Screen = { width: number; height: number };
+export type Screen = { width: number; height: number; display: { width: number; height: number } };
 type Invalid = { error: string };
 
 function integer(body: Record<string, unknown>, name: string): number | undefined {
@@ -97,7 +100,9 @@ export function parseComputerAction(
       const direction = body['direction'];
       if (!isDirection(direction)) return { error: 'direction must be up, down, left or right' };
       const amount = integer(body, 'amount') ?? 3;
-      if (amount < 1 || amount > 20) return { error: 'amount must be between 1 and 20' };
+      if (amount < MIN_SCROLL || amount > MAX_SCROLL) {
+        return { error: `amount must be between ${MIN_SCROLL} and ${MAX_SCROLL}` };
+      }
       return { action: 'scroll', ...from, direction, amount };
     }
 
@@ -139,21 +144,70 @@ export function parseComputerAction(
   }
 }
 
+/**
+ * What the model is told the computer tool can do. Built from the same constants and the same
+ * action list `parseComputerAction` validates against, so the schema cannot drift away from it.
+ */
+export function computerToolDef(screen: Screen): ToolDef {
+  return {
+    name: 'computer',
+    description:
+      'Act on your own X11 desktop: see it, move and click the mouse, type, press keys and ' +
+      'use the clipboard. Take a screenshot before acting when you do not know what is on screen.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: [...COMPUTER_ACTIONS] },
+        x: { type: 'integer', minimum: 0, maximum: screen.width - 1 },
+        y: { type: 'integer', minimum: 0, maximum: screen.height - 1 },
+        toX: { type: 'integer', minimum: 0, maximum: screen.width - 1 },
+        toY: { type: 'integer', minimum: 0, maximum: screen.height - 1 },
+        button: { type: 'integer', enum: [...BUTTONS], description: '1 left, 2 middle, 3 right' },
+        direction: { type: 'string', enum: Object.keys(SCROLL_BUTTON) },
+        amount: { type: 'integer', minimum: MIN_SCROLL, maximum: MAX_SCROLL },
+        text: {
+          type: 'string',
+          description:
+            `text to type (at most ${MAX_TYPE_CHARS} characters) or to put on the clipboard`,
+          maxLength: MAX_CLIPBOARD_CHARS,
+        },
+        keys: {
+          type: 'string',
+          description: 'space-separated keystrokes in xdotool form, such as "ctrl+l Return"',
+        },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+  };
+}
+
 export type ToolCommand = { argv: string[]; input?: string };
 
-export function computerCommand(action: ComputerAction): ToolCommand {
+function screenshotScript({ width, height, display }: Screen): string {
+  const shrink =
+    width === display.width && height === display.height
+      ? ''
+      : ` && magick ${SCREENSHOT} -resize ${width}x${height}! ${SCREENSHOT}`;
+  return `scrot -o -F ${SCREENSHOT}${shrink} && cat ${SCREENSHOT}`;
+}
+
+export function computerCommand(action: ComputerAction, screen: Screen): ToolCommand {
+  const displayX = (x: number) => String(Math.round((x * screen.display.width) / screen.width));
+  const displayY = (y: number) => String(Math.round((y * screen.display.height) / screen.height));
+
   switch (action.action) {
     case 'screenshot':
-      return { argv: ['sh', '-c', SCREENSHOT_SH] };
+      return { argv: ['sh', '-c', screenshotScript(screen)] };
 
     case 'move':
-      return { argv: ['xdotool', 'mousemove', '--sync', String(action.x), String(action.y)] };
+      return { argv: ['xdotool', 'mousemove', '--sync', displayX(action.x), displayY(action.y)] };
 
     case 'click':
       return {
         argv: [
           'xdotool',
-          'mousemove', '--sync', String(action.x), String(action.y),
+          'mousemove', '--sync', displayX(action.x), displayY(action.y),
           'click', '--clearmodifiers', String(action.button),
         ],
       };
@@ -162,9 +216,9 @@ export function computerCommand(action: ComputerAction): ToolCommand {
       return {
         argv: [
           'xdotool',
-          'mousemove', '--sync', String(action.x), String(action.y),
+          'mousemove', '--sync', displayX(action.x), displayY(action.y),
           'mousedown', '--clearmodifiers', String(action.button),
-          'mousemove', '--sync', String(action.toX), String(action.toY),
+          'mousemove', '--sync', displayX(action.toX), displayY(action.toY),
           'mouseup', '--clearmodifiers', String(action.button),
         ],
       };
@@ -173,7 +227,7 @@ export function computerCommand(action: ComputerAction): ToolCommand {
       return {
         argv: [
           'xdotool',
-          'mousemove', '--sync', String(action.x), String(action.y),
+          'mousemove', '--sync', displayX(action.x), displayY(action.y),
           'click', '--clearmodifiers', '--repeat', String(action.amount),
           SCROLL_BUTTON[action.direction],
         ],
@@ -200,8 +254,9 @@ export async function performComputerAction(
   exec: Exec,
   target: AgentTarget,
   action: ComputerAction,
+  screen: Screen,
 ): Promise<ComputerResult> {
-  const { argv, input } = computerCommand(action);
+  const { argv, input } = computerCommand(action, screen);
   const result = await exec('sudo', asAgent(target, argv), {
     timeoutMs: ACTION_TIMEOUT_MS,
     ...(action.action === 'screenshot' ? { maxBytes: SCREENSHOT_MAX_BYTES } : {}),

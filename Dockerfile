@@ -1,9 +1,13 @@
-FROM debian:trixie
+FROM debian:trixie AS base
 
 # install.sh first and on its own layer: it is a full apt cycle plus a Node download, and it
-# must not be invalidated by a source edit.
-COPY infra /opt/schermes/infra
+# must not be invalidated by a source edit. Only these two files are read at build time; the
+# rest of infra/ is named by path and arrives with the final COPY, so editing a script there
+# no longer costs a rebuild of everything above.
+COPY infra/install.sh infra/schermes.service /opt/schermes/infra/
 RUN /opt/schermes/infra/install.sh
+
+FROM base
 
 # Manifests before sources, so dependency installs are cached across source edits.
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml /opt/schermes/

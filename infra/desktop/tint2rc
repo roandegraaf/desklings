@@ -1,0 +1,97 @@
+rounded = 12
+border_width = 1
+border_sides = TBLR
+background_color = #10151c 88
+border_color = #ffffff 14
+
+rounded = 8
+border_width = 0
+background_color = #ffffff 16
+border_color = #000000 0
+background_color_hover = #ffffff 22
+border_color_hover = #000000 0
+background_color_pressed = #ffffff 28
+border_color_pressed = #000000 0
+
+rounded = 8
+border_width = 0
+background_color = #000000 0
+border_color = #000000 0
+background_color_hover = #ffffff 12
+border_color_hover = #000000 0
+background_color_pressed = #ffffff 20
+border_color_pressed = #000000 0
+
+panel_items = L:TC
+panel_size = 100% 52
+panel_shrink = 1
+panel_margin = 0 8
+panel_padding = 10 6 6
+panel_background_id = 1
+panel_position = bottom center horizontal
+panel_layer = top
+panel_monitor = all
+strut_policy = follow_size
+panel_window_name = tint2
+disable_transparency = 1
+wm_menu = 0
+mouse_effects = 1
+mouse_hover_icon_asb = 100 0 12
+mouse_pressed_icon_asb = 100 0 0
+
+separator = new
+separator_background_id = 0
+separator_color = #ffffff 18
+separator_style = line
+separator_size = 1
+separator_padding = 4 8
+
+launcher_padding = 0 0 4
+launcher_background_id = 0
+launcher_icon_background_id = 3
+launcher_icon_size = 32
+launcher_icon_theme = Adwaita
+launcher_tooltip = 1
+launcher_item_app = /opt/schermes/infra/desktop/browser.desktop
+launcher_item_app = /opt/schermes/infra/desktop/files.desktop
+launcher_item_app = /usr/share/applications/lxterminal.desktop
+
+taskbar_mode = single_desktop
+taskbar_padding = 0 0 4
+taskbar_background_id = 0
+taskbar_active_background_id = 0
+taskbar_name = 0
+
+task_text = 1
+task_icon = 1
+task_centered = 0
+task_maximum_size = 200 40
+task_padding = 8 4 6
+task_font = DejaVu Sans 9
+task_font_color = #e8ebf0 75
+task_active_font_color = #ffffff 100
+task_iconified_font_color = #e8ebf0 45
+task_background_id = 3
+task_active_background_id = 2
+task_iconified_background_id = 3
+task_tooltip = 1
+mouse_left = toggle_iconify
+mouse_middle = none
+mouse_right = close
+mouse_scroll_up = toggle
+mouse_scroll_down = iconify
+
+time1_format = %H:%M
+time2_format = %a %d %b
+time1_font = DejaVu Sans Bold 10
+time2_font = DejaVu Sans 8
+clock_font_color = #e8ebf0 90
+clock_padding = 8 0
+clock_background_id = 0
+
+tooltip_show_timeout = 0.4
+tooltip_hide_timeout = 0.1
+tooltip_padding = 8 6
+tooltip_background_id = 1
+tooltip_font = DejaVu Sans 9
+tooltip_font_color = #e8ebf0 100
