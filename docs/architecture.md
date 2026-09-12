@@ -896,7 +896,9 @@ to the same routes. Exactly one port is exposed, and everything on it is `/api`.
 - **Deferred** — the React + Vite web UI that used to be served off this port, removed once the
   native app reached parity. It cost a build stage in the image, a dev-dependency tree, and a
   second implementation of every thread and paging rule. Bring it back only if a browser-only
-  client becomes a requirement; the API it needs is unchanged and the git history has it.
+  client becomes a requirement. The API it needs is unchanged, but the implementation is **not
+  recoverable from this repository**: the UI was deleted while it was still uncommitted, so it
+  is in no commit and `git log -- ui/` finds nothing.
 - **Recommendation** — a client learns that something changed by **polling**, not by a WebSocket
   event stream. The daemon has no push side at all, so a stream would be a new module, a
   subscription registry and a reconnect story on both ends; a timer is none of those, it heals
