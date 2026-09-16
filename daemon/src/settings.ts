@@ -149,16 +149,22 @@ export function writePushSandbox(db: Db, sandbox: boolean): void {
  * The `.p8` mounted into the container, stored at boot the way a pasted one is, so the screen
  * never has to see it. Apple names the download `AuthKey_<KEYID>.p8`, which is where the key id
  * comes from unless one is given. An empty file is no file: compose mounts /dev/null when the
- * owner has not set one.
+ * owner has not set one. Anything else that stops the read is logged, because the daemon runs
+ * as `schermes` and a key dropped in as root with mode 600 is the ordinary way this fails.
  */
 export function seedPushKey(db: Db, masterKey: Buffer, path: string, keyId?: string): boolean {
   let pem: string;
   try {
     pem = readFileSync(path, 'utf8').trim();
-  } catch {
+  } catch (error) {
+    log.warn('push key not read', { file: path, error });
     return false;
   }
-  if (!pem.includes('-----BEGIN PRIVATE KEY-----')) return false;
+  if (pem === '') return false;
+  if (!pem.includes('-----BEGIN PRIVATE KEY-----')) {
+    log.warn('push key ignored: not a .p8', { file: path });
+    return false;
+  }
   const id = keyId?.trim() || /^AuthKey_([A-Z0-9]+)\.p8$/i.exec(basename(path))?.[1];
   if (!id) throw new Error(`the APNs key id is not in ${JSON.stringify(basename(path))}: set SCHERMES_APNS_KEY_ID`);
   writePushKey(db, masterKey, pem);

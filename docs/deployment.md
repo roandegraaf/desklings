@@ -62,6 +62,9 @@ memory-maps its WAL index, which FUSE handles badly. Updates are Unraid's own up
 For push, drop the `AuthKey_<KEYID>.p8` from the developer portal into the appdata directory
 (the `appdata` SMB share, or `cat > ... <<'EOF'` in the web terminal) and map it under its own
 name: the daemon reads the key id off the filename, so `SCHERMES_APNS_KEY_ID` is not needed.
+The daemon runs as `schermes`, not root, so the file has to be world-readable (`chmod 644`); the
+appdata directory is what keeps it private. The boot log says `push key loaded`, or `push key
+not read` with the reason.
 
 Five settings in the `schermes` service are load-bearing and have to survive any rewrite: the
 three named volumes, `hostname`, `init` and `seccomp=unconfined`.
