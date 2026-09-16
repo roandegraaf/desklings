@@ -17,7 +17,4 @@ RUN cd /opt/schermes && pnpm install --frozen-lockfile --prod
 
 COPY . /opt/schermes
 
-# setpriv execs in place, so signals from the container reach the daemon directly.
-CMD ["setpriv", "--reuid", "schermes", "--regid", "schermes", "--init-groups", \
-     "env", "HOME=/var/lib/schermes", "USER=schermes", "LOGNAME=schermes", \
-     "node", "/opt/schermes/daemon/src/main.ts"]
+ENTRYPOINT ["/opt/schermes/infra/entrypoint.sh"]

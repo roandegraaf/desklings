@@ -35,10 +35,27 @@ docker compose logs -f schermes
 Point the app at `http://<host>:7777`, set the owner password, store the provider settings,
 create an agent.
 
-On Unraid specifically: install the Compose Manager plugin from Community Applications, clone
-the repository under `/mnt/user/appdata/`, and point a stack at it. Or run the commands above
-over SSH; the Docker daemon is the one Unraid already runs. Either way the container has
-`restart: unless-stopped`, so it comes back with the array.
+### Unraid
+
+Every push to `master` builds the image on GitHub Actions and publishes it as
+`ghcr.io/roandegraaf/desklings:latest`, so Unraid pulls a finished image and never builds. In
+the Docker tab, **Add Container**, switch to advanced view, and fill in:
+
+| Field | Value |
+| --- | --- |
+| Repository | `ghcr.io/roandegraaf/desklings:latest` |
+| Network type | Bridge |
+| Port | container `7777`, host `7777` |
+| Path | container `/var/lib/schermes`, host `/mnt/cache/appdata/schermes/data` |
+| Path | container `/home`, host `/mnt/cache/appdata/schermes/home` |
+| Path | container `/srv/schermes`, host `/mnt/cache/appdata/schermes/shared` |
+| Extra parameters | `--hostname=schermes --init --shm-size=1g --security-opt=seccomp=unconfined` |
+
+The extra parameters are the four load-bearing compose settings below, spelled for `docker
+run`. The paths are plain bind mounts: the entrypoint fixes their ownership on every start, so
+an empty appdata directory is fine. Keep them on the pool (`/mnt/cache/...`, or whatever the
+pool is called) rather than under `/mnt/user/...`: that path is a FUSE filesystem, and SQLite
+memory-maps its WAL index, which FUSE handles badly. Updates are Unraid's own update button.
 
 Five settings in the `schermes` service are load-bearing and have to survive any rewrite: the
 three named volumes, `hostname`, `init` and `seccomp=unconfined`.
