@@ -920,15 +920,34 @@ test('a reply in a shared thread counts as a message between agents; in an owner
   const bravo = insertAgent(db, 'bravo') as Agent;
   const shared = conversationWith(db, [alpha.id, bravo.id]);
   const owner = conversationFor(db, alpha.id);
-  for (const conversationId of [shared, owner]) {
+  const chainAfterExchange = (conversationId: number): number => {
     appendMessage(db, conversationId, { role: 'user', content: 'go' });
     appendMessage(db, conversationId, { role: 'assistant', content: '', sender: 'alpha', toolCalls: [commandCall] });
     appendMessage(db, conversationId, { role: 'tool', content: 'exit code 0', sender: 'alpha', toolCallId: 'c2' });
     appendMessage(db, conversationId, { role: 'assistant', content: 'done', sender: 'alpha' });
     appendMessage(db, conversationId, { role: 'user', content: 'thanks', sender: 'bravo' });
+    return agentChain(db, conversationId);
+  };
+  assert.equal(chainAfterExchange(shared), 2, 'the reply and the message, not the tool step');
+  assert.equal(chainAfterExchange(owner), 1, 'a reply to the owner is not between agents');
+});
+
+test('the owner writing to either agent resets the chain', () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const bravo = insertAgent(db, 'bravo') as Agent;
+  const charlie = insertAgent(db, 'charlie') as Agent;
+  const shared = conversationWith(db, [alpha.id, bravo.id]);
+  for (let i = 0; i < MAX_AGENT_CHAIN; i++) {
+    appendMessage(db, shared, { role: 'user', content: 'again', sender: i % 2 ? 'alpha' : 'bravo' });
   }
-  assert.equal(agentChain(db, shared), 2, 'the reply and the message, not the tool step');
-  assert.equal(agentChain(db, owner), 1, 'a reply to the owner is not between agents');
+  assert.equal(agentChain(db, shared), MAX_AGENT_CHAIN);
+  appendMessage(db, conversationFor(db, charlie.id), { role: 'user', content: 'unrelated' });
+  assert.equal(agentChain(db, shared), MAX_AGENT_CHAIN, 'a post to a stranger is not the owner joining in');
+  appendMessage(db, conversationFor(db, bravo.id), { role: 'user', content: 'go ahead' });
+  assert.equal(agentChain(db, shared), 0, 'a post in a participant\'s own thread resets it');
+  appendMessage(db, shared, { role: 'user', content: 'again', sender: 'alpha' });
+  assert.equal(agentChain(db, shared), 1);
 });
 
 test('a restart hands back an agent whose reply landed before the daemon died', () => {

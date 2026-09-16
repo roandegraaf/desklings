@@ -39,9 +39,8 @@ from inside a live turn. If the daemon died in between, boot moves such an agent
 has not been written yet. Write to it and it moves.
 
 **Two agents have wedged a thread between them.** `MAX_AGENT_CHAIN` stops them after six
-messages without the owner. Posting into either agent's own thread does not clear it; post into
-the shared conversation, which is what resets the count. The UI's shared-thread composer says
-so, because it is the one thing in the API that is not discoverable from the symptom.
+messages without the owner. Posting to either agent, in its own thread or in the shared one,
+resets the count.
 
 **A message gets a 429.** The loop cap (`SCHERMES_MAX_LOOPS`, default 8) or the worker cap
 (`SCHERMES_MAX_WORKERS`, default 4). A message to a *busy* agent is never refused — the message

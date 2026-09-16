@@ -28,8 +28,8 @@ const MAX_MESSAGE_CHARS = 8_192;
  * owner. Two agents that keep writing to each other would otherwise never stop, and nothing in
  * a turn is expensive enough to notice the runaway on its own.
  *
- * ponytail: an agent-to-agent thread the owner never posts to hits this ceiling permanently.
- * Posting to that conversation clears it; a decay rule can wait until anyone wants one.
+ * ponytail: an agent-to-agent thread hits this ceiling permanently until the owner posts to any
+ * of its agents. A decay rule can wait until anyone wants one.
  */
 export const MAX_AGENT_CHAIN = 6;
 
@@ -329,23 +329,39 @@ export function pendingConversation(
 }
 
 /**
- * How many messages agents have passed between themselves since the owner last spoke here. In a
- * shared thread an agent's reply is one of them: every other agent is shown it as a message and
- * answers it, which is how two agents kept reacting to each other under a cap that counted only
- * `send_message`.
+ * How many messages agents have passed between themselves since the owner last spoke to any of
+ * them. The owner's word reaches an agent through its own thread as much as through the shared
+ * one, so a post to either participant is what resets the count. In a shared thread an agent's
+ * reply is one of them: every other agent is shown it as a message and answers it, which is how
+ * two agents kept reacting to each other under a cap that counted only `send_message`.
  */
 export function agentChain(db: Db, conversationId: number): number {
+  const participants = participantAgents(db, conversationId).map((agent) => agent.id);
+  const spoke =
+    db
+      .select({ id: max(messages.id) })
+      .from(messages)
+      .innerJoin(
+        conversationParticipants,
+        eq(conversationParticipants.conversationId, messages.conversationId),
+      )
+      .where(
+        and(
+          inArray(conversationParticipants.agentId, participants),
+          eq(messages.role, 'user'),
+          isNull(messages.sender),
+        ),
+      )
+      .get()?.id ?? 0;
   // Not listMessages: this runs per send_message, and parsing every stored screenshot blocks the loop.
   const stored = db
     .select({ role: messages.role, sender: messages.sender, toolCalls: messages.toolCalls })
     .from(messages)
-    .where(eq(messages.conversationId, conversationId))
+    .where(and(eq(messages.conversationId, conversationId), gt(messages.id, spoke)))
     .orderBy(asc(messages.id))
     .all();
-  const spoke = stored.findLastIndex((message) => message.role === 'user' && message.sender === null);
-  const shared = participantAgents(db, conversationId).length > 1;
+  const shared = participants.length > 1;
   return stored
-    .slice(spoke + 1)
     .filter(
       (message) =>
         message.sender !== null &&
