@@ -143,6 +143,25 @@ export function parseProfile(body: Record<string, unknown>): string | { error: s
   return profile.trim();
 }
 
+export function setNameToolDef(): ToolDef {
+  return {
+    name: 'set_name',
+    description:
+      'Change the name you run and are addressed by: lowercase letters, digits and dashes, up ' +
+      'to 31 characters, not one another agent has. It takes effect when this turn ends: your ' +
+      'Linux user and home move with it, your desktop restarts, and your history stays yours. ' +
+      'Until then you are still your current name.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', pattern: '^[a-z0-9][a-z0-9-]{0,30}$' },
+      },
+      required: ['name'],
+      additionalProperties: false,
+    },
+  };
+}
+
 export function setProfileToolDef(): ToolDef {
   return {
     name: 'set_profile',

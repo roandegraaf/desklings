@@ -109,7 +109,8 @@ struct Agent: Codable, Sendable, Identifiable, Hashable {
     var id: Int
     var name: String
     /// What the owner calls it, free text and cosmetic. `name` is still what runs as a Linux
-    /// user, what the agents address each other by and what every route is keyed on.
+    /// user, what the agents address each other by and what every route is keyed on; changing
+    /// it moves all three, which `updateAgent(slug:)` asks the daemon to do.
     var label: String?
     /// How a client draws it, an opaque token the daemon stores and every device reads, so the
     /// avatar picked on one is the avatar on all of them. `BloubIdentity` owns the format.

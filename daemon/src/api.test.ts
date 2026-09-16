@@ -44,6 +44,7 @@ function fixture(caps: { maxLoops?: number } = {}) {
   const masterKey = loadMasterKey(join(mkdtempSync(join(tmpdir(), 'schermes-api-')), 'master.key'));
   const spawned: string[] = [];
   const stopped: string[] = [];
+  const moved: [string, string][] = [];
   const desktop = {
     ensure(name: string) {
       if (name === 'unspawnable') return Promise.reject(new Error('Xvnc did not come up'));
@@ -52,6 +53,11 @@ function fixture(caps: { maxLoops?: number } = {}) {
     },
     stop(name: string) {
       stopped.push(name);
+      return Promise.resolve();
+    },
+    rename(from: string, to: string) {
+      if (to === 'unmovable') return Promise.reject(new Error('agent-unmovable already exists'));
+      moved.push([from, to]);
       return Promise.resolve();
     },
   };
@@ -88,6 +94,7 @@ function fixture(caps: { maxLoops?: number } = {}) {
     masterKey,
     spawned,
     stopped,
+    moved,
     ran,
     replies,
     app: createApp({ db, masterKey, desktop, exec, makeProvider, ...caps }).app,
@@ -334,6 +341,39 @@ test('an agent carries the free-text name the owner gave it, and can be renamed'
   // An agent created without one has no label at all, so a reader falls back to the name.
   const plain = await json(await post(app, '/api/agents', { name: 'charlie' }, cookie));
   assert.ok(!('label' in plain), 'no label rather than an empty one');
+});
+
+test('an agent can move to a new name, taking its history, its user and its desktop along', async () => {
+  const f = fixture();
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
+  const alpha = await json(await post(f.app, '/api/agents', { name: 'alpha', label: 'Bob', profile: PROFILED }, cookie));
+  await post(f.app, '/api/agents', { name: 'charlie' }, cookie);
+  const thread = conversationFor(f.db, Number(alpha['id']));
+  appendMessage(f.db, thread, { role: 'assistant', content: 'hi', sender: 'alpha' });
+  insertApproval(f.db, findAgent(f.db, 'charlie') as Agent, thread, { kind: 'agent', target: 'alpha', reason: 'idle' });
+
+  for (const name of ['Bravo', 'a b', '-x', 'a'.repeat(32)]) {
+    assert.equal((await patch(f.app, '/api/agents/alpha', { name }, cookie)).status, 400, name);
+  }
+  assert.equal((await patch(f.app, '/api/agents/alpha', { name: 'charlie' }, cookie)).status, 409, 'taken');
+  assert.equal((await patch(f.app, '/api/agents/alpha', { name: 'unmovable' }, cookie)).status, 500);
+  assert.equal(findAgent(f.db, 'alpha')?.label, 'Bob', 'a user that would not move leaves the row as it was');
+  assert.deepEqual(f.spawned, ['alpha', 'charlie', 'alpha'], 'and its desktop comes back');
+
+  const renamed = await patch(f.app, '/api/agents/alpha', { name: 'bravo', label: 'Bob II' }, cookie);
+  assert.equal(renamed.status, 200);
+  const after = await json(renamed);
+  assert.equal(after['name'], 'bravo');
+  assert.equal(after['label'], 'Bob II', 'the cosmetics in the same request are kept too');
+  assert.equal(after['id'], alpha['id'], 'the same agent');
+  assert.deepEqual(f.moved, [['alpha', 'bravo']]);
+  assert.deepEqual(f.stopped, ['alpha', 'alpha'], 'the desktop is down while the user moves');
+  assert.deepEqual(f.spawned, ['alpha', 'charlie', 'alpha', 'bravo'], 'and back up under the new name');
+  assert.equal((await f.app.request('/api/agents/alpha', { headers: { cookie } })).status, 404);
+  assert.deepEqual(listMessages(f.db, thread).map((m) => m.sender), ['bravo']);
+  assert.deepEqual(listApprovals(f.db).map((a) => a.target), ['bravo']);
+  assert.equal((await patch(f.app, '/api/agents/bravo', { name: 'bravo' }, cookie)).status, 200, 'the same name is not a move');
+  assert.equal(f.moved.length, 1);
 });
 
 test('an agent whose desktop will not start is not left half-created', async () => {

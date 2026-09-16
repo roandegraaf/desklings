@@ -163,7 +163,8 @@ export type Agent = {
   id: number;
   name: string;
   /** What the owner calls it, free text. Cosmetic only: `name` is what runs, is addressed and is
-   * routed to, and a label is never any of those. Absent on a task worker. */
+   * routed to, and a label is never any of those. Absent on a task worker. A name changes only by
+   * a move: `PATCH` with a `name`, or the agent's own `set_name`. */
   label?: string;
   /** How a client draws it: an opaque token the daemon stores so every device shows the same
    * avatar. Absent until a client sets one. */

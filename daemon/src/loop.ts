@@ -7,6 +7,7 @@ import type {
   ToolCall,
 } from '@schermes/shared';
 import {
+  AGENT_NAME,
   agentTarget,
   asAgent,
   findAgent,
@@ -50,6 +51,7 @@ import { computerToolDef, parseComputerAction, performComputerAction } from './c
 import { homePrompt, loadHome, parseRemember, remember, rememberToolDef } from './home.ts';
 import {
   askOwnerToolDef,
+  setNameToolDef,
   parseAskOwner,
   parseProfile,
   profilePrompt,
@@ -388,6 +390,8 @@ export type LoopDeps = {
   maxWorkers: number;
   /** Fires when the owner stops the turn. */
   signal?: AbortSignal;
+  /** Moves an agent to the name it asked for with set_name, once its turn is over. */
+  rename?: ((agent: Agent, name: string) => Promise<void>) | undefined;
   /** Hears what a permanent agent said at the end of a turn, and why one failed: the seam a
    * messaging channel hangs off. The thread it happened in is passed so the channel can decide
    * whether it is one the owner reads there. */
@@ -879,6 +883,29 @@ async function dispatch(
     };
   }
 
+  // Not now: this turn runs as the current user, and the desktop has to be down for the Linux
+  // user to move. The runner does it after the turn, so the check here is only the name.
+  if (call.name === 'set_name' && agent.parentId === undefined) {
+    const name = args['name'];
+    const error =
+      typeof name !== 'string' || !AGENT_NAME.test(name)
+        ? `name must match ${AGENT_NAME.source}`
+        : name === agent.name
+          ? `you are already ${name}`
+          : findAgent(deps.db, name) !== undefined
+            ? `${name} is taken`
+            : deps.rename === undefined
+              ? 'renaming is not available here'
+              : workersBusy(deps.db, deps.runner, agent)
+                ? 'a task worker of yours is still running as you; wait for its result first'
+                : undefined;
+    if (error !== undefined) return { text: `error: ${error}`, event: { ok: false, error } };
+    return {
+      text: `You will be ${name} from your next turn on; finish this one as ${agent.name}.`,
+      event: { ok: true, name },
+    };
+  }
+
   if (call.name === 'set_profile' && agent.parentId === undefined) {
     const profile = parseProfile(args);
     if (typeof profile !== 'string') {
@@ -1094,6 +1121,7 @@ export async function runAgent(
           requestDeletionToolDef(),
           askOwnerToolDef(),
           setProfileToolDef(),
+          setNameToolDef(),
         ]
       : [commandToolDef(), webSearchToolDef(), webFetchToolDef()];
   // The row, not the argument: the profile is written mid-turn by set_profile, and the next
@@ -1133,6 +1161,7 @@ export async function runAgent(
   let spawned = false;
   let refused = false;
   let asked = false;
+  let rename: string | undefined;
   let steps = 0;
   const usage = { promptTokens: 0, completionTokens: 0 };
   let metered = false;
@@ -1215,6 +1244,7 @@ export async function runAgent(
         if (observation.event['ok'] === true && call.name === 'send_message') wrote = true;
         if (observation.event['ok'] === true && call.name === 'spawn_task_worker') spawned = true;
         if (observation.event['ok'] === true && call.name === 'ask_owner') asked = true;
+        if (observation.event['ok'] === true && call.name === 'set_name') rename = String(observation.event['name']);
         if (observation.event['error'] === CONTROL_HELD) refused = true;
         appendMessage(db, conversationId, {
           role: 'tool',
@@ -1268,7 +1298,19 @@ export async function runAgent(
     // Every way out of the turn, not only the last line of the happy one: a stdio session left
     // open is a child process that outlives the turn that started it.
     await mcp?.close();
+    // Last, with nothing of the turn still running as the old user. The failure is logged and
+    // not thrown: the turn itself succeeded, and the next one runs under the name that stuck.
+    if (rename !== undefined) {
+      await deps.rename?.(agent, rename).catch((error: unknown) => {
+        log.error('agent rename failed', { agent: agent.name, to: rename, error });
+      });
+    }
   }
+}
+
+/** A worker runs as its parent's Linux user, so stopping that user's processes stops the worker. */
+export function workersBusy(db: Db, runner: Runner, agent: Agent): boolean {
+  return listAgents(db).some((other) => other.parentId === agent.id && runner.running(other.name));
 }
 
 export type RunnerDeps = {
@@ -1287,6 +1329,7 @@ export type RunnerDeps = {
   maxLoops: number;
   maxWorkers: number;
   deliver?: NonNullable<LoopDeps['deliver']> | undefined;
+  rename?: LoopDeps['rename'];
 };
 
 // One agent piling up messages faster than it answers them still has to let go eventually.

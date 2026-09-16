@@ -185,8 +185,11 @@ struct ConsoleView: View {
         // costs one request and changes nothing.
         .task(id: registration.token) {
             guard let token = registration.token, token != session.registeredDevice else { return }
-            if (try? await session.run({ try await $0.registerDevice(registration, token: token) })) != nil {
+            do {
+                try await session.run { try await $0.registerDevice(registration, token: token) }
                 session.registeredDevice = token
+            } catch {
+                if !error.isCancellation { registration.failure = "the daemon refused it: \(error.localizedDescription)" }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .openAgent)) { note in

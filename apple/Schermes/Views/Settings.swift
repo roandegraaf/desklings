@@ -366,7 +366,7 @@ private struct NotificationsPage: View {
                 Text("Mount the AuthKey_<KEYID>.p8 from the Apple Developer portal into the container and point SCHERMES_APNS_KEY_FILE at it; then nothing here needs filling in. Paste it only when you cannot: blank keeps the stored one.")
             }
         }
-        .task {
+        .task(id: session.registeredDevice) {
             devices = (try? await session.run { try await $0.devices() }) ?? []
         }
     }

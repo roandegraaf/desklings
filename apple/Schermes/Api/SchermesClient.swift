@@ -387,10 +387,12 @@ struct SchermesClient: Sendable {
         try await send("POST", url("/api/agents"), body: ["name": name, "label": label, "look": look])
     }
 
-    /// Changes what the owner sees and what the agent is told it is: the name, the avatar, the
-    /// profile. The agent keeps the name it runs and is addressed by. A blank profile clears it.
-    func updateAgent(name: String, label: String? = nil, look: String? = nil, profile: String? = nil) async throws -> Agent {
+    /// Changes what the owner sees and what the agent is told it is: the label, the avatar, the
+    /// profile. A `slug` moves the agent to a new name: its Linux user, home and desktop go with
+    /// it, so the daemon refuses one while the agent is in a turn. A blank profile clears it.
+    func updateAgent(name: String, slug: String? = nil, label: String? = nil, look: String? = nil, profile: String? = nil) async throws -> Agent {
         var body: [String: String] = [:]
+        if let slug { body["name"] = slug }
         if let label { body["label"] = label }
         if let look { body["look"] = look }
         if let profile { body["profile"] = profile }

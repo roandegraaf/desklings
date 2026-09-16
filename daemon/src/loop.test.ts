@@ -2204,3 +2204,39 @@ test("the owner's pictures reach the model as user images and share the replay w
   assert.match(sent.find((m) => 'image' in m && m.image?.base64 === 'pic2')?.text ?? '', /Message from the owner:\n/);
   assert.ok(first.image?.mediaType === 'image/jpeg');
 });
+
+test('set_name moves the agent only once its turn is over, and only to a free valid name', async () => {
+  const renames: [string, string][] = [];
+  const rename = (agent: Agent, name: string) => {
+    renames.push([agent.name, name]);
+    return Promise.resolve();
+  };
+  const nameCall = (id: string, name: string) => ({ id, name: 'set_name', arguments: JSON.stringify({ name }) });
+  const f = fixture([
+    { toolCalls: [nameCall('n1', 'Bravo'), nameCall('n2', 'alpha'), nameCall('n3', 'bravo')] },
+    { toolCalls: [commandCall] },
+    { text: 'Done.' },
+  ]);
+  insertAgent(f.db, 'taken');
+  const seenBeforeEnd = () => renames.length;
+  const deps = { ...f.deps, rename, exec: (file: string, args: readonly string[], options?: unknown) => {
+    assert.equal(seenBeforeEnd(), 0, 'the turn still runs as alpha');
+    return f.deps.exec(file, args, options as never);
+  } };
+
+  f.ask('Call yourself bravo.');
+  await runAgent(deps, f.agent, f.conversationId);
+  assert.ok(f.offered[0]?.includes('set_name'));
+  const results = f.messages().filter((m) => m.role === 'tool');
+  assert.match(String(results.find((m) => m.toolCallId === 'n1')?.content), /must match/);
+  assert.match(String(results.find((m) => m.toolCallId === 'n2')?.content), /already alpha/);
+  assert.match(String(results.find((m) => m.toolCallId === 'n3')?.content), /from your next turn on/);
+  assert.deepEqual(renames, [['alpha', 'bravo']]);
+
+  const g = fixture([{ toolCalls: [nameCall('n4', 'taken')] }, { text: 'Oh.' }]);
+  insertAgent(g.db, 'taken');
+  g.ask('Be taken.');
+  await runAgent({ ...g.deps, rename }, g.agent, g.conversationId);
+  assert.match(String(g.messages().find((m) => m.toolCallId === 'n4')?.content), /taken is taken/);
+  assert.equal(renames.length, 1);
+});

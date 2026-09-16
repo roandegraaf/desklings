@@ -82,7 +82,7 @@ log "sudoers"
 # The daemon (schermes) may create agent users, install packages, and act as any agent user.
 # create-agent-user.sh is root-owned under /opt/schermes, so this is not a path to arbitrary root.
 cat > /etc/sudoers.d/schermes.tmp <<'EOF'
-schermes ALL=(root) NOPASSWD: /opt/schermes/infra/desktop/create-agent-user.sh, /usr/bin/apt-get
+schermes ALL=(root) NOPASSWD: /opt/schermes/infra/desktop/create-agent-user.sh, /opt/schermes/infra/desktop/rename-agent-user.sh, /usr/bin/apt-get
 schermes ALL=(%agents) NOPASSWD: ALL
 EOF
 # Agent users are the operators of their own machine; the spec allows passwordless sudo.

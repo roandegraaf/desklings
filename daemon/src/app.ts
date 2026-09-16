@@ -59,7 +59,9 @@ import {
   findAgentById,
   forgetAgent,
   insertAgent,
+  isWorker,
   listAgents,
+  renameAgent,
   setAgentCosmetics,
 } from './agents.ts';
 import {
@@ -97,7 +99,7 @@ import {
 } from './schedules.ts';
 import { isHttpServer, openMcp, parseMcpServers, withStoredSecrets } from './mcp.ts';
 import type { McpServerSpec } from './mcp.ts';
-import { compactNow, createRunner, liveReply } from './loop.ts';
+import { compactNow, createRunner, liveReply, workersBusy } from './loop.ts';
 import {
   MAX_FILE_BYTES,
   MAX_MEMORY_FILE_CHARS,
@@ -302,6 +304,7 @@ export function createApp({
     // owner, and a deletion request wherever it was made, become a push to every registered
     // device. Fire and forget; nothing configured or nobody registered is silence, and a
     // failed delivery is a log line.
+    rename: (agent, name) => moveAgent(agent, name).then(() => undefined),
     // Called from inside a turn, so a throw here would fail a turn that already finished.
     deliver: (agent, conversationId, text, kind) => {
       try {
@@ -569,6 +572,25 @@ export function createApp({
 
   /** The desktop first: the row is what frees the display number, and an Xvnc still holding it
    * would be adopted by whichever agent is given that number next. */
+  /**
+   * The desktop first, because usermod refuses a user with processes; the row last, because a
+   * user that would not move is a rename that did not happen. The turn cap is the caller's:
+   * nothing here runs while the agent does.
+   */
+  async function moveAgent(agent: Agent, name: string): Promise<Agent> {
+    await desktop.stop(agent.name);
+    try {
+      await desktop.rename(agent.name, name);
+    } catch (error) {
+      await desktop.ensure(agent.name, agent.display);
+      throw error;
+    }
+    const moved = renameAgent(db, agent, name);
+    log.info('agent renamed', { from: agent.name, to: name });
+    await desktop.ensure(moved.name, moved.display);
+    return moved;
+  }
+
   async function removeAgent(agent: Agent): Promise<void> {
     try {
       await desktop.stop(agent.name);
@@ -633,20 +655,37 @@ export function createApp({
     return c.json(findAgent(db, name) ?? agent, 201);
   });
 
-  /** The owner's name, avatar and profile for an agent. Nothing here needs what creating one
-   * needs: no desktop, no Linux user, nothing but the row. */
+  /** The owner's name, avatar and profile for an agent are the row alone. A new `name` is the
+   * Linux user and the desktop too, so it waits for a turn that is running to end. */
   app.patch('/api/agents/:name', async (c) => {
     const agent = findAgent(db, c.req.param('name'));
     if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
 
-    const fields = agentFields(await jsonBody(c));
+    const body = await jsonBody(c);
+    const fields = agentFields(body);
     if ('error' in fields) return c.json({ error: fields.error }, 400);
-    if (Object.keys(fields).length === 0) {
-      return c.json({ error: 'nothing to change: send a label, a look or a profile' }, 400);
+    const name = stringField(body, 'name');
+    if (name === undefined && Object.keys(fields).length === 0) {
+      return c.json({ error: 'nothing to change: send a name, a label, a look or a profile' }, 400);
+    }
+    if (name !== undefined && !AGENT_NAME.test(name)) {
+      return c.json({ error: `name must match ${AGENT_NAME.source}` }, 400);
     }
 
-    setAgentCosmetics(db, agent.name, fields);
-    return c.json(findAgent(db, agent.name));
+    if (Object.keys(fields).length > 0) setAgentCosmetics(db, agent.name, fields);
+    if (name === undefined || name === agent.name) return c.json(findAgent(db, agent.name));
+
+    if (isWorker(agent)) return c.json({ error: 'a task worker keeps its name' }, 400);
+    if (findAgent(db, name) !== undefined) return c.json({ error: 'agent already exists' }, 409);
+    if (runner.running(agent.name) || workersBusy(db, runner, agent)) {
+      return c.json({ error: `${agent.name} is in the middle of a turn; try again in a moment` }, 409);
+    }
+    try {
+      return c.json(await moveAgent(agent, name));
+    } catch (error) {
+      log.error('agent rename failed', { agent: agent.name, to: name, error });
+      return c.json({ error: `could not rename ${agent.name}: ${(error as Error).message}` }, 500);
+    }
   });
 
   /** Ends the turn an agent is in the middle of. Nothing is deleted: the transcript keeps

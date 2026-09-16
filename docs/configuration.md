@@ -224,11 +224,18 @@ stop", not because anything reads them from the environment. Changing one is a c
 Agent names match `^[a-z0-9][a-z0-9-]{0,30}$`. The name becomes the Linux user `agent-<name>`,
 so it is validated at every boundary that accepts one.
 
-A name is the system identity and never changes. What the owner is shown is the agent's `label`:
-free text, any script, up to `MAX_LABEL_CHARS` on one line, and purely cosmetic — nothing
-addresses, routes, runs as or names a file after a label, and the app derives the name from it
-when an agent is created (`Bob the Builder` runs as `agent-bob-the-builder`). `PATCH
-/api/agents/:name` changes a label, a look or a profile; nothing changes a name.
+A name is the system identity. What the owner is shown is the agent's `label`: free text, any
+script, up to `MAX_LABEL_CHARS` on one line, and purely cosmetic — nothing addresses, routes,
+runs as or names a file after a label, and the app derives the name from it when an agent is
+created (`Bob the Builder` runs as `agent-bob-the-builder`). `PATCH /api/agents/:name` changes a
+label, a look or a profile in the row alone. A `name` in the same request moves the agent: its
+desktop is stopped, `rename-agent-user.sh` moves the Linux user and its home (`usermod
+--move-home`), every `sender` and approval target spelling the old name is rewritten, and the
+desktop starts again under the new one. It is refused while the agent is in a turn (409), for a
+name another agent holds (409), and when a deleted agent's user still occupies the new name
+(500, from the script). An agent renames itself with `set_name`; the move waits for its turn to
+end, because the turn is running as the old user. Its task workers keep the names they were born
+with.
 
 An agent's `profile` is what it is for, in Markdown, in its system prompt every turn. A new
 agent has none and interviews the owner with `ask_owner` to write one with `set_profile`;

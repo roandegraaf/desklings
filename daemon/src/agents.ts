@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { asc, eq } from 'drizzle-orm';
+import { and, asc, eq } from 'drizzle-orm';
 import type { Agent, AgentState } from '@schermes/shared';
 import { config } from './config.ts';
 import { log } from './log.ts';
@@ -46,6 +46,9 @@ export type DesktopOps = {
   /** Everything this agent is running, stopped. Called when the agent is deleted: its display
    * number goes back in the pool, and an Xvnc still holding it would take the next agent's. */
   stop(name: string): Promise<void>;
+  /** Moves the Linux user and its home to a new name. Only with the desktop stopped: usermod
+   * refuses a user that still has processes. */
+  rename(from: string, to: string): Promise<void>;
 };
 
 export const systemDesktop: DesktopOps = {
@@ -54,6 +57,10 @@ export const systemDesktop: DesktopOps = {
     // Xvnc, the window manager, the dock and whatever the agent left running, in one signal.
     // `pkill` exits 1 when nothing matched, which is a desktop that was already down.
     await run('sudo', ['-n', '-u', user, 'pkill', '-u', user]).catch(() => undefined);
+  },
+
+  async rename(from, to) {
+    await run('sudo', ['-n', `${config.desktopScripts}/rename-agent-user.sh`, from, to]);
   },
 
   async ensure(name, display) {
@@ -188,14 +195,31 @@ export function insertAgent(
   );
 }
 
-/** Changes what the owner sees and what the agent is told it is. The row's `name` is its system
- * identity and never moves. A null profile clears it. */
+/** Changes what the owner sees and what the agent is told it is. A null profile clears it. */
 export function setAgentCosmetics(
   db: Db,
   name: string,
   cosmetics: { label?: string; look?: string; profile?: string | null },
 ): void {
   db.update(agents).set(cosmetics).where(eq(agents.name, name)).run();
+}
+
+/**
+ * The row and every string that spells its name: what it sent, the summaries written for it,
+ * and a pending request to delete it. Rows keyed on its id need nothing. Its task workers keep
+ * the names they were born with; the next one is named after the new stem.
+ */
+export function renameAgent(db: Db, agent: Agent, name: string): Agent {
+  return db.transaction((tx) => {
+    tx.update(agents).set({ name }).where(eq(agents.id, agent.id)).run();
+    tx.update(messages).set({ sender: name }).where(eq(messages.sender, agent.name)).run();
+    tx.update(summaries).set({ sender: name }).where(eq(summaries.sender, agent.name)).run();
+    tx.update(approvals)
+      .set({ target: name })
+      .where(and(eq(approvals.kind, 'agent'), eq(approvals.target, agent.name)))
+      .run();
+    return toAgent(tx.select().from(agents).where(eq(agents.id, agent.id)).get()!);
+  });
 }
 
 /**

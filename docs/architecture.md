@@ -179,6 +179,11 @@ that belongs to it for as long as the row exists. Creating one through the API d
   name stays the identity: the Linux user, the agents' address for each other, the tool schemas
   and every route are keyed on it, and a label reaches none of them. The app derives a name from
   the label when it creates one, and shows the derived name before the owner commits to it.
+- **Requirement** — a name can still move, by the owner (`PATCH` with a `name`) or by the agent
+  (`set_name`). A move is the row plus everything spelled after it — `messages.sender`,
+  `summaries.sender`, an approval's `target` — in one transaction, between stopping the desktop
+  and starting it again, because `usermod` refuses a user with processes. An agent's own request
+  is carried out after its turn, which runs as the old user until then.
 - **Recommendation** — the avatar the owner picked is a `look` column beside the label, an
   opaque token the daemon stores under the label's rule and reads none of. It exists so a phone
   and a Mac draw the same agent: a look kept in one device's defaults was a different agent on

@@ -106,12 +106,13 @@ final class NotificationRelay: NSObject, UNUserNotificationCenterDelegate {
         pushRegistration.failure = error.localizedDescription
     }
 
-    /// The app is in front: the poll already draws what this announces.
+    /// The app is in front: the poll already draws what an agent's push announces. A push about
+    /// no agent is the test from the settings screen, which is sent to be seen.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        []
+        notification.request.content.userInfo["agent"] == nil ? [.banner, .sound] : []
     }
 
     func userNotificationCenter(

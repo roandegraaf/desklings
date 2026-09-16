@@ -69,8 +69,8 @@ struct BloubPicker: View {
     }
 }
 
-/// Changing an agent's name and look after it exists. The same picker as the create sheet, over a
-/// big live avatar so the choice is made against the thing itself rather than a swatch.
+/// Changing an agent's name, slug and look after it exists. The same picker as the create sheet,
+/// over a big live avatar so the choice is made against the thing itself rather than a swatch.
 struct AgentLookSheet: View {
     let session: Session
     let agent: Agent
@@ -79,6 +79,7 @@ struct AgentLookSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var identity: BloubIdentity
     @State private var label: String
+    @State private var slug: String
     @State private var trouble: String?
     /// What the daemon held when the sheet opened, so Done sends only what moved.
     private let opened: BloubIdentity
@@ -89,9 +90,11 @@ struct AgentLookSheet: View {
         opened = identity
         _identity = State(initialValue: identity)
         _label = State(initialValue: agent.title)
+        _slug = State(initialValue: agent.name)
     }
 
     private var wanted: String { label.trimmingCharacters(in: .whitespaces) }
+    private var wantedSlug: String { slug.trimmingCharacters(in: .whitespaces) }
 
     var body: some View {
         VStack(spacing: 18) {
@@ -103,9 +106,24 @@ struct AgentLookSheet: View {
                 .multilineTextAlignment(.center)
                 .font(.title3.weight(.semibold))
                 .onSubmit(finish)
-            Text(trouble ?? "Runs as agent-\(agent.name)")
-                .font(.footnote.monospaced())
-                .foregroundStyle(trouble == nil ? Color.secondary : Color.red)
+            HStack(spacing: 0) {
+                Text("Runs as agent-")
+                TextField("slug", text: $slug)
+                    .textFieldStyle(.plain)
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .fixedSize()
+                    .onSubmit(finish)
+            }
+            .font(.footnote.monospaced())
+            .foregroundStyle(.secondary)
+            if let trouble {
+                Text(trouble)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
 
             BloubPicker(identity: $identity)
 
@@ -126,21 +144,33 @@ struct AgentLookSheet: View {
         .onChange(of: identity) { looks[agent.name] = identity }
     }
 
-    /// Saves whatever changed — the name, the look, or both — then closes. The look is already on
+    /// Saves whatever changed — the name, the slug, the look — then closes. The look is already on
     /// this device the moment it is picked; the daemon is where the other devices read it from.
-    /// The list polls every couple of seconds, so nothing here has to tell it; a save that fails
-    /// keeps the sheet open and says why.
+    /// The list polls every couple of seconds, so nothing here has to tell it, except a new slug:
+    /// the row the list has selected is keyed on the old one, so the sheet points it at the new.
+    /// A save that fails keeps the sheet open and says why.
     private func finish() {
         let newLabel = wanted != agent.title ? wanted : nil
+        let newSlug = wantedSlug != agent.name ? wantedSlug : nil
         let newLook = identity != opened ? identity.token : nil
-        guard newLabel != nil || newLook != nil else { return dismiss() }
+        guard newLabel != nil || newSlug != nil || newLook != nil else { return dismiss() }
         if newLabel != nil, !isAgentLabel(wanted) {
             trouble = "One line, up to \(MAX_AGENT_LABEL) characters."
             return
         }
+        if let newSlug, !isAgentName(newSlug) {
+            trouble = "Lowercase letters, digits and dashes, up to \(MAX_AGENT_NAME) characters."
+            return
+        }
         Task {
             do {
-                _ = try await session.run { try await $0.updateAgent(name: agent.name, label: newLabel, look: newLook) }
+                let saved = try await session.run {
+                    try await $0.updateAgent(name: agent.name, slug: newSlug, label: newLabel, look: newLook)
+                }
+                if newSlug != nil {
+                    looks[saved.name] = identity
+                    NotificationCenter.default.post(name: .openAgent, object: saved.name)
+                }
                 dismiss()
             } catch {
                 trouble = error.localizedDescription
