@@ -8,6 +8,9 @@ enum SchermesError: LocalizedError {
     case daemon(status: Int, message: String)
     case badURL
     case notJSON(String)
+    /// Valid JSON that is not a server list. The daemon would say so too; saying it here names
+    /// the entry rather than the request.
+    case notServers(String)
 
     var errorDescription: String? {
         switch self {
@@ -15,6 +18,7 @@ enum SchermesError: LocalizedError {
         case .daemon(_, let message): message
         case .badURL: "that is not a daemon address"
         case .notJSON(let detail): "that is not JSON: \(detail)"
+        case .notServers(let detail): detail
         }
     }
 }
@@ -50,44 +54,66 @@ enum ThreadSource: Hashable, Sendable {
 struct DaemonSettings: Decodable, Sendable {
     var provider: ProviderSettings
     var web: WebSettings
+    var push: PushSettings
+
+    private enum Keys: String, CodingKey { case push }
 
     init(from decoder: any Decoder) throws {
         provider = try ProviderSettings(from: decoder)
         web = try WebSettings(from: decoder)
+        // Absent on a daemon from before push existed, which is not a reason to refuse the
+        // settings screen.
+        push = try decoder.container(keyedBy: Keys.self)
+            .decodeIfPresent(PushSettings.self, forKey: .push)
+            ?? PushSettings(keyId: "", teamId: "", bundleId: "", keySet: false, sandbox: false)
     }
 }
 
 struct DaemonSettingsUpdate: Encodable, Sendable {
     var provider: ProviderSettingsUpdate
     var web: WebSettingsUpdate
+    var push: PushSettingsUpdate
 
     func encode(to encoder: any Encoder) throws {
         try provider.encode(to: encoder)
         try web.encode(to: encoder)
+        try push.encode(to: encoder)
     }
 }
 
-/// What the settings screen edits. Only made from what the daemon answered, because a save sends
-/// every field and one sent from an empty form would blank everything stored. The keys are
+/// What the settings pages edit. Only made from what the daemon answered, because a page's save
+/// sends every field it owns and one made from an empty form would blank them. The keys are
 /// write-only and start blank.
 struct SettingsForm: Equatable {
     var baseUrl: String
     var model: String
     var extraBody: String
     var searchUrl: String
+    var pushKeyId: String
+    var pushTeamId: String
+    var pushBundleId: String
+    var pushSandbox: Bool
     var apiKey = ""
     var searchKey = ""
+    var pushKey = ""
 
     init(_ settings: DaemonSettings) {
         baseUrl = settings.provider.baseUrl
         model = settings.provider.model
         extraBody = settings.provider.extraBody
         searchUrl = settings.web.searchUrl
+        pushKeyId = settings.push.keyId
+        pushTeamId = settings.push.teamId
+        pushBundleId = settings.push.bundleId
+        pushSandbox = settings.push.sandbox
     }
 
+    /// One page at a time: `PUT /api/settings` keeps every field a body leaves out, so a page
+    /// sends its own fields and the other two halves encode to nothing.
+    ///
     /// The daemon writes whatever string it is given, so a blank key is left out rather than sent
     /// as `""`, which would erase it. Every other field always goes: empty is how one is cleared.
-    var update: DaemonSettingsUpdate {
+    var modelUpdate: DaemonSettingsUpdate {
         DaemonSettingsUpdate(
             provider: ProviderSettingsUpdate(
                 baseUrl: baseUrl,
@@ -95,7 +121,30 @@ struct SettingsForm: Equatable {
                 apiKey: apiKey.isEmpty ? nil : apiKey,
                 extraBody: typedJSON(extraBody)
             ),
-            web: WebSettingsUpdate(searchUrl: searchUrl, searchKey: searchKey.isEmpty ? nil : searchKey)
+            web: WebSettingsUpdate(),
+            push: PushSettingsUpdate()
+        )
+    }
+
+    var webUpdate: DaemonSettingsUpdate {
+        DaemonSettingsUpdate(
+            provider: ProviderSettingsUpdate(),
+            web: WebSettingsUpdate(searchUrl: searchUrl, searchKey: searchKey.isEmpty ? nil : searchKey),
+            push: PushSettingsUpdate()
+        )
+    }
+
+    var pushUpdate: DaemonSettingsUpdate {
+        DaemonSettingsUpdate(
+            provider: ProviderSettingsUpdate(),
+            web: WebSettingsUpdate(),
+            push: PushSettingsUpdate(
+                pushKeyId: pushKeyId,
+                pushTeamId: pushTeamId,
+                pushBundleId: pushBundleId,
+                pushKey: pushKey.isEmpty ? nil : pushKey,
+                pushSandbox: pushSandbox
+            )
         )
     }
 }
@@ -112,17 +161,133 @@ func typedJSON(_ text: String) -> String {
     return parses(straight) ? straight : text
 }
 
-/// The MCP box as the daemon's `servers`. Parsed here, as the web UI does, so a typo is named with
-/// its line and column instead of arriving as something that is not an array. Empty is no servers.
-func mcpServers(fromDraft draft: String) throws -> JSONValue {
+/// One server as the editor holds it, and exactly the body `PUT /api/mcp/servers/<name>` wants.
+/// A secret already stored is the empty string here and goes out as one, which is what keeps it:
+/// a key left out of the block would be removed with it, so the whole set is always encoded, an
+/// empty block as `{}`. Only the half the transport uses is sent.
+struct McpServerDraft: Sendable, Hashable, Encodable {
+    /// One `env` variable or header. A list rather than a dictionary so the editor's rows keep
+    /// the order they are given.
+    struct Secret: Sendable, Hashable {
+        var key: String
+        var value: String
+    }
+
+    var name: String = ""
+    var transport: McpServerSummary.Transport = .stdio
+    var command: String = ""
+    var args: [String] = []
+    var url: String = ""
+    var secrets: [Secret] = []
+
+    private enum Key: String, CodingKey { case name, command, args, url, env, headers }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: Key.self)
+        try container.encode(name, forKey: .name)
+        let values = Dictionary(secrets.map { ($0.key, $0.value) }, uniquingKeysWith: { _, last in last })
+        switch transport {
+        case .stdio:
+            try container.encode(command, forKey: .command)
+            try container.encode(args, forKey: .args)
+            try container.encode(values, forKey: .env)
+        case .http:
+            try container.encode(url, forKey: .url)
+            try container.encode(values, forKey: .headers)
+        }
+    }
+}
+
+private extension JSONValue {
+    var text: String? {
+        guard case .string(let value) = self else { return nil }
+        return value
+    }
+}
+
+/// The MCP box, or a snippet pasted out of a README, as drafts a form can be filled from. Both
+/// shapes are accepted: the bare `[{…}]` array the daemon speaks, and the
+/// `{"mcpServers": {"name": {…}}}` object every MCP README prints, whose keys are the names.
+/// Parsed here, as the web UI did, so a typo is named with its line and column instead of
+/// arriving as something that is not an array. Empty is no servers.
+///
+/// Only what a draft cannot represent is refused. The name's charset, the url's scheme and how
+/// many servers there may be stay the daemon's to judge, so the two cannot drift.
+func mcpServers(fromDraft draft: String) throws -> [McpServerDraft] {
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty else { return .array([]) }
+    guard !text.isEmpty else { return [] }
+    let json: JSONValue
     do {
-        return try JSONDecoder().decode(JSONValue.self, from: Data(typedJSON(text).utf8))
+        json = try JSONDecoder().decode(JSONValue.self, from: Data(typedJSON(text).utf8))
     } catch let DecodingError.dataCorrupted(context) {
         let detail = (context.underlyingError as NSError?)?.userInfo[NSDebugDescriptionErrorKey] as? String
         throw SchermesError.notJSON(detail ?? context.debugDescription)
     }
+
+    switch json {
+    case .array(let entries):
+        return try entries.map { try mcpServer(from: $0, named: nil) }
+    case .object(let root):
+        guard case .object(let named)? = root["mcpServers"] else {
+            throw SchermesError.notServers("that is not a server list or an mcpServers block")
+        }
+        // A JSON object has no order, so the names are sorted rather than left to the decoder.
+        return try named.keys.sorted().map { try mcpServer(from: named[$0]!, named: $0) }
+    default:
+        throw SchermesError.notServers("that is not a server list or an mcpServers block")
+    }
+}
+
+/// One server out of a pasted snippet, for the editor sheet, which holds one. Anything else is
+/// refused rather than half-read: filling the form from the first entry would drop the rest
+/// without saying so.
+func mcpServer(fromDraft draft: String) throws -> McpServerDraft {
+    let parsed = try mcpServers(fromDraft: draft)
+    guard parsed.count == 1 else {
+        throw SchermesError.notServers(
+            parsed.isEmpty
+                ? "that snippet has no server in it"
+                : "that snippet has \(parsed.count) servers in it, so add them one at a time"
+        )
+    }
+    return parsed[0]
+}
+
+private func mcpServer(from value: JSONValue, named: String?) throws -> McpServerDraft {
+    guard case .object(let entry) = value else {
+        throw SchermesError.notServers("every server must be an object")
+    }
+    guard let name = named ?? entry["name"]?.text, !name.isEmpty else {
+        throw SchermesError.notServers("every server needs a name")
+    }
+    let command = entry["command"]?.text
+    let url = entry["url"]?.text
+    guard (command == nil) != (url == nil) else {
+        throw SchermesError.notServers("\(name) must have either a command (stdio) or a url (http), not both")
+    }
+
+    guard case .array(let rawArgs) = entry["args"] ?? .array([]) else {
+        throw SchermesError.notServers("\(name).args must be an array of strings")
+    }
+    let args = rawArgs.compactMap(\.text)
+    guard args.count == rawArgs.count else {
+        throw SchermesError.notServers("\(name).args must be an array of strings")
+    }
+
+    let block = command == nil ? "headers" : "env"
+    guard case .object(let raw) = entry[block] ?? .object([:]) else {
+        throw SchermesError.notServers("\(name).\(block) must be an object of strings")
+    }
+    let secrets = try raw.keys.sorted().map { key -> McpServerDraft.Secret in
+        guard let value = raw[key]?.text else {
+            throw SchermesError.notServers("\(name).\(block).\(key) must be a string")
+        }
+        return McpServerDraft.Secret(key: key, value: value)
+    }
+
+    return command == nil
+        ? McpServerDraft(name: name, transport: .http, url: url!, secrets: secrets)
+        : McpServerDraft(name: name, transport: .stdio, command: command!, args: args, secrets: secrets)
 }
 
 /// No window is the newest page, `before` walks back, `after` asks for only what is new.
@@ -130,6 +295,8 @@ struct MessageWindow: Sendable {
     var before: Int? = nil
     var after: Int? = nil
     var limit: Int? = nil
+    /// False asks for each image's media type without its bytes.
+    var images = true
 
     static let newest = MessageWindow()
 }
@@ -145,6 +312,8 @@ struct SchermesClient: Sendable {
         config.httpCookieStorage = .shared
         config.httpCookieAcceptPolicy = .always
         config.httpShouldSetCookies = true
+        // Every route is live data: a disk cache only wrote each poll, screenshots included, to disk.
+        config.urlCache = nil
         return URLSession(configuration: config)
     }()
 
@@ -167,6 +336,7 @@ struct SchermesClient: Sendable {
                 window.before.map { URLQueryItem(name: "before", value: String($0)) },
                 window.after.map { URLQueryItem(name: "after", value: String($0)) },
                 window.limit.map { URLQueryItem(name: "limit", value: String($0)) },
+                window.images ? nil : URLQueryItem(name: "images", value: "0"),
             ].compactMap { $0 }
             if !items.isEmpty { parts.queryItems = items }
         }
@@ -225,8 +395,67 @@ struct SchermesClient: Sendable {
         try await send("GET", url("/api/agents"))
     }
 
-    func createAgent(name: String) async throws -> Agent {
-        try await send("POST", url("/api/agents"), body: ["name": name])
+    func createAgent(name: String, label: String, look: String) async throws -> Agent {
+        try await send("POST", url("/api/agents"), body: ["name": name, "label": label, "look": look])
+    }
+
+    /// Changes what the owner sees and what the agent is told it is: the name, the avatar, the
+    /// profile. The agent keeps the name it runs and is addressed by. A blank profile clears it.
+    func updateAgent(name: String, label: String? = nil, look: String? = nil, profile: String? = nil) async throws -> Agent {
+        var body: [String: String] = [:]
+        if let label { body["label"] = label }
+        if let look { body["look"] = look }
+        if let profile { body["profile"] = profile }
+        return try await send("PATCH", url("/api/agents/\(Self.escape(name))"), body: body)
+    }
+
+    /// Ends the turn an agent is in. `stopped` is false when nothing was running, which is not
+    /// an error: the owner pressed the button as the turn ended by itself.
+    func stop(agent: String) async throws -> Bool {
+        struct Stopped: Decodable { let stopped: Bool }
+        let answer: Stopped = try await send("POST", url("/api/agents/\(Self.escape(agent))/stop"), body: Empty())
+        return answer.stopped
+    }
+
+    /// A file for the agent's `~/uploads`. Base64 in JSON, the way a screenshot travels.
+    func upload(agent: String, name: String, data: Data) async throws -> UploadResult {
+        try await send(
+            "POST",
+            url("/api/agents/\(Self.escape(agent))/uploads"),
+            body: ["name": name, "base64": data.base64EncodedString()]
+        )
+    }
+
+    /// A file from inside the agent's home, as the agent named it: `~/…` or the full path.
+    func file(agent: String, path: String) async throws -> AgentFile {
+        guard var parts = URLComponents(url: try url("/api/agents/\(Self.escape(agent))/files"), resolvingAgainstBaseURL: false)
+        else { throw SchermesError.badURL }
+        parts.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let built = parts.url else { throw SchermesError.badURL }
+        return try await send("GET", built)
+    }
+
+    func memory(agent: String) async throws -> MemoryFiles {
+        try await send("GET", url("/api/agents/\(Self.escape(agent))/memory"))
+    }
+
+    func saveMemory(agent: String, lasting: String) async throws -> MemoryFiles {
+        try await send("PUT", url("/api/agents/\(Self.escape(agent))/memory"), body: ["lasting": lasting])
+    }
+
+    /// Every thread at once. The daemon clips each hit to a snippet around the match.
+    func search(_ needle: String) async throws -> [SearchHit] {
+        guard var parts = URLComponents(url: try url("/api/search"), resolvingAgainstBaseURL: false)
+        else { throw SchermesError.badURL }
+        parts.queryItems = [URLQueryItem(name: "q", value: needle)]
+        guard let built = parts.url else { throw SchermesError.badURL }
+        return try await send("GET", built)
+    }
+
+    /// One model call against the stored provider settings, on the settings screen rather than
+    /// a turn later in an agent's thread.
+    func testProvider() async throws -> ProviderTestResult {
+        try await send("POST", url("/api/settings/test"), body: Empty())
     }
 
     /// A conversation id is a number the daemon handed out, so only the agent half is escaped.
@@ -245,15 +474,48 @@ struct SchermesClient: Sendable {
         try await send("GET", messagesURL(source, window))
     }
 
-    /// Both routes answer 202 with the stored row wrapped as `{message}`.
-    func send(_ source: ThreadSource, text: String) async throws -> Message {
+    /// Removes everything from `from` on. With `retry`, the agents answer the message left last again.
+    func rewind(_ source: ThreadSource, from: Int, retry: Bool) async throws {
+        struct Done: Decodable { let ok: Bool }
+        struct Body: Encodable { var from: Int; var retry: Bool }
+        let _: Done = try await send("POST", url(Self.path(source) + "/rewind"), body: Body(from: from, retry: retry))
+    }
+
+    /// Folds everything since the last summary into a new one, for every agent in the thread, the
+    /// way a turn does when the thread is past its budget. Refused while any of them is mid-turn.
+    func compact(_ source: ThreadSource) async throws -> CompactResult {
+        try await send("POST", url(Self.path(source) + "/compact"), body: Empty())
+    }
+
+    /// Both routes answer 202 with the stored row wrapped as `{message}`. An image rides inline
+    /// as base64, the way a screenshot does, and reaches the model as what the owner saw.
+    func send(_ source: ThreadSource, text: String, image: Base64Image? = nil) async throws -> Message {
         struct Sent: Decodable { let message: Message }
+        struct Outgoing: Encodable { var text: String; var image: Base64Image? }
         let sent: Sent = try await send(
             "POST",
             url(Self.path(source) + "/messages"),
-            body: ["text": text]
+            body: Outgoing(text: text, image: image)
         )
         return sent.message
+    }
+
+    func devices() async throws -> [Device] {
+        try await send("GET", url("/api/devices"))
+    }
+
+    /// This device, so the daemon can reach it when the app is not running. Upserted by token.
+    func registerDevice(token: String, platform: String) async throws {
+        let _: Empty = try await send("POST", url("/api/devices"), body: ["token": token, "platform": platform])
+    }
+
+    func unregisterDevice(token: String) async throws {
+        let _: Empty = try await send("DELETE", url("/api/devices/\(Self.escape(token))"))
+    }
+
+    /// One push to every registered device, from the settings screen.
+    func testPush() async throws -> PushTestResult {
+        try await send("POST", url("/api/settings/push/test"), body: Empty())
     }
 
     func deleteAgent(name: String) async throws {
@@ -282,8 +544,10 @@ struct SchermesClient: Sendable {
         try await send("GET", url("/api/agents/\(Self.escape(agent))/live"))
     }
 
-    func events(agent: String) async throws -> [ExecutionEvent] {
-        try await send("GET", url("/api/agents/\(Self.escape(agent))/events"))
+    /// The newest `limit` events, oldest first. The log grows for the life of the install, so a
+    /// screen that polls it asks for the tail.
+    func events(agent: String, limit: Int) async throws -> [ExecutionEvent] {
+        try await send("GET", url("/api/agents/\(Self.escape(agent))/events", MessageWindow(limit: limit)))
     }
 
     func schedules(agent: String) async throws -> [Schedule] {
@@ -318,10 +582,14 @@ struct SchermesClient: Sendable {
         try await send("GET", url("/api/mcp/servers"))
     }
 
-    /// Replaces the whole list. The secrets in it are never read back, so what goes out is what
-    /// the owner typed, never anything a `GET` returned.
-    func saveMcpServers(_ servers: JSONValue) async throws -> [McpServerSummary] {
-        try await send("PUT", url("/api/mcp/servers"), body: ["servers": servers])
+    /// Adds or changes one server and answers the whole list, so a screen refreshes in one trip.
+    /// A secret the draft carries blank keeps its stored value.
+    func putMcpServer(_ server: McpServerDraft) async throws -> [McpServerSummary] {
+        try await send("PUT", url("/api/mcp/servers/\(Self.escape(server.name))"), body: server)
+    }
+
+    func deleteMcpServer(_ name: String) async throws {
+        let _: Empty = try await send("DELETE", url("/api/mcp/servers/\(Self.escape(name))"))
     }
 
     func testMcpServer(agent: String, server: String) async throws -> McpTestResult {

@@ -97,15 +97,17 @@ nonisolated struct BloubLiveliness {
     var breath: Double
 }
 
-/// Pre-drawn blink schedule: deterministic and stateless.
-///
-/// ponytail: the schedule stops at 900 s, as bloub's does, so an avatar left alone for fifteen
-/// minutes stops blinking. Extend the bound if a long-lived avatar ever makes it visible.
+/// The blink schedule is drawn once up to here and then repeats; an avatar's phase is drawn
+/// from the same span.
+nonisolated let bloubLifePeriod: Double = 900
+
+/// Pre-drawn blink schedule: deterministic and stateless. Stops a second short of the period so
+/// no blink is cut in half by the wrap.
 nonisolated let bloubBlinks: [Double] = {
     var rng = BloubRng(seed: 0x5eed)
     var out: [Double] = []
     var t = 1.4
-    while t < 900 {
+    while t < bloubLifePeriod - 1 {
         out.append(t)
         // 1.9 to 4.6 s apart, with the occasional double blink
         t += 1.9 + rng.next() * 2.7
@@ -120,16 +122,54 @@ nonisolated let bloubBlinks: [Double] = {
 /// Measured: 1 to 2 frames at 10 fps.
 nonisolated private let bloubBlinkDuration = 0.18
 
+/// The lid over one blink, `k` from 0 to 1: shuts fast, opens a little slower, both eased. A
+/// linear lid reads as a camera shutter.
+nonisolated func bloubLidCurve(_ k: Double) -> Double {
+    func smooth(_ x: Double) -> Double { x * x * (3 - 2 * x) }
+    return k < 0.4 ? 1 - smooth(k / 0.4) : smooth((k - 0.4) / 0.6)
+}
+
 nonisolated private func bloubBlinkLid(_ t: Double) -> Double {
+    let t = t.truncatingRemainder(dividingBy: bloubLifePeriod)
     for start in bloubBlinks {
         if t < start { break }
         let k = (t - start) / bloubBlinkDuration
-        if k >= 0 && k <= 1 {
-            // shuts fast, opens a little slower
-            return k < 0.45 ? 1 - k / 0.45 : (k - 0.45) / 0.55
-        }
+        if k >= 0 && k <= 1 { return bloubLidCurve(k) }
     }
     return 1
+}
+
+/// How far a glance flicks the gaze, in degrees. Carved out of the slow sway's amplitude, not
+/// added to it, so the drift's peak stays what `BloubEyefit` was fitted to: a wider box made the
+/// fit fail on the narrow shapes for half the expressions.
+nonisolated enum BloubGlance {
+    static let yaw: Double = 2.5
+    static let pitch: Double = 1.5
+}
+
+/// Pre-drawn glances: every few seconds the gaze flicks to a new spot in a tenth of a second and
+/// holds it, the way eyes at rest jump rather than slide. Drawn short of the period so the wrap
+/// lands on a held glance, never inside a flick.
+nonisolated private let bloubGlances: [(at: Double, yaw: Double, pitch: Double)] = {
+    var rng = BloubRng(seed: 0x91a2)
+    var out: [(at: Double, yaw: Double, pitch: Double)] = []
+    var t = 0.0
+    while true {
+        t += 1.5 + rng.next() * 3.5
+        if t >= bloubLifePeriod - 1 { return out }
+        out.append((t, (rng.next() * 2 - 1) * BloubGlance.yaw, (rng.next() * 2 - 1) * BloubGlance.pitch))
+    }
+}()
+
+nonisolated private func bloubGlance(_ t: Double) -> (yaw: Double, pitch: Double) {
+    let t = t.truncatingRemainder(dividingBy: bloubLifePeriod)
+    var i = bloubGlances.count - 1
+    while i >= 0 && bloubGlances[i].at > t { i -= 1 }
+    // before the first glance of a period the last one of the previous period is still held
+    let to = bloubGlances[i >= 0 ? i : bloubGlances.count - 1]
+    let from = bloubGlances[i > 0 ? i - 1 : bloubGlances.count - 1]
+    let k = i >= 0 ? BloubEase.outCubic(bloubClamp((t - to.at) / 0.1)) : 1
+    return (bloubLerp(from.yaw, to.yaw, k), bloubLerp(from.pitch, to.pitch, k))
 }
 
 nonisolated func bloubLiveliness(
@@ -138,10 +178,13 @@ nonisolated func bloubLiveliness(
     blink: Bool = true,
     float: Bool = true
 ) -> BloubLiveliness {
+    let glance = bloubGlance(t)
     // Periods coprime to each other, so the drift never visibly repeats.
-    BloubLiveliness(
-        dYaw: (bloubLoopNoise(t, 11.3, 0.4) * 5.5 + bloubLoopNoise(t, 3.7, 2.1) * 1.6) * wander,
-        dPitch: (bloubLoopNoise(t, 9.1, 1.3) * 4.2 + bloubLoopNoise(t, 4.3, 0.7) * 1.3) * wander,
+    return BloubLiveliness(
+        dYaw: (bloubLoopNoise(t, 11.3, 0.4) * (5.5 - BloubGlance.yaw) + bloubLoopNoise(t, 3.7, 2.1) * 1.6
+            + glance.yaw) * wander,
+        dPitch: (bloubLoopNoise(t, 9.1, 1.3) * (4.2 - BloubGlance.pitch) + bloubLoopNoise(t, 4.3, 0.7) * 1.3
+            + glance.pitch) * wander,
         dRoll: bloubLoopNoise(t, 13.7, 3.2) * 2.2 * wander,
         lid: blink ? bloubBlinkLid(t) : 1,
         // At rest the video is almost still (centre stable to +-0.003, constant radius): all the

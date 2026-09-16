@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Idempotent provisioning for a schermes host (Debian 13 "trixie").
-# Run as root on a fresh Debian install, or from the Dockerfile for the dev harness.
+# Run from the Dockerfile, or as root on a fresh Debian install without Docker.
 set -euo pipefail
 
 SCHERMES_HOME=/var/lib/schermes

@@ -1,15 +1,9 @@
 import SwiftUI
 
-/// What this is, which daemon it is talking to, and the licence the avatar ships under. bloub is
-/// MIT and its terms require the notice to travel with every copy, so it lives in the app rather
-/// than only in `apple/README.md`.
-struct AboutView: View {
-    /// Absent when this was opened from the Mac's own About item, which is outside the view that
-    /// owns the session. Everything but the daemon section reads the same either way.
-    var session: Session?
-
-    @Environment(\.dismiss) private var dismiss
-
+/// What this is and the licence the avatar ships under. bloub is MIT and its terms require the
+/// notice to travel with every copy, so it lives in the app rather than only in `apple/README.md`.
+/// Which daemon this is talking to is the Daemon page's, next door in Settings.
+struct AboutPage: View {
     private var version: String {
         let info = Bundle.main.infoDictionary
         let short = info?["CFBundleShortVersionString"] as? String ?? "0"
@@ -18,57 +12,54 @@ struct AboutView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    VStack(spacing: 12) {
-                        // Its own look rather than the store's: the About sheet the Mac's app
-                        // menu opens is outside the view that carries one.
-                        BloubView(state: .idle, identity: .standard(for: "schermes"), size: 92)
-                        Text("schermes").font(.title2.weight(.semibold))
-                        Text("Version \(version)")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
-                }
-
-                if let session {
-                    Section("Daemon") {
-                        LabeledContent("Address", value: session.client?.baseURL.absoluteString ?? "none")
-                            .textSelection(.enabled)
-                        // The address only: the password stays in the Keychain under it, so coming
-                        // back to this daemon does not ask for one again.
-                        Button("Use a different daemon") {
-                            dismiss()
-                            session.forgetServer()
-                        }
-                    }
-                }
-
-                Section {
-                    Text(bloubCredit)
+        Form {
+            Section {
+                VStack(spacing: 12) {
+                    // Its own look rather than the store's: the About sheet the Mac's app menu
+                    // opens is outside the view that carries one.
+                    BloubView(state: .idle, identity: .standard(for: "schermes"), size: 92)
+                    Text("schermes").font(.title2.weight(.semibold))
+                    Text("Version \(version)")
                         .font(.footnote)
-                    Text(verbatim: bloubLicence)
-                        .font(.caption2.monospaced())
-                        .textSelection(.enabled)
-                } header: {
-                    Text("The avatar")
-                } footer: {
-                    Text("Everything else here is URLSession, SwiftUI and Swift Testing: no packages.")
+                        .foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
             }
-            .formStyle(.grouped)
-            .navigationTitle("About")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+
+            Section {
+                Text(bloubCredit)
+                    .font(.footnote)
+                Text(verbatim: bloubLicence)
+                    .font(.caption2.monospaced())
+                    .textSelection(.enabled)
+            } header: {
+                Text("The avatar")
+            } footer: {
+                Text("Everything else here is URLSession, SwiftUI and Swift Testing: no packages.")
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle(SettingsCategory.about.title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+    }
+}
+
+/// The same page as a sheet, for the Mac's own About item in the app menu. That lives outside
+/// every window, so it carries no session and needs none.
+struct AboutView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            AboutPage()
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { dismiss() }
+                    }
                 }
-            }
         }
         #if os(macOS)
         .frame(minWidth: 520, minHeight: 560)

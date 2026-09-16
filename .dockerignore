@@ -4,5 +4,3 @@ node_modules
 docs
 *.md
 !README.md
-# Packer output: a multi-GB qcow2 must never enter the docker build context.
-infra/packer/build

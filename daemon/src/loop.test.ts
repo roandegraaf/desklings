@@ -28,6 +28,7 @@ import {
   SUMMARY_PROMPT,
   TRANSITIONS,
   canTransition,
+  compactNow,
   createRunner,
   describe,
   reconcileAgents,
@@ -46,6 +47,7 @@ import {
 } from './schedules.ts';
 import { HOME_APPEND, HOME_LOAD, homePrompt, parseHome } from './home.ts';
 import { withoutKey } from './provider.ts';
+import { STOPPED, WORKER_FAILED } from './loop.ts';
 import { workerPrompt } from './workers.ts';
 import type { ChatReply, Provider, ProviderMessage } from './provider.ts';
 import type { Exec } from './exec.ts';
@@ -88,7 +90,11 @@ function scriptedProvider(script: Record<string, readonly Partial<ChatReply>[]>)
     used.set(name, index + 1);
     const reply = script[name]?.[index];
     if (reply === undefined) return Promise.reject(new Error('the script ran out of replies'));
-    return Promise.resolve({ text: reply.text ?? '', toolCalls: reply.toolCalls ?? [] });
+    return Promise.resolve({
+      text: reply.text ?? '',
+      toolCalls: reply.toolCalls ?? [],
+      ...(reply.usage === undefined ? {} : { usage: reply.usage }),
+    });
   };
   return { provider, seen, offered, summarised };
 }
@@ -138,11 +144,16 @@ function fixture(
   replies: readonly Partial<ChatReply>[],
   search: LoopDeps['search'] = noSearch,
   mcp: LoopDeps['mcp'] = noMcp,
+  onExec?: (argv: readonly string[]) => void,
 ) {
   const db = openDb(':memory:', MIGRATIONS);
   const agent = insertAgent(db, 'alpha') as Agent;
   const ran: string[][] = [];
-  const exec = fakeExec(ran);
+  const fake = fakeExec(ran);
+  const exec: Exec = (file, args, options) => {
+    onExec?.([file, ...args]);
+    return fake(file, args, options);
+  };
 
   const { provider, seen, offered, summarised } = scriptedProvider({ alpha: replies });
   const control = createControl();
@@ -381,7 +392,7 @@ test('the transcript names who wrote every message and hides another agent tool 
   const said = projected.filter((m) => m.role === 'user').map((m) => m.text);
   assert.match(String(said[0]), /^Message from the owner:\nyou two sort it out$/);
   assert.match(String(said[1]), /^Message from bravo:\nwhat is your hostname\?$/);
-  assert.match(String(said[2]), /^Message from bravo:\nmine is bravo-box$/);
+  assert.match(String(said[2]), /^bravo said here, to the owner:\nmine is bravo-box$/);
   // bravo's tool call and its result are dropped together, or the pair would be half a turn.
   assert.doesNotMatch(JSON.stringify(projected), /exit code 0/);
 });
@@ -766,6 +777,51 @@ test('a message that lands mid-turn is picked up instead of refused', async () =
   );
 });
 
+test('a message that lands between steps stays out of the turn while its own results come in', async () => {
+  let release: () => void = () => {};
+  const held = new Promise<void>((done) => {
+    release = () => done();
+  });
+  const db = openDb(':memory:', MIGRATIONS);
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const asked: ProviderMessage[][] = [];
+  const provider: Provider = async (messages) => {
+    asked.push([...messages]);
+    if (asked.length === 1) {
+      await held;
+      return { text: '', toolCalls: [commandCall] };
+    }
+    return { text: `answer ${asked.length}`, toolCalls: [] };
+  };
+  const runner = createRunner({
+    db,
+    exec: fakeExec([]),
+    screen: SCREEN,
+    provider: () => provider,
+    control: createControl(),
+    search: noSearch,
+    mcp: noMcp,
+    ...CAPS,
+  });
+  const owner = conversationFor(db, alpha.id);
+
+  appendMessage(db, owner, { role: 'user', content: 'first' });
+  runner.start(alpha, owner);
+  await tick();
+  appendMessage(db, owner, { role: 'user', content: 'second' });
+  release();
+  await quiet(db);
+
+  assert.equal(asked.length, 3);
+  const step = asked[1] ?? [];
+  assert.ok(step.some((m) => m.role === 'tool' && m.toolCallId === commandCall.id), 'its own result is in');
+  const heard = (messages: readonly ProviderMessage[]) =>
+    messages.some((m) => m.role === 'user' && m.text.includes('second'));
+  assert.ok(!heard(step), 'the arrival is not spliced into the turn');
+  assertEveryCallAnswered(step);
+  assert.ok(heard(asked[2] ?? []), 'the next turn carries it');
+});
+
 test('messages that land in two threads mid-turn are both answered', async () => {
   let release: () => void = () => {};
   const held = new Promise<void>((done) => {
@@ -849,10 +905,30 @@ test('two agents that only write to each other are stopped', async () => {
 
   const shared = conversationWith(p.db, [p.alpha.id, p.bravo.id]);
   const passed = listMessages(p.db, shared).filter((m) => m.role === 'user');
-  assert.equal(passed.length, MAX_AGENT_CHAIN, 'the chain stopped at the cap');
-  assert.equal(agentChain(p.db, shared), MAX_AGENT_CHAIN);
+  // The replies each side gives count too, so the cap lands before that many were even sent.
+  assert.ok(passed.length < MAX_AGENT_CHAIN, `only ${passed.length} got through`);
+  assert.ok(agentChain(p.db, shared) >= MAX_AGENT_CHAIN, 'the chain stopped at the cap');
+  assert.equal(p.state('alpha'), 'waiting_for_user');
+  assert.equal(p.state('bravo'), 'waiting_for_user');
   const refusal = listMessages(p.db, shared).find((m) => m.content.includes('back and forth'));
   assert.ok(refusal !== undefined, 'the agent was told why, in a message it can act on');
+});
+
+test('a reply in a shared thread counts as a message between agents; in an owner thread it does not', () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const bravo = insertAgent(db, 'bravo') as Agent;
+  const shared = conversationWith(db, [alpha.id, bravo.id]);
+  const owner = conversationFor(db, alpha.id);
+  for (const conversationId of [shared, owner]) {
+    appendMessage(db, conversationId, { role: 'user', content: 'go' });
+    appendMessage(db, conversationId, { role: 'assistant', content: '', sender: 'alpha', toolCalls: [commandCall] });
+    appendMessage(db, conversationId, { role: 'tool', content: 'exit code 0', sender: 'alpha', toolCallId: 'c2' });
+    appendMessage(db, conversationId, { role: 'assistant', content: 'done', sender: 'alpha' });
+    appendMessage(db, conversationId, { role: 'user', content: 'thanks', sender: 'bravo' });
+  }
+  assert.equal(agentChain(db, shared), 2, 'the reply and the message, not the tool step');
+  assert.equal(agentChain(db, owner), 1, 'a reply to the owner is not between agents');
 });
 
 test('a restart hands back an agent whose reply landed before the daemon died', () => {
@@ -1192,6 +1268,48 @@ test('a line remembered in one conversation is in the system prompt of the next'
   assert.doesNotMatch(later, /Run the deploy script/, 'but never the body');
 });
 
+test('a question to the owner ends the turn, and the profile written after the answer is in the next prompt', async () => {
+  const askCall = {
+    id: 'q1',
+    name: 'ask_owner',
+    arguments: JSON.stringify({
+      questions: [{ question: 'What am I for?', header: 'Purpose', options: [{ label: 'Spreadsheets' }, { label: 'Email' }] }],
+    }),
+  };
+  const profileCall = {
+    id: 'p1',
+    name: 'set_profile',
+    arguments: JSON.stringify({ profile: '# Excel\nBuilds spreadsheets for the owner.' }),
+  };
+  const f = fixture([
+    // Asked alongside another call: both get their result, and the turn still ends there.
+    { text: 'Hi, a question first.', toolCalls: [askCall, commandCall] },
+    { toolCalls: [profileCall] },
+    { text: 'Written down.' },
+    { text: 'I build spreadsheets.' },
+  ]);
+
+  f.ask('I just created you.');
+  await runAgent(f.deps, f.agent, f.conversationId);
+  assert.equal(f.state(), 'waiting_for_user');
+  assert.match(systemOf(f.seen[0]), /no profile yet/);
+  assert.ok(f.offered[0]?.includes('ask_owner') && f.offered[0]?.includes('set_profile'));
+  assert.deepEqual(f.messages().map((m) => m.role), ['user', 'assistant', 'tool', 'tool']);
+  assert.match(String(f.messages().find((m) => m.toolCallId === 'q1')?.content), /Asked the owner 1 question/);
+  assert.equal(f.seen.length, 1, 'no second model call after the question');
+
+  f.ask('Purpose: What am I for?\n— Spreadsheets');
+  await runAgent(f.deps, f.agent, f.conversationId);
+  assert.equal(findAgent(f.db, 'alpha')?.profile, '# Excel\nBuilds spreadsheets for the owner.');
+  assert.equal(f.state(), 'waiting_for_user');
+
+  f.ask('what are you?');
+  await runAgent(f.deps, f.agent, f.conversationId);
+  const later = systemOf(f.seen.at(-1));
+  assert.match(later, /Builds spreadsheets for the owner/);
+  assert.doesNotMatch(later, /no profile yet/);
+});
+
 test('the home is read once per turn, however many steps the turn takes', async () => {
   const db = openDb(':memory:', MIGRATIONS);
   const alpha = insertAgent(db, 'alpha') as Agent;
@@ -1528,8 +1646,46 @@ test('each agent in a group thread is compacted on its own view of it', async ()
   assert.ok(!forBravo.includes('exit code 0 (A'), 'nor bravo alpha\'s');
 
   // Each agent is still shown who said what, which is the whole point of the group thread.
-  assert.match(forBravo, /Message from alpha:\n\(A\d/, 'bravo sees alpha by name');
+  assert.match(forBravo, /alpha said here, to the owner:\n\(A\d/, 'bravo sees alpha by name');
   assert.match(forAlpha, /Message from the owner:\nread the logs/);
+});
+
+test('a forced compaction covers everything since the last summary, and the next turn opens on it', async () => {
+  const f = fixture([{ text: 'first answer.' }, { text: 'second answer.' }]);
+  longThread(f.db, f.conversationId, 2, 1_000);
+  await runAgent(f.deps, f.agent, f.conversationId);
+  assert.deepEqual(f.summarised, [], 'well under the budget, so the turn compacted nothing');
+  const stored = f.messages().length;
+
+  assert.deepEqual(await compactNow(f.deps, f.agent, f.conversationId), { covered: stored });
+  assert.equal(f.summarised.length, 1);
+  assert.match(String(f.summarised[0]), /first answer\./, 'the whole thread went to the summariser');
+  const summary = latestSummary(f.db, f.conversationId, 'alpha');
+  assert.equal(summary?.throughMessageId, f.messages().at(-1)?.id, 'and nothing is kept verbatim');
+  assert.equal(f.messages().length, stored, 'nothing was rewritten');
+
+  // A second forced pass has nothing to fold and asks the model for nothing.
+  assert.deepEqual(await compactNow(f.deps, f.agent, f.conversationId), { covered: 0 });
+  assert.equal(f.summarised.length, 1);
+
+  // The next turn is handed the summary and the owner's new message, and none of the old rows.
+  f.ask('and now?');
+  await runAgent(f.deps, f.agent, f.conversationId);
+  const asked = replayed(f.seen[1]);
+  assert.match(String(asked[0]?.text), new RegExp(`summarised:\\n${SUMMARY}$`));
+  assert.match(String(asked[1]?.text), /and now\?$/);
+  assert.equal(asked.length, 2);
+  assertEveryCallAnswered(f.seen[1] as ProviderMessage[]);
+});
+
+test('a forced compaction the model refuses is an error and writes no summary', async () => {
+  const f = fixture([]);
+  longThread(f.db, f.conversationId, 1, 100);
+  const deps = { ...f.deps, provider: () => Promise.reject(new Error('endpoint down')) };
+  assert.deepEqual(await compactNow(deps, f.agent, f.conversationId), {
+    error: 'the model would not summarise the thread for alpha',
+  });
+  assert.equal(latestSummary(f.db, f.conversationId, 'alpha'), undefined);
 });
 
 // ---------------------------------------------------------------- scheduled tasks
@@ -1943,4 +2099,108 @@ test('a task worker is offered no MCP tools', async () => {
 
   assert.deepEqual(f.offered[0], ['run_command', 'web_search', 'web_fetch']);
   assert.equal(log.closed, 0, 'and no session was opened for it');
+});
+
+test('a stop lands between steps, after every call in the reply has its result', async () => {
+  let runner: ReturnType<typeof createRunner> | undefined;
+  const f = fixture([{ toolCalls: [commandCall] }, { text: 'never asked for' }], noSearch, noMcp, (argv) => {
+    if (argv.includes('uname -a')) runner?.stop('alpha');
+  });
+  runner = f.runner;
+  f.ask('go');
+  f.runner.start(f.agent, f.conversationId);
+  await quiet(f.db);
+
+  assert.equal(f.state(), 'waiting_for_user');
+  const rows = f.messages();
+  assert.deepEqual(rows.map((m) => m.role), ['user', 'assistant', 'tool', 'assistant']);
+  assert.equal(rows.at(-1)?.content, STOPPED);
+  assertEveryCallAnswered(transcript('alpha', SYSTEM, rows));
+  assert.equal(f.seen.length, 1, 'the model was not asked again');
+  assert.deepEqual(
+    f.events().filter((e) => e.type === 'stop' || e.type === 'turn').map((e) => [e.type, e.data]),
+    [['stop', {}], ['turn', { steps: 1 }]],
+  );
+  assert.equal(f.runner.stop('alpha'), false, 'nothing left to stop');
+});
+
+test('a stop while the model is still writing ends the turn at the last complete exchange', async () => {
+  const f = fixture([]);
+  const controller = new AbortController();
+  const provider: Provider = (_m, _t, _d, signal) =>
+    new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  f.ask('go');
+  const turn = runAgent({ ...f.deps, provider, signal: controller.signal }, f.agent, f.conversationId);
+  await tick();
+  assert.equal(f.state(), 'thinking');
+  controller.abort(new Error('stopped by the owner'));
+  await turn;
+
+  assert.equal(f.state(), 'waiting_for_user');
+  assert.deepEqual(f.messages().map((m) => [m.role, m.content]), [['user', 'go'], ['assistant', STOPPED]]);
+  assert.ok(f.events().some((e) => e.type === 'stop'));
+  assert.ok(!f.events().some((e) => e.type === 'failure'), 'a stop is not a failure');
+});
+
+test('a stopped worker reports the stop to its parent as the failure it is waiting on', async () => {
+  const f = fixture([{ toolCalls: [{ id: 's1', name: 'spawn_task_worker', arguments: '{"brief":"count the files"}' }] }]);
+  const stopAt = (argv: readonly string[]) => argv.includes('ls');
+  const worker: Provider = (messages, _t, _d, signal) => {
+    if (askedAgent(messages) === 'alpha') return f.deps.provider(messages, _t);
+    // The worker's first call is answered with a command; the exec below stops it while it runs.
+    return new Promise((resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+      resolve({ text: '', toolCalls: [{ id: 'w1', name: 'run_command', arguments: '{"command":"ls"}' }] });
+    });
+  };
+  const exec: Exec = (file, args, options) => {
+    if (stopAt([file, ...args])) {
+      const name = listAgents(f.db).find((a) => a.parentId !== undefined)?.name;
+      if (name !== undefined) runner.stop(name);
+    }
+    return f.deps.exec(file, args, options);
+  };
+  const runner = createRunner({ ...f.deps, exec, provider: () => worker, maxLoops: 4 });
+  f.ask('go');
+  runner.start(f.agent, f.conversationId);
+  await quiet(f.db);
+
+  const spawned = listAgents(f.db).find((a) => a.parentId !== undefined);
+  assert.ok(spawned);
+  assert.equal(spawned.state, 'failed');
+  const reported = f.messages().find((m) => m.sender === spawned.name && m.role === 'user');
+  assert.ok(reported, 'the parent was written to');
+  assert.match(reported.content, new RegExp(`^${WORKER_FAILED}: stopped by the owner`));
+});
+
+test('a turn records what it cost when the endpoint says', async () => {
+  const usage = { promptTokens: 100, completionTokens: 7 };
+  const f = fixture([{ toolCalls: [commandCall], usage }, { text: 'done', usage }]);
+  f.ask('go');
+  f.runner.start(f.agent, f.conversationId);
+  await quiet(f.db);
+  const turn = f.events().find((e) => e.type === 'turn');
+  assert.deepEqual(turn?.data, { steps: 2, promptTokens: 200, completionTokens: 14 });
+});
+
+test("the owner's pictures reach the model as user images and share the replay window with screenshots", async () => {
+  const picture = (n: number) => ({ mediaType: 'image/jpeg' as const, base64: `pic${n}` });
+  const f = fixture([{ text: 'seen' }]);
+  f.ask('look at these');
+  const first = appendMessage(f.db, f.conversationId, { role: 'user', content: '', image: picture(1) });
+  appendMessage(f.db, f.conversationId, { role: 'user', content: 'and this', image: picture(2) });
+  appendMessage(f.db, f.conversationId, { role: 'user', content: 'and this', image: picture(3) });
+  appendMessage(f.db, f.conversationId, { role: 'user', content: 'and this', image: picture(4) });
+  f.runner.start(f.agent, f.conversationId);
+  await quiet(f.db);
+
+  const sent = f.seen[0] ?? [];
+  const users = sent.filter((m) => m.role === 'user');
+  assert.equal(users.filter((m) => 'image' in m && m.image !== undefined).length, MAX_REPLAYED_IMAGES);
+  const withPictures = users.map((m) => ('image' in m ? m.image?.base64 : undefined));
+  assert.ok(!withPictures.includes('pic1') && withPictures.includes('pic4'), 'the oldest is out of the window');
+  const dropped = users.find((m) => m.text.includes('no longer shown'));
+  assert.ok(dropped, 'and the model is told so');
+  assert.match(sent.find((m) => 'image' in m && m.image?.base64 === 'pic2')?.text ?? '', /Message from the owner:\n/);
+  assert.ok(first.image?.mediaType === 'image/jpeg');
 });

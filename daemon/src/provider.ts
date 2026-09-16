@@ -32,21 +32,27 @@ export type ToolDef = {
   parameters: Record<string, unknown>;
 };
 
-export type Image = { mediaType: 'image/png'; base64: string };
+export type Image = { mediaType: 'image/png' | 'image/jpeg'; base64: string };
 
 export type ProviderMessage =
   | { role: 'system' | 'user'; text: string; image?: Image }
   | { role: 'assistant'; text: string; toolCalls: readonly ToolCall[] }
   | { role: 'tool'; toolCallId: string; text: string };
 
-export type ChatReply = { text: string; toolCalls: ToolCall[] };
+/** What the endpoint said one call cost, when it said. Streamed endpoints report it in the last
+ * chunk and only when asked with `stream_options`. */
+export type Usage = { promptTokens: number; completionTokens: number };
+
+export type ChatReply = { text: string; toolCalls: ToolCall[]; usage?: Usage };
 
 /** The one seam over the model. A function, because one method is not worth an object. The
- * third argument hears the reply as it streams; a provider that cannot stream never calls it. */
+ * third argument hears the reply as it streams; a provider that cannot stream never calls it.
+ * The fourth ends the call early: the owner stopping a turn must not wait out the model. */
 export type Provider = (
   messages: readonly ProviderMessage[],
   tools: readonly ToolDef[],
   onDelta?: (partial: LiveReply) => void,
+  signal?: AbortSignal,
 ) => Promise<ChatReply>;
 
 export type ProviderConfig = {
@@ -175,6 +181,13 @@ function mergeToolCallDeltas(calls: Map<number, PartialCall>, raw: unknown): voi
   });
 }
 
+function parseUsage(raw: unknown): Usage | undefined {
+  const prompt = field(raw, 'prompt_tokens');
+  const completion = field(raw, 'completion_tokens');
+  if (typeof prompt !== 'number' || typeof completion !== 'number') return undefined;
+  return { promptTokens: prompt, completionTokens: completion };
+}
+
 async function readStream(
   body: ReadableStream<Uint8Array>,
   apiKey: string,
@@ -183,8 +196,10 @@ async function readStream(
 ): Promise<ChatReply> {
   let text = '';
   let reasoning = '';
+  let usage: Usage | undefined;
   const calls = new Map<number, PartialCall>();
   for await (const chunk of dataLines(body, touch)) {
+    usage = parseUsage(field(chunk, 'usage')) ?? usage;
     const failure = field(chunk, 'error');
     if (failure !== undefined) {
       const detail = withoutKey(JSON.stringify(failure), apiKey);
@@ -215,7 +230,7 @@ async function readStream(
       name: call.name,
       arguments: call.arguments === '' ? '{}' : call.arguments,
     }));
-  return { text, toolCalls };
+  return { text, toolCalls, ...(usage === undefined ? {} : { usage }) };
 }
 
 /**
@@ -227,8 +242,11 @@ async function readStream(
 export function openAiProvider(settings: ProviderConfig): Provider {
   const url = `${settings.baseUrl.replace(/\/+$/, '')}/chat/completions`;
 
-  const request: Provider = async (messages, tools, onDelta) => {
+  const request: Provider = async (messages, tools, onDelta, signal) => {
     const controller = new AbortController();
+    const stop = () => controller.abort(signal?.reason);
+    if (signal?.aborted) stop();
+    signal?.addEventListener('abort', stop, { once: true });
     let timer: NodeJS.Timeout | undefined;
     const touch = () => {
       clearTimeout(timer);
@@ -251,6 +269,7 @@ export function openAiProvider(settings: ProviderConfig): Provider {
           model: settings.model,
           messages: messages.map(wire),
           stream: true,
+          stream_options: { include_usage: true },
           ...(tools.length === 0
             ? {}
             : {
@@ -276,29 +295,34 @@ export function openAiProvider(settings: ProviderConfig): Provider {
         return await readStream(response.body, settings.apiKey, touch, onDelta);
       }
 
-      const choices = field(await response.json(), 'choices');
+      const body: unknown = await response.json();
+      const choices = field(body, 'choices');
       const message = field(Array.isArray(choices) ? choices[0] : undefined, 'message');
       const content = field(message, 'content');
+      const usage = parseUsage(field(body, 'usage'));
       return {
         text: typeof content === 'string' ? content : '',
         toolCalls: parseToolCalls(field(message, 'tool_calls')),
+        ...(usage === undefined ? {} : { usage }),
       };
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', stop);
     }
   };
 
   // One retry, for the failures that are the endpoint's moment rather than the request: a
   // timeout, a dropped socket, a 429 or a 5xx. A request the endpoint rejected outright is
-  // going to be rejected again.
-  return async (messages, tools, onDelta) => {
+  // going to be rejected again, and a call the owner stopped is not asked again either.
+  return async (messages, tools, onDelta, signal) => {
     try {
-      return await request(messages, tools, onDelta);
+      return await request(messages, tools, onDelta, signal);
     } catch (error) {
+      if (signal?.aborted) throw error;
       if (error instanceof ProviderError && !error.retryable) throw error;
       log.info('provider call failed, retrying once', { error });
       await sleep(RETRY_DELAY_MS);
-      return request(messages, tools, onDelta);
+      return request(messages, tools, onDelta, signal);
     }
   };
 }

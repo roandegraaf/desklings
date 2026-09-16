@@ -144,3 +144,40 @@ test('a request the endpoint rejects outright is not repeated', async () => {
   );
   assert.equal(calls, 1);
 });
+
+test('usage is read from the last streamed chunk and from a plain reply, and is asked for', async () => {
+  const stream = sse([
+    delta({ content: 'hi' }),
+    `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 3 } })}`,
+    'data: [DONE]',
+  ]);
+  const { result, sent } = await withFetch(stream, () => provider([{ role: 'user', text: 'hi' }], []));
+  assert.deepEqual(result.usage, { promptTokens: 12, completionTokens: 3 });
+  assert.deepEqual((sent as { stream_options: unknown }).stream_options, { include_usage: true });
+
+  const plain = new Response(
+    JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 5, completion_tokens: 1 } }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  );
+  const { result: read } = await withFetch(plain, () => provider([{ role: 'user', text: 'hi' }], []));
+  assert.deepEqual(read.usage, { promptTokens: 5, completionTokens: 1 });
+});
+
+test('a stopped call ends at once and is not retried', async () => {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (_url, init) =>
+    new Promise((_, reject) => {
+      calls += 1;
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    });
+  try {
+    const controller = new AbortController();
+    const call = provider([{ role: 'user', text: 'hi' }], [], undefined, controller.signal);
+    controller.abort(new Error('stopped by the owner'));
+    await assert.rejects(call, /stopped by the owner/);
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

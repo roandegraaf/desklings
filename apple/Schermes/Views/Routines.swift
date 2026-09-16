@@ -4,7 +4,7 @@ import SwiftUI
 /// the list is polled on the web UI's 5 s tick rather than trusted to stay as the owner left it.
 struct RoutinesView: View {
     let session: Session
-    let agent: String
+    let agent: Agent
 
     @State private var schedules: [Schedule]?
     @State private var cron = ""
@@ -39,7 +39,7 @@ struct RoutinesView: View {
                     ProgressView().frame(maxWidth: .infinity)
                 }
             } footer: {
-                Text("Each one starts a turn in \(agent)'s thread with you, with its prompt, whether or not anyone is awake. Resuming counts the next run from now rather than making up the runs it missed.")
+                Text("Each one starts a turn in \(agent.title)'s thread with you, with its prompt, whether or not anyone is awake. Resuming counts the next run from now rather than making up the runs it missed.")
             }
 
             Section {
@@ -58,7 +58,7 @@ struct RoutinesView: View {
                 TextField(
                     "Prompt",
                     text: $prompt,
-                    prompt: Text("Written for a future \(agent) with none of this conversation in front of it"),
+                    prompt: Text("Written for a future \(agent.title) with none of this conversation in front of it"),
                     axis: .vertical
                 )
                 .lineLimit(2...6)
@@ -78,9 +78,9 @@ struct RoutinesView: View {
             }
         }
         .formStyle(.grouped)
-        .task(id: agent) {
+        .task(id: agent.name) {
             while !Task.isCancelled {
-                if let rows = try? await session.run({ try await $0.schedules(agent: agent) }) {
+                if let rows = try? await session.run({ try await $0.schedules(agent: agent.name) }) {
                     schedules = rows
                 }
                 try? await Task.sleep(for: .seconds(5))
@@ -99,7 +99,7 @@ struct RoutinesView: View {
         adding = true
         Task {
             await change { client in
-                let created = try await client.createSchedule(agent: agent, cron: cron, prompt: prompt)
+                let created = try await client.createSchedule(agent: agent.name, cron: cron, prompt: prompt)
                 schedules = (schedules ?? []) + [created]
                 self.cron = ""
                 self.prompt = ""
@@ -111,7 +111,7 @@ struct RoutinesView: View {
     private func pause(_ schedule: Schedule, _ paused: Bool) {
         Task {
             await change { client in
-                let updated = try await client.pauseSchedule(agent: agent, id: schedule.id, paused: paused)
+                let updated = try await client.pauseSchedule(agent: agent.name, id: schedule.id, paused: paused)
                 schedules = schedules?.map { $0.id == updated.id ? updated : $0 }
             }
         }
@@ -120,7 +120,7 @@ struct RoutinesView: View {
     private func delete(_ schedule: Schedule) {
         Task {
             await change { client in
-                try await client.deleteSchedule(agent: agent, id: schedule.id)
+                try await client.deleteSchedule(agent: agent.name, id: schedule.id)
                 schedules?.removeAll { $0.id == schedule.id }
             }
         }

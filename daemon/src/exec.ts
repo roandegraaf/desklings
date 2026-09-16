@@ -11,6 +11,9 @@ export type ExecOptions = {
   input?: string;
   timeoutMs?: number;
   maxBytes?: number;
+  /** Ends the command early with SIGTERM. `sudo` relays it, and GNU `timeout` passes it on to
+   * the whole process group, so the owner stopping a turn stops the command it was running. */
+  signal?: AbortSignal;
 };
 
 export type Exec = (
@@ -79,6 +82,10 @@ export const systemExec: Exec = (file, args, options = {}) =>
     if (options.timeoutMs !== undefined) {
       timer = setTimeout(() => child.kill('SIGKILL'), options.timeoutMs);
     }
+    const stop = () => child.kill('SIGTERM');
+    if (options.signal?.aborted) stop();
+    options.signal?.addEventListener('abort', stop, { once: true });
+    child.on('close', () => options.signal?.removeEventListener('abort', stop));
 
     // A tool that never reads stdin makes this EPIPE, which is not an error here.
     child.stdin.on('error', () => {});

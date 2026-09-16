@@ -30,14 +30,49 @@ export type WebSettingsUpdate = {
   searchKey?: string;
 };
 
+/** The push half of the settings. The `.p8` key is reported as present or absent like the other
+ * keys. Pushes go straight to Apple from the daemon; nothing else is in between. */
+export type PushSettings = {
+  keyId: string;
+  teamId: string;
+  bundleId: string;
+  keySet: boolean;
+  sandbox: boolean;
+};
+
+export type PushSettingsUpdate = {
+  pushKeyId?: string;
+  pushTeamId?: string;
+  pushBundleId?: string;
+  /** The `.p8` PEM text. Empty clears it. */
+  pushKey?: string;
+  pushSandbox?: boolean;
+};
+
+/** A device the app registered for push, by its APNs token. */
+export type Device = {
+  token: string;
+  platform: 'ios' | 'macos';
+  createdAt: number;
+};
+
+export type PushTestResult = {
+  ok: boolean;
+  sent: number;
+  error?: string;
+};
+
 /** One configured MCP server as the owner's screen may see it: what it is and which secrets it
- * carries by name, never their values. The whole stored list is encrypted, so a `PUT` that
- * changes one server carries every secret again — the provider key's behaviour. */
+ * carries by name, never their values — the provider key's behaviour. A screen that never sees a
+ * value cannot send one back, so on `PUT /api/mcp/servers/<name>` a secret sent blank keeps the
+ * stored one and a key left out is removed. */
 export type McpServerSummary = {
   name: string;
   transport: 'stdio' | 'http';
-  /** The stdio command line, joined; absent for an http server. */
+  /** The stdio executable, bare; absent for an http server. */
   command?: string;
+  /** Its arguments, so a screen can round-trip one; absent for an http server. */
+  args?: string[];
   /** The http endpoint; absent for a stdio server. */
   url?: string;
   /** The environment variables or headers it carries, by name only. */
@@ -54,6 +89,49 @@ export type McpTestResult = {
 
 export type ApiError = {
   error: string;
+};
+
+/** What one model call against the stored provider settings came back with. An endpoint that
+ * could not be reached is a successful test with `ok` false, like an MCP test. */
+export type ProviderTestResult = {
+  ok: boolean;
+  /** The first line of what the model answered, when it answered. */
+  reply?: string;
+  error?: string;
+};
+
+/** An agent's memory files as the owner may read and edit them. `today` is the daily note the
+ * agent appends to and is read-only here; `lasting` is `MEMORY.md`, which the owner may rewrite. */
+export type MemoryFiles = {
+  lasting: string;
+  today: string;
+};
+
+/** One row a search across every thread found: where it is, who is in that thread, and the
+ * row without its image and tool calls, clipped to a snippet around the match. */
+export type SearchHit = {
+  conversationId: number;
+  participants: string[];
+  message: Pick<Message, 'id' | 'role' | 'content' | 'sender' | 'createdAt'>;
+};
+
+/** What the owner's `POST .../compact` did: for each agent in the thread, how many rows its new
+ * summary stands for. Zero is an agent with nothing since its last summary, and no model call. */
+export type CompactResult = {
+  compacted: Record<string, number>;
+};
+
+/** A file from an agent's home, fetched so the owner can open or keep it. */
+export type AgentFile = {
+  name: string;
+  bytes: number;
+  base64: string;
+};
+
+/** Where a file the owner handed to an agent landed, inside that agent's home. */
+export type UploadResult = {
+  path: string;
+  bytes: number;
 };
 
 export const MIN_PASSWORD_LENGTH = 8;
@@ -84,6 +162,16 @@ export type LiveReply = { text: string; reasoning: string };
 export type Agent = {
   id: number;
   name: string;
+  /** What the owner calls it, free text. Cosmetic only: `name` is what runs, is addressed and is
+   * routed to, and a label is never any of those. Absent on a task worker. */
+  label?: string;
+  /** How a client draws it: an opaque token the daemon stores so every device shows the same
+   * avatar. Absent until a client sets one. */
+  look?: string;
+  /** Who it is, in Markdown: what it is for, how it works, what it stays out of. Written by the
+   * agent after it interviews the owner, or by the owner; part of its system prompt. Absent
+   * until one of them writes it, and on a task worker. */
+  profile?: string;
   /** The X display this agent drives. A worker shares its parent's and drives nothing, so its
    * own number is a placeholder above the range a desktop can use. */
   display: number;
@@ -122,10 +210,13 @@ export type ComputerAction =
   | { action: 'key'; keys: string }
   | { action: 'clipboard_write'; text: string };
 
+/** An image on the wire: a screenshot the daemon took, or a picture the owner sent. */
+export type ImageAttachment = { mediaType: 'image/png' | 'image/jpeg'; base64: string };
+
 /** A screenshot travels as base64 in JSON; see docs/architecture.md for why. */
 export type ComputerResult = {
   action: ComputerActionName;
-  image?: { mediaType: 'image/png'; base64: string };
+  image?: ImageAttachment;
   text?: string;
 };
 
@@ -157,7 +248,7 @@ export type Message = {
   sender?: string;
   toolCalls?: ToolCall[];
   toolCallId?: string;
-  image?: { mediaType: 'image/png'; base64: string };
+  image?: ImageAttachment;
   createdAt: number;
 };
 
@@ -195,7 +286,9 @@ export type EventType =
   | 'restart'
   | 'control'
   | 'schedule_dropped'
-  | 'approval';
+  | 'approval'
+  | 'stop'
+  | 'turn';
 
 /** The structured record of what an agent did. No chain-of-thought, no secrets, no payloads. */
 export type ExecutionEvent = {

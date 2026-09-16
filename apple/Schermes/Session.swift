@@ -21,6 +21,8 @@ final class Session {
 
     private(set) var phase: Phase = .connecting
     private(set) var client: SchermesClient?
+    /// The APNs token this daemon has been told about, so a log out can take it back.
+    var registeredDevice: String?
     var address: String = UserDefaults.standard.string(forKey: addressKey) ?? ""
     var trouble: String?
 
@@ -32,13 +34,20 @@ final class Session {
         await connect()
     }
 
-    /// A bare host is what people type, so a missing scheme is filled in rather than refused.
+    /// A bare host is what people type, so a missing scheme is filled in rather than refused:
+    /// https for a domain, http for an IP, a single-label name or anything under .local.
     static func parse(_ address: String) -> URL? {
         let trimmed = address.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
-        let text = trimmed.contains("://") ? trimmed : "http://\(trimmed)"
+        let scheme = isDomain(trimmed) ? "https" : "http"
+        let text = trimmed.contains("://") ? trimmed : "\(scheme)://\(trimmed)"
         guard let url = URL(string: text), url.host() != nil else { return nil }
         return url
+    }
+
+    private static func isDomain(_ address: String) -> Bool {
+        let host = address.split(whereSeparator: { $0 == ":" || $0 == "/" }).first ?? ""
+        return host.contains(".") && !host.hasSuffix(".local") && host.contains { $0.isLetter }
     }
 
     func connect() async {
@@ -89,6 +98,10 @@ final class Session {
     }
 
     func logOut() async {
+        if let registeredDevice, let client {
+            try? await client.unregisterDevice(token: registeredDevice)
+            self.registeredDevice = nil
+        }
         try? await client?.logout()
         if let daemon = client?.baseURL {
             Task.detached { Keychain.clear(for: daemon) }

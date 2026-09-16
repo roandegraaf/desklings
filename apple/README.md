@@ -29,9 +29,17 @@ xcrun simctl create 'iPhone 17' \
   com.apple.CoreSimulator.SimRuntime.iOS-26-5
 ```
 
-Signing is ad-hoc (`CODE_SIGN_IDENTITY = "-"`, manual) so a fresh clone builds for the simulator
-and this Mac with no Apple account. Running on a physical iPhone needs a real team: pick one under
-Signing & Capabilities in Xcode, or set `DEVELOPMENT_TEAM` in `project.yml`.
+Signing is automatic on the owner's paid team (`DEVELOPMENT_TEAM` in `project.yml`), which is
+what a device build and push need. The first device build registers the App ID with the push
+capability and makes the profile:
+
+```sh
+xcodebuild -scheme Schermes -destination 'generic/platform=iOS' -allowProvisioningUpdates build
+```
+
+A clone without that team still builds for the simulator and this Mac: put
+`CODE_SIGN_STYLE: Manual`, `CODE_SIGN_IDENTITY: "-"` and an empty `DEVELOPMENT_TEAM` back under
+`signing` in `project.yml`.
 
 ## A daemon to talk to
 
@@ -43,8 +51,9 @@ has no owner yet, and checks if it has.
 
 `NSAllowsArbitraryLoads` is on, and that is deliberate. The daemon speaks plain HTTP by design;
 TLS belongs to a reverse proxy in front of it, not inside it. Without this the app could not reach
-a daemon on `http://127.0.0.1:7777` or on a LAN address at all. The connect screen says to use
-`https://` for anything off the local network, and that path is unaffected by this setting.
+a daemon on `http://127.0.0.1:7777` or on a LAN address at all. A bare domain typed into the
+connect screen gets `https://` on its own; an IP, a single-label name or a `.local` name gets
+`http://`. The https path is unaffected by this setting.
 
 ## Session and password
 
@@ -54,6 +63,42 @@ it is only ever sent back to the daemon it was set on, and one 401 on any guarde
 request spends it once to log back in and retries that request. A second 401 shows the login
 screen. Auth routes never take that path: `POST /api/auth/login` answers 401 for a wrong password,
 and retrying it would loop.
+
+## What the chat offers
+
+A reply renders as Markdown, with fenced code in a box that copies; long-press or right-click a
+bubble to copy it. The paperclip attaches a photo or a file: an image goes inline on the message and
+the agent sees it; any other file is uploaded into the agent's `~/uploads` and the message names
+where it landed. A file an agent names in a reply, `~/workspace/report.xlsx` or its full path, is shown
+where it is named: on a line of its own as a card with its type, an image as the picture itself,
+inside a sentence as a link with the file's name. A tap opens a Markdown, HTML, SVG, code or text
+file as an artifact: a pane beside the chat on a Mac and an iPad, a sheet on a phone, with a
+rendered preview, its source, copy and save. Anything else opens in Quick Look. The arrow saves a
+file to Downloads on a Mac and through the Files sheet on a phone. On a Mac an image can also be pasted into the composer or dropped on the chat. The red stop button, or Escape, ends the agent's turn. The More menu on a
+phone, or the toolbar on a Mac and an iPad, exports the loaded thread as Markdown and opens the
+agent's routines, activity and memory; the memory page rewrites `MEMORY.md`. The sidebar's search
+box also searches every thread through the daemon. On a Mac, a turn that ends or a deletion
+request that arrives while the app is not in front becomes a notification, and the badge counts
+unread threads and pending requests.
+
+## Push notifications
+
+The daemon pushes over APNs when an agent finishes a turn or asks for something, so a phone hears
+about it with the app closed. The app asks for notification permission, registers for remote
+notifications, and hands the device token to the daemon (`POST /api/devices`); the APNs key, key
+id, team id and bundle id go in the app's settings, with Sandbox on for a development build, and
+"Send test push" proves the path. Only a **device build signed by a real team** gets a token: the
+`aps-environment` entitlement in `Schermes/Schermes.entitlements` is applied to `iphoneos` builds
+only (`CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]` in `project.yml`), because it needs a provisioning
+profile, which the team's automatic signing supplies for a device. The simulator and the Mac
+build register no token, so on them the Settings screen shows why under Devices and the daemon
+has nobody to push to.
+
+The APNs key itself comes from the developer portal, once per team: Certificates, Identifiers &
+Profiles ▸ Keys ▸ add a key with **Apple Push Notifications service (APNs)** enabled, download the
+`AuthKey_<KEYID>.p8` (it can be downloaded only once) and paste its contents, the Key ID and the
+Team ID (`69G9C748N4`) into Settings ▸ Push notifications, with Sandbox on for an Xcode-installed
+build. Then install on the phone, allow notifications, and press "Send test push".
 
 ## Deleting things
 
@@ -85,15 +130,19 @@ itself.
   say exactly reads as nothing rather than as a guess.
 - `Schermes/Session.swift` owns the server address, the Keychain password and the auth state.
 - `Schermes/Views/` is the connect and login screens, the agent list, the chat, an agent's
-  routines (schedules) and activity feed, and the settings: the provider and web search behind
-  the gear under the agent list, the MCP servers behind the Plugins row above it. A stored key is
-  never shown, and a blank key field keeps the stored one. On macOS and regular width an inspector
+  routines (schedules) and activity feed, and the settings: one gear under the agent list opening
+  six categories — Model, Web search, Notifications, Plugins (the MCP servers), Daemon and About.
+  On the Mac that gear is a `SettingsLink` into a real `Settings` scene, which brings ⌘, and the
+  app menu's Settings… item with it; on iOS it opens a sheet. A stored key is never shown, and a
+  blank key field keeps the stored one. Plugins edits one MCP server at a time in a sheet, which
+  also takes a pasted `{"mcpServers": {…}}` README snippet to fill itself from. On macOS and regular width an inspector
   column shows the picked agent's live screen as a thumbnail over its routines and activity; the
-  full desktop it opens borrows the thumbnail's connection, so Xvnc only ever sees one viewer.
-  Compact width reaches the same screens from the chat's toolbar instead. `About` under the agent
-  list — and the Mac's own app menu, through a notification, because an `@State` on the `App`
-  driving a sheet inside the `WindowGroup` stopped the window being made at all — carries the
-  version, the daemon, and bloub's licence, which its terms require to travel with the app.
+  full desktop it opens (its own resizable, full-screen-capable window per agent on the Mac) shares
+  the thumbnail's connection through `Desktops`, so Xvnc only ever sees one viewer.
+  Compact width reaches the same screens from the chat's toolbar instead. The About page carries
+  the version and bloub's licence, which its terms require to travel with the app; the Mac's own
+  app menu opens the same content as a sheet through a notification, because an `@State` on the
+  `App` driving a sheet inside the `WindowGroup` stopped the window being made at all.
 - `Schermes/Bloub/` is the avatar: the engine port, the `Canvas` view, the agent-state table and
   the local identity store.
 - `Schermes/Assets.xcassets/AppIcon.appiconset` is one bloub on a dark tile, rendered at 1024 by
@@ -107,6 +156,16 @@ branch therefore writes its own `\n`, on the end of the draft: a `TextField` bin
 string and says nothing about the cursor. That is a hardware keyboard only, which is where
 Shift+Return exists; an iPhone's software keyboard still inserts a newline and sends with the
 button. ⌘Return sends too.
+
+A draft that starts with `/` opens the command list above the composer (`Views/Commands.swift`),
+the way a Telegram bot's does: letters narrow it, ↑↓ move the picked row, Tab and Return complete
+it, and a row answers a tap. A command with nothing to fill in runs the moment it is completed;
+`/remember` is put in the composer for its note. Only a whole name counts when the draft is sent,
+so a path like `/home/agent-x/report.md` goes to the agent as words. The commands are the chat's
+own buttons and pages by name — `/new`, `/compact`, `/stop`, `/retry`, `/undo`, `/remember`,
+`/interview`, `/screen`, `/profile`, `/routines`, `/activity`, `/memory` — and a shared thread
+offers only the first five. Matching ignores case because the iPhone capitalises the first letter
+of whatever is typed.
 
 ## The avatar
 

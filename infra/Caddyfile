@@ -1,0 +1,3 @@
+{$SCHERMES_DOMAIN} {
+	reverse_proxy schermes:{$SCHERMES_PORT:7777}
+}

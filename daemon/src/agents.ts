@@ -21,6 +21,21 @@ const run = promisify(execFile);
 
 export const AGENT_NAME = /^[a-z0-9][a-z0-9-]{0,30}$/;
 
+export const MAX_LABEL_CHARS = 64;
+
+/**
+ * A label is free text, because it is only ever displayed: no Linux user, no path, no shell and
+ * no tool schema is built from one. The rule is a one-line string of a readable length — control
+ * characters are out because a label is shown in a row, not a paragraph. A look, the token a
+ * client draws the avatar from, is held to the same rule: the daemon stores it and reads none
+ * of it.
+ */
+export function cleanLabel(raw: string): string | undefined {
+  const label = raw.trim();
+  if (label === '' || [...label].length > MAX_LABEL_CHARS) return undefined;
+  return /[\u0000-\u001f\u007f]/.test(label) ? undefined : label;
+}
+
 // `:0` is reserved for a physical console and start-desktop.sh takes at most three digits.
 export const MAX_DISPLAY = 999;
 
@@ -97,10 +112,13 @@ export function asAgent(target: AgentTarget, argv: readonly string[]): string[] 
 }
 
 function toAgent(row: typeof agents.$inferSelect): Agent {
-  const { parentId, parentConversationId, ...rest } = row;
+  const { label, look, profile, parentId, parentConversationId, ...rest } = row;
   return {
     ...rest,
     state: row.state as AgentState,
+    ...(label === null ? {} : { label }),
+    ...(look === null ? {} : { look }),
+    ...(profile === null ? {} : { profile }),
     ...(parentId === null ? {} : { parentId }),
     ...(parentConversationId === null ? {} : { parentConversationId }),
   };
@@ -148,12 +166,36 @@ export function nextDisplay(taken: readonly number[]): number {
  * Synchronous from the name check to the insert, so two in-flight requests cannot read the
  * same set of taken displays. Returns undefined when the name is already taken.
  */
-export function insertAgent(db: Db, name: string): Agent | undefined {
+export function insertAgent(
+  db: Db,
+  name: string,
+  cosmetics: { label?: string; look?: string } = {},
+): Agent | undefined {
   if (findAgent(db, name) !== undefined) return undefined;
   const display = nextDisplay(listAgents(db).map((agent) => agent.display));
   return toAgent(
-    db.insert(agents).values({ name, display, createdAt: Date.now() }).returning().get(),
+    db
+      .insert(agents)
+      .values({
+        name,
+        label: cosmetics.label ?? null,
+        look: cosmetics.look ?? null,
+        display,
+        createdAt: Date.now(),
+      })
+      .returning()
+      .get(),
   );
+}
+
+/** Changes what the owner sees and what the agent is told it is. The row's `name` is its system
+ * identity and never moves. A null profile clears it. */
+export function setAgentCosmetics(
+  db: Db,
+  name: string,
+  cosmetics: { label?: string; look?: string; profile?: string | null },
+): void {
+  db.update(agents).set(cosmetics).where(eq(agents.name, name)).run();
 }
 
 /**

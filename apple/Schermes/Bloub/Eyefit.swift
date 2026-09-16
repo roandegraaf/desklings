@@ -21,9 +21,10 @@ nonisolated enum BloubEyefit {
     private static let r = Bloub.radius
 
     /// Peak amplitudes of the life at rest, read off `bloubLiveliness`: `bloubLoopNoise` is bounded
-    /// by 1 in absolute value, so these sums are exact bounds. They must be covered, or the
-    /// correction is right on the nominal pose and wrong a second later — seven degrees of yaw
-    /// move an eye a dozen units on a ball of radius 100.
+    /// by 1 in absolute value and the glance fits inside the first term's budget, so these sums
+    /// are exact bounds. They must be covered, or the correction is right on the nominal pose and
+    /// wrong a second later — seven degrees of yaw move an eye a dozen units on a ball of radius
+    /// 100.
     private static let driftYaw = 5.5 + 1.6
     private static let driftPitch = 4.2 + 1.3
     /// Float of the centre, in ball radii.
@@ -285,11 +286,14 @@ nonisolated enum BloubEyefit {
         return (0..<3).map { Double($0) / 2 * def.duration }
     }
 
-    /// One shape's offset on one state and one expression, drift included.
+    /// One shape's offset on one state and one expression, drift included. While `following`, the
+    /// gaze is the pointer's instead, over everything `BloubLook.following` can reach: the drift
+    /// is off then, and the state's own gaze gives way to the look's.
     private static func offset(
         _ def: BloubStateDef,
         _ radii: [Double],
-        _ expr: BloubExpression?
+        _ expr: BloubExpression?,
+        following: Bool
     ) -> CGPoint {
         var trials: [Trial] = []
         for t in dates(def) {
@@ -299,23 +303,28 @@ nonisolated enum BloubEyefit {
             let contour = BloubGeometry.points(swapped, r)
             let calContour = BloubGeometry.points(pose.sil, r)
             let v = visage(def, pose, expr)
-            // The drift's four corners bound the nominal pose, which is their centre: testing it
-            // as well would change no margin and costs one trial in five.
-            for dy in [-driftYaw, driftYaw] {
-                for dp in [-driftPitch, driftPitch] {
-                    var corner = v
-                    corner.gaze = BloubGaze(
-                        yaw: v.gaze.yaw + dy,
-                        pitch: v.gaze.pitch + dp,
-                        roll: v.gaze.roll
-                    )
-                    trials.append(Trial(
-                        prints: prints(corner, pose.sil, radii),
-                        reference: prints(corner, pose.sil, pose.sil.radii),
-                        contour: contour,
-                        calContour: calContour
-                    ))
+            // The corners bound the nominal pose, which is their centre: testing it as well would
+            // change no margin and cost one more trial. The pointer's aim is at most 1 long, so
+            // while following the corners are eight points round that circle.
+            let corners: [(yaw: Double, pitch: Double)] = following
+                ? (0..<8).map {
+                    let a = Double($0) / 8 * bloubTau
+                    let reach = def.id.pointerReach ?? 0
+                    let look = BloubLook.following(nx: cos(a) * reach, ny: sin(a) * reach)
+                    return (look.yaw, look.pitch)
                 }
+                : [-driftYaw, driftYaw].flatMap { dy in
+                    [-driftPitch, driftPitch].map { (v.gaze.yaw + dy, v.gaze.pitch + $0) }
+                }
+            for corner in corners {
+                var cornered = v
+                cornered.gaze = BloubGaze(yaw: corner.yaw, pitch: corner.pitch, roll: v.gaze.roll)
+                trials.append(Trial(
+                    prints: prints(cornered, pose.sil, radii),
+                    reference: prints(cornered, pose.sil, pose.sil.radii),
+                    contour: contour,
+                    calContour: calContour
+                ))
             }
         }
         return solve(trials)
@@ -325,6 +334,7 @@ nonisolated enum BloubEyefit {
         var shape: BloubShapeId
         var state: BloubStateId
         var expression: BloubExpressionId?
+        var following: Bool
     }
 
     /// Built on first use: one entry per (shape, base-body state, expression). `static let` is
@@ -337,8 +347,10 @@ nonisolated enum BloubEyefit {
                 let expressions: [BloubExpressionId?] =
                     def.baseFace ? [nil] + BloubExpressionId.allCases.map { $0 } : [nil]
                 for expression in expressions {
-                    out[Key(shape: shape, state: def.id, expression: expression)] =
-                        offset(def, radii, expression?.expression)
+                    for following in def.id.pointerReach != nil ? [false, true] : [false] {
+                        out[Key(shape: shape, state: def.id, expression: expression, following: following)] =
+                            offset(def, radii, expression?.expression, following: following)
+                    }
                 }
             }
         }
@@ -351,12 +363,16 @@ nonisolated enum BloubEyefit {
     static func offset(
         shape: BloubShapeId?,
         state: BloubStateId,
-        expression: BloubExpressionId?
+        expression: BloubExpressionId?,
+        following: Bool = false
     ) -> CGPoint {
         guard let shape else { return .zero }
         // a state with no resting face has one entry whatever the expression
-        return table[Key(shape: shape, state: state, expression: expression)]
-            ?? table[Key(shape: shape, state: state, expression: nil)]
-            ?? .zero
+        func entry(_ following: Bool) -> CGPoint? {
+            table[Key(shape: shape, state: state, expression: expression, following: following)]
+                ?? table[Key(shape: shape, state: state, expression: nil, following: following)]
+        }
+        // a state that does not follow the pointer has only its resting entries
+        return (following ? entry(true) : nil) ?? entry(false) ?? .zero
     }
 }

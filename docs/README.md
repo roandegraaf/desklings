@@ -7,15 +7,15 @@ harness. Everything else is here.
 | --------------------------------------- | ------------------------------------------------------------ |
 | [architecture.md](architecture.md)      | Why the system is shaped the way it is                       |
 | [development.md](development.md)        | Working on it: workspace, tests, the Docker harness          |
-| [deployment.md](deployment.md)          | Getting it onto a VPS or a real Debian box, TLS, backups     |
-| [image-build.md](image-build.md)        | Building the qcow2 for Unraid with Packer                    |
+| [deployment.md](deployment.md)          | Running it on Unraid or any Docker host, bare Debian, TLS, backups |
 | [configuration.md](configuration.md)    | Every environment variable, and the limits that are not one  |
 | [troubleshooting.md](troubleshooting.md) | Symptoms that have happened, and what they turned out to be |
 
 ## The rest of the map
 
-The project overview names **eleven** documents. Seven of them are the files above, counting the
-project README. The other four are sections of `architecture.md` rather than files of their own.
+The project overview names **eleven** documents. Six of them are the files above, counting the
+project README; a seventh, the qcow2 build guide, went away with the VM deploy path. The other
+four are sections of `architecture.md` rather than files of their own.
 
 | Subject                             | Where it lives                                                                                   |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------ |
@@ -31,10 +31,10 @@ privilege model plus the secrets handling plus the single-port rule, and none of
 comprehensible alone.
 
 The ones that did get their own file earned it by having a distinct audience and a distinct
-moment. You read the deployment guide once when you deploy, the image build guide once on a
-Linux host with QEMU, the configuration reference when you need a specific value, and
-troubleshooting only when something is already wrong. Architecture is the one you read to
-understand, and the four subjects above are part of understanding it.
+moment. You read the deployment guide once when you deploy, the configuration reference when
+you need a specific value, and troubleshooting only when something is already wrong.
+Architecture is the one you read to understand, and the four subjects above are part of
+understanding it.
 
 ## How to read architecture.md
 

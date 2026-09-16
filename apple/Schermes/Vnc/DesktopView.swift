@@ -55,31 +55,107 @@ import SwiftUI
             }
             feed.finish()
         }
+        // Closed by the last viewer leaving rather than dropped: the next one to open this
+        // desktop should see it connecting, not a minutes-old frame that reads as live.
+        if Task.isCancelled {
+            screen = nil
+            failure = nil
+        }
     }
 }
 
+/// One `DesktopLink` per agent for the whole app, however many views show that desktop. On a Mac
+/// the inspector's thumbnail and the desktop's own window are in different scenes and still read
+/// one socket.
+@Observable final class Desktops {
+    // Links are never removed: a view that fetched one just before the last viewer left would
+    // otherwise keep drawing a link nothing runs any more.
+    @ObservationIgnored private var links: [String: DesktopLink] = [:]
+    @ObservationIgnored private var viewers: [String: Int] = [:]
+    @ObservationIgnored private var runs: [String: Task<Void, Never>] = [:]
+
+    func link(_ agent: String) -> DesktopLink {
+        if let link = links[agent] { return link }
+        let link = DesktopLink()
+        links[agent] = link
+        return link
+    }
+
+    func watch(_ agent: String, session: Session) async {
+        let link = link(agent)
+        viewers[agent, default: 0] += 1
+        if runs[agent] == nil {
+            runs[agent] = Task {
+                while !Task.isCancelled {
+                    await link.run(session: session, agent: agent)
+                    try? await Task.sleep(for: .seconds(5))
+                }
+            }
+        }
+        while !Task.isCancelled { try? await Task.sleep(for: .seconds(3600)) }
+        viewers[agent, default: 1] -= 1
+        guard viewers[agent] == 0 else { return }
+        viewers[agent] = nil
+        runs.removeValue(forKey: agent)?.cancel()
+    }
+}
+
+#if os(macOS)
+/// Handed a name rather than an `Agent`, which would freeze the state dot and, as the window's
+/// identity, open a second window whenever the state changed.
+struct DesktopWindow: View {
+    let session: Session
+    let name: String
+
+    @State private var agent: Agent?
+    @State private var gone = false
+
+    var body: some View {
+        Group {
+            if let agent {
+                DesktopView(session: session, agent: agent)
+            } else if gone {
+                ContentUnavailableView("No screen", systemImage: "display", description: Text("This agent no longer exists."))
+            } else {
+                ProgressView()
+            }
+        }
+        .frame(minWidth: 560, minHeight: 360)
+        .windowToolbarFullScreenVisibility(.onHover)
+        .task {
+            while !Task.isCancelled {
+                if let rows = try? await session.run({ try await $0.agents() }) {
+                    agent = rows.first { $0.name == name }
+                    gone = agent == nil
+                }
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+}
+#endif
+
 /// One agent's live screen, and the owner's hands on it when they ask for them. Full-bleed dark
-/// with the picture scaled to fit and letterboxed, the agent pill and the way back at the top
-/// left, and taking or returning control at the top right.
+/// with the picture scaled to fit and letterboxed. On a Mac it fills its own window, with the
+/// agent and taking or returning control in the toolbar; elsewhere it covers the screen, with the
+/// way back and the agent at the top left and control at the top right.
 ///
 /// Input is sent only while the daemon says this viewer holds the desktop. The proxy filters
 /// nothing, so `viewOnly` is the rule and an unknown answer is not a yes.
 struct DesktopView: View {
     let session: Session
     let agent: Agent
-    /// A connection somebody else keeps open, borrowed instead of opening a second one.
-    var shared: DesktopLink?
 
-    @State private var own = DesktopLink()
     @State private var trouble: String?
     @State private var held: Bool?
     @State private var typing = false
     @State private var box = CGSize.zero
 
     @Environment(AgentLooks.self) private var looks
+    @Environment(Desktops.self) private var desktops
     @Environment(\.dismiss) private var dismiss
 
-    private var link: DesktopLink { shared ?? own }
+    private var link: DesktopLink { desktops.link(agent.name) }
     private var holding: Bool { !viewOnly(held) }
 
     var body: some View {
@@ -92,17 +168,23 @@ struct DesktopView: View {
                 .overlay { if holding { hands } }
                 .onGeometryChange(for: CGSize.self) { $0.size } action: { box = $0 }
         }
-        // A band of its own rather than an overlay over the picture: on macOS a click on a SwiftUI
-        // control drawn above an `NSView` reaches the view underneath as well, so chrome over the
-        // desktop meant every press of Return control also landed a click on the agent's screen.
+        #if os(macOS)
+        // In the window's toolbar, which sits outside the content view: on macOS a click on a
+        // SwiftUI control drawn above an `NSView` reaches the view underneath as well, so chrome
+        // over the desktop landed every press of Return control on the agent's screen too.
+        .navigationTitle(agent.title)
+        .toolbar(removing: .title)
+        .toolbar {
+            ToolbarItem(placement: .principal) { identity.padding(.horizontal, 8) }
+            ToolbarItem { control.labelStyle(.titleAndIcon) }
+        }
+        #else
         .safeAreaInset(edge: .top) { bar }
+        #endif
         .overlay(alignment: .bottom) { complaint }
         .preferredColorScheme(.dark)
-        // Leaving cancels this, which cancels the client, which closes the socket. A borrowed
-        // connection is closed by whoever lent it.
-        .task(id: agent.name) {
-            if shared == nil { await own.run(session: session, agent: agent.name) }
-        }
+        // Leaving cancels this, and the last view of this desktop to leave closes the socket.
+        .task(id: agent.name) { await desktops.watch(agent.name, session: session) }
         .task(id: agent.name) { await follow() }
         .onChange(of: held) {
             let now = holding
@@ -121,11 +203,11 @@ struct DesktopView: View {
                     .interpolation(.medium)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .accessibilityLabel("\(agent.name)'s screen")
+                    .accessibilityLabel("\(agent.title)'s screen")
             } else {
                 VStack(spacing: 12) {
                     if link.failure == nil { ProgressView().controlSize(.large) }
-                    Text(link.failure ?? "Connecting to \(agent.name)'s desktop…")
+                    Text(link.failure ?? "Connecting to \(agent.title)'s desktop…")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -148,41 +230,52 @@ struct DesktopView: View {
 
     // MARK: - Chrome
 
-    private var bar: some View {
-        HStack(spacing: 10) {
-            chrome
-            Spacer(minLength: 12)
-            tools
+    private var identity: some View {
+        HStack(spacing: 7) {
+            BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 22)
+            Text(agent.title).font(.headline)
+            StateDot(state: agent.state)
         }
-        .padding(16)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(agent.title), \(agent.state.label)")
     }
 
-    private var chrome: some View {
+    private var control: some View {
+        Button(
+            holding ? returnTitle : "Take control",
+            systemImage: holding ? "hand.raised.fill" : "hand.raised"
+        ) { take(!holding) }
+            .lineLimit(1)
+            .accessibilityLabel(holding ? "Return control" : "Take control")
+            // Unknown ownership is not a no: until the daemon has answered there is nothing
+            // to take or return, exactly as the web UI has it.
+            .disabled(held == nil)
+    }
+
+    #if os(macOS)
+    private let returnTitle = "Return control"
+    #else
+    // The full phrase plus the keyboard button is wider than an iPhone, and the label wrapped
+    // onto two lines.
+    private let returnTitle = "Return"
+
+    private var bar: some View {
         HStack(spacing: 10) {
             Button("Back", systemImage: "chevron.left") { dismiss() }
                 .labelStyle(.iconOnly)
                 .buttonStyle(.glass)
                 .buttonBorderShape(.circle)
                 // Escape belongs to the desktop while the desktop is this viewer's: a shortcut
-                // here is consulted before the key shim ever sees the press. The way out while
-                // holding is this button and the one beside it, which the bar keeps clickable.
+                // here is consulted before the key shim ever sees the press.
                 .keyboardShortcut(holding ? nil : KeyboardShortcut(.escape, modifiers: []))
 
-            HStack(spacing: 7) {
-                BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 22)
-                Text(agent.name).font(.headline)
-                StateDot(state: agent.state)
-            }
-            .padding(.horizontal, 13)
-            .padding(.vertical, 7)
-            .glassEffect(.regular, in: .capsule)
-            .accessibilityLabel("\(agent.name), \(agent.state.label)")
-        }
-    }
+            identity
+                .padding(.horizontal, 13)
+                .padding(.vertical, 7)
+                .glassEffect(.regular, in: .capsule)
 
-    private var tools: some View {
-        HStack(spacing: 10) {
-            #if os(iOS)
+            Spacer(minLength: 12)
+
             // The software keyboard is raised deliberately: it covers half the desktop, and most
             // of what is done on one is done with the pointer.
             if holding {
@@ -194,22 +287,12 @@ struct DesktopView: View {
                     .buttonStyle(.glass)
                     .buttonBorderShape(.circle)
             }
-            #endif
 
-            // "Return" rather than "Return control": the full phrase plus the keyboard button is
-            // wider than an iPhone, and the label wrapped onto two lines.
-            Button(
-                holding ? "Return" : "Take control",
-                systemImage: holding ? "hand.raised.fill" : "hand.raised"
-            ) { take(!holding) }
-                .lineLimit(1)
-                .buttonStyle(.glass)
-                .accessibilityLabel(holding ? "Return control" : "Take control")
-                // Unknown ownership is not a no: until the daemon has answered there is nothing
-                // to take or return, exactly as the web UI has it.
-                .disabled(held == nil)
+            control.buttonStyle(.glass)
         }
+        .padding(16)
     }
+    #endif
 
     /// A refusal from the control routes has nowhere else to go, and it is the one error here the
     /// owner can do something about. The connection's own failure is shown in the middle while

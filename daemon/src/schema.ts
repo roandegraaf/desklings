@@ -1,4 +1,4 @@
-import { integer, primaryKey, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import { index, integer, primaryKey, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 
 /** Single-row table: schermes has one owner, not a user list. */
 export const owner = sqliteTable('owner', {
@@ -22,6 +22,15 @@ export const settings = sqliteTable('settings', {
 export const agents = sqliteTable('agents', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   name: text('name').notNull().unique(),
+  // What the owner calls this agent, free text. Cosmetic: `name` stays the system identity, so
+  // nothing addresses, routes or runs as a label.
+  label: text('label'),
+  // How a client draws it, an opaque token the daemon stores so every device shows the same
+  // avatar. The client owns the format.
+  look: text('look'),
+  // Who this agent is, in Markdown: what it is for, how it works, what it stays out of. Written
+  // by the agent itself after interviewing the owner, or by the owner; in its system prompt.
+  profile: text('profile'),
   display: integer('display').notNull().unique(),
   // Durable agent state: the loop is a process, this column is the truth.
   state: text('state').notNull().default('idle'),
@@ -53,22 +62,26 @@ export const conversationParticipants = sqliteTable(
   (table) => [primaryKey({ columns: [table.conversationId, table.agentId] })],
 );
 
-export const messages = sqliteTable('messages', {
-  id: integer('id').primaryKey({ autoIncrement: true }),
-  conversationId: integer('conversation_id')
-    .notNull()
-    .references(() => conversations.id),
-  role: text('role').notNull(),
-  content: text('content').notNull(),
-  // The agent that wrote it. Null is the owner, who has no agent row.
-  sender: text('sender'),
-  // JSON, written only on assistant rows that asked for tools.
-  toolCalls: text('tool_calls'),
-  toolCallId: text('tool_call_id'),
-  // JSON: the base64 PNG a screenshot observation carries.
-  image: text('image'),
-  createdAt: integer('created_at').notNull(),
-});
+export const messages = sqliteTable(
+  'messages',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    conversationId: integer('conversation_id')
+      .notNull()
+      .references(() => conversations.id),
+    role: text('role').notNull(),
+    content: text('content').notNull(),
+    // The agent that wrote it. Null is the owner, who has no agent row.
+    sender: text('sender'),
+    // JSON, written only on assistant rows that asked for tools.
+    toolCalls: text('tool_calls'),
+    toolCallId: text('tool_call_id'),
+    // JSON: the base64 PNG a screenshot observation carries.
+    image: text('image'),
+    createdAt: integer('created_at').notNull(),
+  },
+  (table) => [index('messages_conversation_id_idx').on(table.conversationId)],
+);
 
 /**
  * What a compacted stretch of a thread is replayed as. A summary stands in for the messages
@@ -79,17 +92,21 @@ export const messages = sqliteTable('messages', {
  * projection — its own tool traffic, nobody else's — so one shared summary would replay another
  * agent's work as this one's.
  */
-export const summaries = sqliteTable('summaries', {
-  id: integer('id').primaryKey({ autoIncrement: true }),
-  conversationId: integer('conversation_id')
-    .notNull()
-    .references(() => conversations.id),
-  sender: text('sender').notNull(),
-  content: text('content').notNull(),
-  fromMessageId: integer('from_message_id').notNull(),
-  throughMessageId: integer('through_message_id').notNull(),
-  createdAt: integer('created_at').notNull(),
-});
+export const summaries = sqliteTable(
+  'summaries',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    conversationId: integer('conversation_id')
+      .notNull()
+      .references(() => conversations.id),
+    sender: text('sender').notNull(),
+    content: text('content').notNull(),
+    fromMessageId: integer('from_message_id').notNull(),
+    throughMessageId: integer('through_message_id').notNull(),
+    createdAt: integer('created_at').notNull(),
+  },
+  (table) => [index('summaries_conversation_id_sender_idx').on(table.conversationId, table.sender)],
+);
 
 /**
  * A standing job for one agent. `next_run_at` is the whole clock: the tick fires every row that
@@ -109,15 +126,19 @@ export const schedules = sqliteTable('schedules', {
   createdAt: integer('created_at').notNull(),
 });
 
-export const events = sqliteTable('events', {
-  id: integer('id').primaryKey({ autoIncrement: true }),
-  agentId: integer('agent_id')
-    .notNull()
-    .references(() => agents.id),
-  type: text('type').notNull(),
-  data: text('data').notNull(),
-  createdAt: integer('created_at').notNull(),
-});
+export const events = sqliteTable(
+  'events',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    agentId: integer('agent_id')
+      .notNull()
+      .references(() => agents.id),
+    type: text('type').notNull(),
+    data: text('data').notNull(),
+    createdAt: integer('created_at').notNull(),
+  },
+  (table) => [index('events_agent_id_idx').on(table.agentId)],
+);
 
 /**
  * A destructive change an agent has asked the owner for. Only pending requests live here: a
@@ -137,5 +158,15 @@ export const approvals = sqliteTable('approvals', {
   // An agent's name, or a conversation id written out.
   target: text('target').notNull(),
   reason: text('reason').notNull(),
+  createdAt: integer('created_at').notNull(),
+});
+
+/** A device the app registered for push, by its APNs token. One row per token, whichever
+ * platform: a token that stops working is dropped when Apple says so. */
+export const devices = sqliteTable('devices', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  token: text('token').notNull().unique(),
+  // 'ios' or 'macos'.
+  platform: text('platform').notNull(),
   createdAt: integer('created_at').notNull(),
 });

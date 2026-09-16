@@ -30,21 +30,25 @@ happened, and leaves the agent waiting for its owner rather than resuming on its
 
 Agent-to-agent messaging and task workers: agents write to each other and to group threads,
 and a permanent agent can hand a job to a disposable task worker that runs as it and reports
-back. Human takeover: the agent desktops stream to the browser over a WebSocket proxy on the
-same port, and taking control stands the agent down until you give it back. The web UI: log in,
-store the provider settings, create an agent, read its thread a page at a time with the
-screenshots it took inline, watch and drive its desktop, and follow what it did.
+back. Human takeover: the agent desktops stream to the app over a WebSocket proxy on the
+same port, and taking control stands the agent down until you give it back. The owner's side:
+stop a turn where it stands, hand an agent a file, read and correct what it remembers, search
+every thread, send a picture, see what each turn cost, and get a push on the phone when an
+agent finishes, fails or asks to delete something — straight from the daemon to Apple, with
+nothing in between. A new agent interviews its owner about what it is for and writes the answer as its profile,
+which is in its system prompt from then on; it can put a form of questions to the owner at any
+time, and the owner edits the profile from the app. The native app: log in, store the provider
+settings and test them, create an agent, answer its questions, read its thread a page at a time
+with Markdown and the screenshots it took inline, watch and drive its desktop, and follow what
+it did.
 
-Two things have never been run. **No real OpenAI-compatible endpoint has ever answered** — every
+One thing has never been run. **No real OpenAI-compatible endpoint has ever answered** — every
 turn described above was served by `infra/provider-stub.py`, a scripted stand-in on loopback.
-And the **Packer template has never been built**: `packer validate` passes, but producing the
-qcow2 needs QEMU and `/dev/kvm` on a Linux host, and this was written on a Mac. See
-[docs/image-build.md](docs/image-build.md) for exactly what that leaves unproven.
 
-## Try the dev harness
+## Try it
 
-Requires Docker. The container is a real Debian 13 host provisioned by the same
-`infra/install.sh` that a VM or VPS would run.
+Requires Docker. The container is a real Debian 13 host provisioned by `infra/install.sh`, and
+the same image is what you deploy.
 
 ```sh
 docker compose build
@@ -53,7 +57,7 @@ docker compose up -d
 docker compose exec schermes /opt/schermes/infra/desktop/check.sh # the desktops
 ```
 
-Then open http://127.0.0.1:7777 and set the owner password.
+Then point the app at http://127.0.0.1:7777 and set the owner password.
 
 `smoke.sh` walks the API: health, the first-run password, the second setup attempt being
 refused, an unauthenticated request being rejected, login, and the settings round-trip with the
@@ -81,8 +85,8 @@ each browser, captures a screenshot per desktop, verifies a cookie survives a Ch
 and verifies that the web port is the only socket bound outside loopback.
 
 Both are safe to run repeatedly, including after `docker compose restart` and after
-`docker compose up --build`: `/var/lib/schermes` is a named volume, so nothing wipes the
-database between runs and the scripts reuse the owner and the agents they find.
+`docker compose up --build`: `/var/lib/schermes` and `/home` are named volumes, so nothing wipes the
+database or the agent homes between runs and the scripts reuse the owner and the agents they find.
 
 To work on the daemon:
 
@@ -103,10 +107,11 @@ pnpm check   # TypeScript, strict
 | `SCHERMES_MAX_WORKERS` | `4`                 | Concurrent task workers                |
 
 That is all of them. The model provider is not configured here: base URL, model and API key are
-set in the UI and stored encrypted. Full reference, including the limits that are constants
+set in the app and stored encrypted, and so are the web search key and the APNs key. Full reference, including the limits that are constants
 rather than variables, in [docs/configuration.md](docs/configuration.md).
 
-schermes speaks plain HTTP. Put Caddy or nginx in front of it for TLS.
+schermes speaks plain HTTP. For a domain, the compose file ships Caddy behind a profile:
+[docs/deployment.md](docs/deployment.md#a-linked-domain).
 
 ## Layout
 
@@ -121,7 +126,6 @@ infra/smoke.sh                       runnable check for the daemon API
 infra/desktop/create-agent-user.sh   create agent-<name>, home, workspace, uploads, profile
 infra/desktop/start-desktop.sh       spawn or adopt an agent's Xvnc display and window manager
 infra/desktop/check.sh               runnable check for the whole desktop foundation
-infra/packer/                        QEMU template that builds the qcow2 for Unraid
 infra/provider-stub.py               scripted OpenAI-compatible endpoint, used by smoke.sh
 docs/                                architecture, deployment, configuration, troubleshooting
 ```
@@ -131,23 +135,30 @@ and `tsc` only type-checks. It serves no static files either — the exposed por
 nothing else. The client is the native app in `apple/`; see [apple/README.md](apple/README.md)
 to build it.
 
-## Deploying to a real machine
+## Deploying
 
-Install Debian 13, copy this repository to `/opt/schermes`, and run `infra/install.sh` as
-root. It provisions the host, installs the daemon's dependencies, and enables the
-`schermes.service` unit. The script is idempotent, so re-running it after an update is the
-upgrade path.
+The Docker image is the deployment. Unraid runs Docker natively, so an Unraid box, a VPS or any
+Linux host with the Compose plugin is the same target:
 
 ```sh
-systemctl start schermes
-SCHERMES_URL=http://127.0.0.1:7777 /opt/schermes/infra/smoke.sh
+git clone <this repository> schermes && cd schermes
+echo SCHERMES_BIND=0.0.0.0 > .env
+docker compose up -d --build
 ```
 
-Open `http://<host>:7777` and set the owner password. Whoever reaches the port first becomes the
-owner, so claim it promptly on a network you trust — setup succeeds exactly once.
+Point the app at `http://<host>:7777` and set the owner password. Whoever reaches the port
+first becomes the owner, so claim it promptly on a network you trust — setup succeeds exactly
+once. Upgrading is `git pull` and the same `up -d --build`: the database, the master key, the
+agent homes and the shared directory live in named volumes and survive it.
 
-For Unraid, build the qcow2 instead: [docs/image-build.md](docs/image-build.md). Full deployment
-notes, including TLS and what to back up, in [docs/deployment.md](docs/deployment.md).
+For a domain, put `SCHERMES_DOMAIN=schermes.example.com` and `COMPOSE_PROFILES=domain` in
+`.env` instead of the bind line, and Caddy handles the certificate. The app turns a bare domain
+into `https://` on its own. Steps and the Unraid port note in
+[docs/deployment.md](docs/deployment.md#a-linked-domain).
+
+A Debian 13 host without Docker works too: copy the repository to `/opt/schermes` and run
+`infra/install.sh` as root, which enables the `schermes.service` unit. Full deployment notes,
+including TLS and what to back up, in [docs/deployment.md](docs/deployment.md).
 
 ## Documentation
 

@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The agents as conversation rows — the threads they share listed under them, task workers nested
-/// under the agent that spawned them — a row of large avatars above, and the thread of whichever
+/// under the agent that spawned them — and the thread of whichever
 /// row is picked. `NavigationSplitView` is the sidebar on macOS and regular width and collapses to
 /// its own screen on compact.
 struct ConsoleView: View {
@@ -19,13 +19,23 @@ struct ConsoleView: View {
     @State private var query = ""
     @State private var trouble: String?
     @State private var creating = false
-    @State private var panel: Panel?
+    #if os(iOS)
+    @State private var settingsOpen = false
+    #endif
     @State private var inspecting = true
+    /// The file open beside the chat, if any. One per console: switching threads closes it.
+    @State private var artifacts = Artifacts()
     /// What an agent has asked the owner to delete and nobody has answered yet.
     @State private var requests: [Approval] = []
     @State private var removing: Removal?
     @State private var dressing: Agent?
     @State private var managing: Agent?
+    /// What the daemon found for the search box across every thread.
+    @State private var hits: [SearchHit] = []
+    /// The state each permanent agent was last seen in, so a turn ending while the owner is
+    /// looking elsewhere can be announced.
+    @State private var lastStates: [String: AgentState] = [:]
+    @State private var lastRequestIds: Set<Int> = []
 
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -52,7 +62,7 @@ struct ConsoleView: View {
 
         var title: String {
             switch self {
-            case .agent(let agent): "Delete \(agent.name)?"
+            case .agent(let agent): "Delete \(agent.title)?"
             case .thread: "Delete this thread?"
             }
         }
@@ -68,18 +78,9 @@ struct ConsoleView: View {
         }
     }
 
-    /// Everything the bottom of the sidebar opens, through one `.sheet(item:)` so a Debug build and
-    /// a Release build carry the same modifiers.
-    enum Panel: Identifiable {
-        case settings
-        case plugins
-        case about
-
-        var id: Self { self }
-    }
-
     @Environment(AgentLooks.self) private var looks
     @Environment(Unread.self) private var unread
+    @Environment(PushRegistration.self) private var registration
     @Environment(\.scenePhase) private var scenePhase
 
     private var awake: Bool { scenePhase == .active }
@@ -100,7 +101,8 @@ struct ConsoleView: View {
         let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
         guard !needle.isEmpty else { return trees }
         return trees.filter { tree in
-            tree.agent.name.lowercased().contains(needle)
+            tree.agent.title.lowercased().contains(needle)
+                || tree.agent.name.lowercased().contains(needle)
                 || preview(.agent(tree.agent.name))?.content.lowercased().contains(needle) == true
         }
     }
@@ -111,10 +113,13 @@ struct ConsoleView: View {
             guard let agent = agents.first(where: { $0.name == name }) else { return nil }
             return .agent(agent)
         case .conversation(let id):
-            guard let conversation = conversations.first(where: { $0.id == id }) else { return nil }
+            // A search hit can open a thread under an agent whose subtree is not the expanded one.
+            guard let participants = conversations.first(where: { $0.id == id })?.participants
+                ?? hits.first(where: { $0.conversationId == id })?.participants
+            else { return nil }
             return .group(
-                id: conversation.id,
-                members: agents.filter { conversation.participants.contains($0.name) }
+                id: id,
+                members: agents.filter { participants.contains($0.name) }
             )
         case nil:
             return nil
@@ -133,6 +138,9 @@ struct ConsoleView: View {
                     // members, so the source rather than the name is what has to be the identity.
                     ChatView(session: session, thread: thread, inspector: roomy ? $inspecting : nil)
                         .id(thread.source)
+                        .environment(artifacts)
+                        .modifier(ArtifactSplit(artifacts: artifacts, roomy: roomy))
+                        .onChange(of: thread.source) { artifacts.open = nil }
                 } else {
                     ContentUnavailableView(
                         "No thread picked",
@@ -150,15 +158,39 @@ struct ConsoleView: View {
                 if roomy && inspecting { inspector }
             }
         }
-        // Keyed by the scene phase, so a window nobody is looking at stops asking. On iOS the
-        // process is suspended anyway; on a Mac this loop is a request per agent every two
-        // seconds for as long as the app is open, whether or not it is in front.
+        // Keyed by the scene phase: a window nobody is looking at asks less often, and what it
+        // finds is announced rather than drawn. On iOS the process is suspended anyway; on a Mac
+        // this is what lets a turn finishing behind another app reach the owner.
         .task(id: awake) {
-            guard awake else { return }
             while !Task.isCancelled {
                 await refresh()
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .seconds(awake ? 2 : 10))
             }
+        }
+        // Debounced: a search is a request to the daemon, not a filter over what is loaded.
+        .task(id: query) {
+            let needle = query.trimmingCharacters(in: .whitespaces)
+            guard needle.count >= 2 else {
+                hits = []
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled,
+                  let found = try? await session.run({ try await $0.search(needle) })
+            else { return }
+            hits = found
+        }
+        .onAppear { Notifier.ask() }
+        // Once per token per daemon: the daemon upserts, so a relaunch that gets the same token
+        // costs one request and changes nothing.
+        .task(id: registration.token) {
+            guard let token = registration.token, token != session.registeredDevice else { return }
+            if (try? await session.run({ try await $0.registerDevice(token: token, platform: registration.platform) })) != nil {
+                session.registeredDevice = token
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openAgent)) { note in
+            if let name = note.object as? String { picked = .agent(name) }
         }
         // Its own, slower loop: shared threads are made by agents writing to each other, which is
         // far rarer than a message arriving, and this one costs a request per thread it finds.
@@ -174,7 +206,7 @@ struct ConsoleView: View {
             if case .agent(let name) = next { expanded = subtreeOwner(name) }
         }
         .sheet(isPresented: $creating) {
-            NewAgentSheet(session: session) { agent in
+            NewAgentSheet(session: session, taken: Set(agents.map(\.name))) { agent in
                 picked = .agent(agent.name)
                 Task { await refresh() }
             }
@@ -199,6 +231,7 @@ struct ConsoleView: View {
                             GroupRow(
                                 conversation: conversation,
                                 besides: tree.agent.name,
+                                titles: titles(agents),
                                 preview: preview(.conversation(conversation.id)),
                                 unread: isUnread(.conversation(conversation.id))
                             )
@@ -211,7 +244,7 @@ struct ConsoleView: View {
                     }
                 }
 
-                if !tree.workers.isEmpty {
+                if !tree.workers.isEmpty, query.isEmpty {
                     WorkersToggle(count: tree.workers.count, open: openWorkers.contains(tree.agent.name)) {
                         if openWorkers.contains(tree.agent.name) {
                             openWorkers.remove(tree.agent.name)
@@ -236,20 +269,25 @@ struct ConsoleView: View {
                     }
                 }
             }
+
+            if !hits.isEmpty {
+                Section("Messages") {
+                    ForEach(hits) { hit in
+                        NavigationLink(value: source(of: hit)) {
+                            HitRow(hit: hit, titles: titles(agents))
+                        }
+                    }
+                }
+            }
         }
         .navigationTitle("Agents")
-        // A large title scrolls under the top inset, so it reads as a smudge behind the pinned
+        // A large title scrolls under the top inset, so it reads as a smudge behind the pending
         // row's material rather than as a title.
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
-        .searchable(text: $query, placement: .sidebar, prompt: "Search agents")
-        .safeAreaInset(edge: .top) {
-            VStack(spacing: 0) {
-                pending
-                pinned
-            }
-        }
+        .searchable(text: $query, placement: .sidebar, prompt: "Search agents and messages")
+        .safeAreaInset(edge: .top) { pending }
         .overlay {
             if trees.isEmpty {
                 ContentUnavailableView(
@@ -257,7 +295,7 @@ struct ConsoleView: View {
                     systemImage: "person.crop.circle.badge.plus",
                     description: Text(trouble ?? "Create one to start talking.")
                 )
-            } else if visible.isEmpty {
+            } else if visible.isEmpty && hits.isEmpty {
                 ContentUnavailableView.search(text: query)
             }
         }
@@ -268,51 +306,34 @@ struct ConsoleView: View {
             }
         }
         // The sidebar's toolbar is only as wide as the sidebar, so a second button there ends up
-        // behind an overflow chevron. Plugins, Log out and the settings gear live under the list.
+        // behind an overflow chevron: the settings gear lives under the list instead.
         // The chat's pill is centred in the window and must clear this column, so with the
         // inspector open a Mac window can shrink only to about twice this width plus 320. At 240
         // that is just under 800.
         .navigationSplitViewColumnWidth(min: 220, ideal: 240, max: 420)
         .safeAreaInset(edge: .bottom) {
-            VStack(spacing: 0) {
-                Button { panel = .plugins } label: {
-                    HStack {
-                        Label("Plugins", systemImage: "puzzlepiece.extension")
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.tertiary)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 11)
-                    .contentShape(.rect)
+            HStack {
+                Spacer()
+                #if os(macOS)
+                // The `Settings` scene owns ⌘, on the Mac, so the gear only has to open it.
+                SettingsLink {
+                    Label("Settings", systemImage: "gearshape")
                 }
-                .buttonStyle(.plain)
-
-                Divider()
-
-                HStack(spacing: 18) {
-                    Button("Log out", systemImage: "rectangle.portrait.and.arrow.right") {
-                        Task { await session.logOut() }
-                    }
-                    Button("About", systemImage: "info.circle") { panel = .about }
-                    Spacer()
-                    Button("Settings", systemImage: "gearshape") { panel = .settings }
-                        .labelStyle(.iconOnly)
-                        .font(.body)
-                        .keyboardShortcut(",", modifiers: .command)
-                }
-                .labelStyle(.titleAndIcon)
-                .buttonStyle(.plain)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
+                #else
+                Button("Settings", systemImage: "gearshape") { settingsOpen = true }
+                    .keyboardShortcut(",", modifiers: .command)
+                #endif
             }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.plain)
+            .font(.body)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
             .background(.bar)
         }
         .sheet(item: $dressing) { agent in
-            AgentLookSheet(name: agent.name, state: agent.state, identity: looks[agent.name])
+            AgentLookSheet(session: session, agent: agent, identity: looks[agent.name])
         }
         .sheet(item: $managing) { agent in
             RoutinesAndActivity(session: session, agent: agent)
@@ -328,16 +349,9 @@ struct ConsoleView: View {
         } message: { what in
             Text(what.detail)
         }
-        .sheet(item: $panel) { shown in
-            switch shown {
-            case .settings:
-                SettingsView(session: session)
-            case .plugins:
-                PluginsView(session: session, agents: agents.filter { $0.parentId == nil })
-            case .about:
-                AboutView(session: session)
-            }
-        }
+        #if os(iOS)
+        .sheet(isPresented: $settingsOpen) { SettingsSheet(session: session) }
+        #endif
     }
 
     /// The picked agent's screen and routines. A shared thread has several agents and a task worker
@@ -358,46 +372,13 @@ struct ConsoleView: View {
         .inspectorColumnWidth(min: 220, ideal: 250, max: 420)
     }
 
-    /// The permanent agents as large avatars above the list. Every one of them: the row is a way
-    /// to reach an agent at a glance, not a set the owner has to curate.
-    @ViewBuilder private var pinned: some View {
-        if !trees.isEmpty {
-            ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: 12) {
-                    ForEach(trees) { tree in
-                        Button { picked = .agent(tree.agent.name) } label: {
-                            VStack(spacing: 6) {
-                                BloubView(
-                                    state: tree.agent.state.bloub,
-                                    identity: looks[tree.agent.name],
-                                    size: 58
-                                )
-                                Text(tree.agent.name)
-                                    .font(.caption2)
-                                    .lineLimit(1)
-                                    .foregroundStyle(picked == .agent(tree.agent.name) ? .primary : .secondary)
-                            }
-                            .frame(width: 70)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("\(tree.agent.name), \(tree.agent.state.label)")
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-            }
-            .scrollIndicators(.hidden)
-            .background(.bar)
-        }
-    }
-
     /// What a right-click on an agent offers: the two screens that are otherwise only reachable
     /// from inside its chat, and the one thing that cannot be undone, last and apart.
     @ViewBuilder private func menu(for agent: Agent) -> some View {
-        Button("Appearance…", systemImage: "paintpalette") { dressing = agent }
-        Button("Routines and activity…", systemImage: "clock.arrow.circlepath") { managing = agent }
+        Button("Name and appearance…", systemImage: "paintpalette") { dressing = agent }
+        Button("Profile, routines and activity…", systemImage: "clock.arrow.circlepath") { managing = agent }
         Divider()
-        Button("Delete \(agent.name)", systemImage: "trash", role: .destructive) {
+        Button("Delete \(agent.title)", systemImage: "trash", role: .destructive) {
             removing = .agent(agent)
         }
     }
@@ -408,7 +389,9 @@ struct ConsoleView: View {
         if !requests.isEmpty {
             VStack(spacing: 0) {
                 ForEach(requests) { request in
-                    ApprovalRow(request: request) { approve in decide(request, approve) }
+                    ApprovalRow(request: request, titles: titles(agents)) { approve in
+                        decide(request, approve)
+                    }
                     Divider()
                 }
             }
@@ -455,6 +438,34 @@ struct ConsoleView: View {
         previews[source.key]
     }
 
+    /// An agent's own thread is reached through the agent; every other one by its id.
+    private func source(of hit: SearchHit) -> ThreadSource {
+        if hit.participants.count == 1, let only = hit.participants.first {
+            return .agent(only)
+        }
+        return .conversation(hit.conversationId)
+    }
+
+    /// A turn that ended, or a request that arrived, while the owner was not looking at this
+    /// window. Announced once, when the change is first seen.
+    private func announce(_ rows: [Agent], _ pending: [Approval]) {
+        defer {
+            lastStates = Dictionary(uniqueKeysWithValues: rows.map { ($0.name, $0.state) })
+            lastRequestIds = Set(pending.map(\.id))
+        }
+        guard !lastStates.isEmpty else { return }
+        for agent in rows where agent.parentId == nil {
+            guard let before = lastStates[agent.name], before.busy, !agent.state.busy, !awake else { continue }
+            let body = agent.state == .failed
+                ? "The turn failed."
+                : previews[ThreadSource.agent(agent.name).key]?.content.prefix(120).description ?? "Finished."
+            Notifier.post(id: "turn:\(agent.name):\(agent.state.rawValue)", title: agent.title, body: body)
+        }
+        for request in pending where !lastRequestIds.contains(request.id) && !awake {
+            Notifier.post(id: "approval:\(request.id)", title: titles(rows)[request.agent] ?? request.agent, body: "Asks to delete something: \(request.reason)")
+        }
+    }
+
     private func isUnread(_ source: ThreadSource) -> Bool {
         unread.has(source, newest: previews[source.key]?.id)
     }
@@ -471,12 +482,16 @@ struct ConsoleView: View {
     private func refresh() async {
         do {
             let rows = try await session.run { try await $0.agents() }
-            agents = rows
-            requests = (try? await session.run { try await $0.approvals() }) ?? requests
+            if agents != rows { agents = rows }
+            looks.adopt(rows)
+            let pending = (try? await session.run { try await $0.approvals() }) ?? requests
+            if requests != pending { requests = pending }
             trouble = nil
             for agent in rows where agent.parentId == nil {
                 await loadPreview(.agent(agent.name))
             }
+            announce(rows, requests)
+            Notifier.badge(rows.filter { $0.parentId == nil && isUnread(.agent($0.name)) }.count + requests.count)
         } catch {
             if !error.isCancellation { trouble = error.localizedDescription }
         }
@@ -494,9 +509,9 @@ struct ConsoleView: View {
 
     private func loadPreview(_ source: ThreadSource) async {
         guard let last = try? await session.run({
-            try await $0.messages(source, window: MessageWindow(limit: 1))
+            try await $0.messages(source, window: MessageWindow(limit: 1, images: false))
         }).last else { return }
-        previews[source.key] = last
+        if previews[source.key] != last { previews[source.key] = last }
     }
 }
 
@@ -504,20 +519,24 @@ struct ConsoleView: View {
 /// until one of them is pressed, and the agent is told either way.
 struct ApprovalRow: View {
     let request: Approval
+    /// The owner's word for each agent: a request names them by name.
+    let titles: [String: String]
     let onDecide: (Bool) -> Void
 
     @Environment(AgentLooks.self) private var looks
     @State private var deciding = false
+
+    private func title(_ name: String) -> String { titles[name] ?? name }
 
     private var asks: String {
         switch request.kind {
         case .agent:
             return request.target == request.agent
                 ? "wants to delete itself"
-                : "wants to delete \(request.target)"
+                : "wants to delete \(title(request.target))"
         case .conversation:
             // Its own name is not news to the owner; who else is in the thread is.
-            let others = request.participants.filter { $0 != request.agent }
+            let others = request.participants.filter { $0 != request.agent }.map(title)
             guard !others.isEmpty else { return "wants to delete its own thread" }
             return "wants to delete its thread with \(others.formatted(.list(type: .and)))"
         }
@@ -528,7 +547,7 @@ struct ApprovalRow: View {
             BloubView(state: .notify, identity: looks[request.agent], size: 30)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("\(request.agent) \(asks)")
+                Text("\(title(request.agent)) \(asks)")
                     .font(.footnote.weight(.medium))
                     .lineLimit(2)
                 Text(request.reason)
@@ -570,7 +589,7 @@ struct AgentRow: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(agent.name)
+                    Text(agent.title)
                         .font(.body.weight(.medium))
                         .lineLimit(1)
                     StateDot(state: agent.state)
@@ -599,7 +618,7 @@ struct AgentRow: View {
     private var subtitle: String {
         if agent.state.busy || agent.state == .failed { return agent.state.label }
         guard let preview else { return agent.state.label }
-        if !preview.content.isEmpty { return preview.content.replacingOccurrences(of: "\n", with: " ") }
+        if !preview.content.isEmpty { return plainPreview(preview.content) }
         if preview.image != nil { return "screenshot" }
         if let call = preview.toolCalls?.first { return call.name }
         return agent.state.label
@@ -611,6 +630,7 @@ struct AgentRow: View {
 struct GroupRow: View {
     let conversation: Conversation
     let besides: String
+    let titles: [String: String]
     let preview: Message?
     let unread: Bool
 
@@ -629,11 +649,11 @@ struct GroupRow: View {
             }
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("with \(others.formatted(.list(type: .and)))")
+                Text("with \(others.map { titles[$0] ?? $0 }.formatted(.list(type: .and)))")
                     .font(.subheadline)
                     .lineLimit(1)
                 if let preview, !preview.content.isEmpty {
-                    Text(preview.content.replacingOccurrences(of: "\n", with: " "))
+                    Text(plainPreview(preview.content))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -668,6 +688,43 @@ struct WorkersToggle: View {
     }
 }
 
+/// One message a search found, under the thread it is in. Opening it opens that thread at its
+/// newest row; the hit itself is somewhere above.
+struct HitRow: View {
+    let hit: SearchHit
+    let titles: [String: String]
+
+    private var who: String {
+        hit.message.sender.map { titles[$0] ?? $0 } ?? "You"
+    }
+
+    private var thread: String {
+        hit.participants.map { titles[$0] ?? $0 }.formatted(.list(type: .and))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(who)
+                    .font(.caption.weight(.medium))
+                Text("in \(thread)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Text(shortTime(hit.message.createdAt))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .lineLimit(1)
+            Text(hit.message.content.replacingOccurrences(of: "\n", with: " "))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
 struct WorkerRow: View {
     let agent: Agent
 
@@ -676,7 +733,7 @@ struct WorkerRow: View {
     var body: some View {
         HStack(spacing: 10) {
             BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 26)
-            Text(agent.name)
+            Text(agent.title)
                 .font(.subheadline)
                 .lineLimit(1)
             StateDot(state: agent.state)
@@ -689,6 +746,8 @@ struct WorkerRow: View {
 
 struct NewAgentSheet: View {
     let session: Session
+    /// The names already in use, so the slug this sheet derives is one the daemon will accept.
+    let taken: Set<String>
     let onCreated: (Agent) -> Void
 
     @Environment(AgentLooks.self) private var looks
@@ -700,20 +759,24 @@ struct NewAgentSheet: View {
     @State private var chosen: BloubIdentity?
 
     private var identity: BloubIdentity {
-        chosen ?? .standard(for: wanted)
+        chosen ?? .standard(for: slug)
     }
 
     private var wanted: String { name.trimmingCharacters(in: .whitespaces) }
 
-    /// The daemon's own rule, checked here so a typed capital is answered as it is typed rather
-    /// than by a round trip. The daemon checks it again; this is the keyboard's half.
-    private var nameIsFine: Bool { isAgentName(wanted) }
+    /// What the agent runs as, derived from what the owner typed and shown before they commit to
+    /// it: it is the Linux user, the other agents' address for it, and it never changes after.
+    private var slug: String { agentName(for: wanted, taken: taken) }
+
+    /// The daemon's own rule, checked here so an empty or overlong name is answered as it is
+    /// typed rather than by a round trip. The daemon checks it again; this is the keyboard's half.
+    private var nameIsFine: Bool { isAgentLabel(wanted) }
 
     var body: some View {
         VStack(spacing: 18) {
             Text("New agent")
                 .font(.title2.weight(.semibold))
-            Text("Lowercase letters, digits and dashes. Creating one makes a Linux user and starts a desktop, so it is slow on purpose.")
+            Text("Call it whatever you like. Creating one makes a Linux user and starts a desktop, so it is slow on purpose.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -723,9 +786,6 @@ struct NewAgentSheet: View {
             TextField("name", text: $name)
                 .textFieldStyle(.plain)
                 .autocorrectionDisabled()
-                #if os(iOS)
-                .textInputAutocapitalization(.never)
-                #endif
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
                 .glassEffect(.regular, in: .capsule)
@@ -739,10 +799,14 @@ struct NewAgentSheet: View {
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
             } else if !wanted.isEmpty && !nameIsFine {
-                Text("Lowercase letters, digits and dashes, starting with a letter or a digit, up to 31 characters.")
+                Text("One line, up to \(MAX_AGENT_LABEL) characters.")
                     .font(.footnote)
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
+            } else if nameIsFine {
+                Text("Runs as agent-\(slug)")
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.secondary)
             }
 
             HStack {
@@ -769,7 +833,9 @@ struct NewAgentSheet: View {
         trouble = nil
         Task {
             do {
-                let agent = try await session.run { try await $0.createAgent(name: wanted) }
+                let agent = try await session.run {
+                    try await $0.createAgent(name: slug, label: wanted, look: identity.token)
+                }
                 looks[agent.name] = identity
                 onCreated(agent)
                 dismiss()
@@ -779,6 +845,17 @@ struct NewAgentSheet: View {
             working = false
         }
     }
+}
+
+/// One line of a reply for a list row: markdown marks dropped, fences and newlines folded.
+func plainPreview(_ content: String) -> String {
+    content
+        .replacingOccurrences(of: "```[a-z]*", with: "", options: .regularExpression)
+        .replacingOccurrences(of: "^#{1,6}\\s+", with: "", options: .regularExpression)
+        .replacingOccurrences(of: "(?m)^\\s*[-*]\\s+", with: "", options: .regularExpression)
+        .replacingOccurrences(of: "[*_`]", with: "", options: .regularExpression)
+        .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        .trimmingCharacters(in: .whitespaces)
 }
 
 func shortTime(_ millis: Int) -> String {

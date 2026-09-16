@@ -8,7 +8,12 @@ name=${1:?usage: create-agent-user.sh <name>}
 user="agent-$name"
 [ "$(id -u)" -eq 0 ] || { echo "create-agent-user.sh must run as root" >&2; exit 1; }
 
-id -u "$user" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash --groups agents "$user"
+if ! id -u "$user" >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash --groups agents "$user"
+  # A home that outlived its user, on the /home volume under a replaced container, still
+  # carries whatever uid the user had last time.
+  chown -R "$user:$user" "$(getent passwd "$user" | cut -d: -f6)"
+fi
 usermod --append --groups agents "$user"
 
 home=$(getent passwd "$user" | cut -d: -f6)

@@ -22,6 +22,13 @@ import {
 } from './computer.ts';
 import { commandArgv, commandToolDef, parseCommand, runCommand } from './terminal.ts';
 import { HOME_APPEND, parseRemember, remember, rememberToolDef } from './home.ts';
+import {
+  MAX_PROFILE_CHARS,
+  askOwnerToolDef,
+  parseAskOwner,
+  parseProfile,
+  setProfileToolDef,
+} from './interview.ts';
 import { nextRun, parseSchedule, parseScheduleId, scheduleTaskToolDef } from './schedules.ts';
 import { COMPUTER_ACTIONS } from '@schermes/shared';
 import type { Agent } from '@schermes/shared';
@@ -307,7 +314,7 @@ function schema(def: { parameters: Record<string, unknown> }): Record<string, Re
 test('every action the computer tool advertises is an action the parser accepts', () => {
   const props = schema(computerToolDef(SCREEN));
   const sample: Record<string, Record<string, unknown>> = {
-    screenshot: {},
+    screenshot: { show: true },
     move: { x: 1, y: 1 },
     click: { x: 1, y: 1 },
     drag: { x: 1, y: 1, toX: 2, toY: 2 },
@@ -437,6 +444,40 @@ test('a cron expression is resolved against a given moment, never the wall clock
   assert.ok(often > noon && often <= noon + 5_000);
   assert.equal(nextRun('nonsense', noon), undefined);
   assert.equal(nextRun('0 0 30 2 *', noon), undefined);
+});
+
+test('questions for the owner are bounded, and a profile is one non-empty text', () => {
+  const refuse = (args: Record<string, unknown>): string => {
+    const parsed = parseAskOwner(args);
+    assert.ok('error' in parsed, `expected ${JSON.stringify(args)} to be refused`);
+    return parsed.error;
+  };
+  assert.match(refuse({}), /1 to 4 questions/);
+  assert.match(refuse({ questions: [] }), /1 to 4 questions/);
+  assert.match(refuse({ questions: Array(5).fill({ question: 'x' }) }), /1 to 4 questions/);
+  assert.match(refuse({ questions: [{ question: '  ' }] }), /question must be/);
+  assert.match(refuse({ questions: [{ question: 'x', options: 'yes' }] }), /options must be/);
+  assert.match(refuse({ questions: [{ question: 'x', options: [{ description: 'no label' }] }] }), /label/);
+
+  assert.deepEqual(
+    parseAskOwner({
+      questions: [
+        { question: ' What  am I\nfor? ', header: 'Purpose', options: [{ label: 'Email', description: 'triage it' }, { label: 'Sheets' }], multiple: true },
+        { question: 'Anything else?', header: '', multiple: false },
+      ],
+    }),
+    [
+      { question: 'What am I for?', header: 'Purpose', options: [{ label: 'Email', description: 'triage it' }, { label: 'Sheets' }], multiple: true },
+      { question: 'Anything else?' },
+    ],
+  );
+
+  assert.match(String((parseProfile({}) as { error: string }).error), /non-empty/);
+  assert.match(String((parseProfile({ profile: 'x'.repeat(MAX_PROFILE_CHARS + 1) }) as { error: string }).error), /at most/);
+  assert.equal(parseProfile({ profile: '  # Me\nI do things.\n' }), '# Me\nI do things.');
+
+  assert.deepEqual((askOwnerToolDef().parameters as Record<string, unknown>)['required'], ['questions']);
+  assert.deepEqual((setProfileToolDef().parameters as Record<string, unknown>)['required'], ['profile']);
 });
 
 test('a deletion request is checked before it can stand, and names an agent that exists', () => {

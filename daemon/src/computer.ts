@@ -175,6 +175,13 @@ export function computerToolDef(screen: Screen): ToolDef {
           type: 'string',
           description: 'space-separated keystrokes in xdotool form, such as "ctrl+l Return"',
         },
+        show: {
+          type: 'boolean',
+          description:
+            'with screenshot: true to put this screenshot in your reply to the owner. Only when the ' +
+            'image itself is what they need, at most once a turn, just before you reply; never for ' +
+            'a check or to present a file you made',
+        },
       },
       required: ['action'],
       additionalProperties: false,

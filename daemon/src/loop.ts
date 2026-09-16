@@ -15,6 +15,7 @@ import {
   isWorker,
   listAgents,
   nextWorkerName,
+  setAgentCosmetics,
   setAgentState,
 } from './agents.ts';
 import {
@@ -47,6 +48,13 @@ import {
 import { browse, browserToolDef, cdpConnect, parseBrowserAction } from './browser.ts';
 import { computerToolDef, parseComputerAction, performComputerAction } from './computer.ts';
 import { homePrompt, loadHome, parseRemember, remember, rememberToolDef } from './home.ts';
+import {
+  askOwnerToolDef,
+  parseAskOwner,
+  parseProfile,
+  profilePrompt,
+  setProfileToolDef,
+} from './interview.ts';
 import { CONTROL_HELD, CONTROL_REFUSAL } from './control.ts';
 import type { Control } from './control.ts';
 import type { Screen } from './computer.ts';
@@ -231,7 +239,21 @@ async function compact(
     return replay;
   }
 
-  const covered = live.slice(0, cut);
+  return (await writeSummary(deps, agent, conversationId, live.slice(0, cut))) ?? replay;
+}
+
+/**
+ * Writes one summary row standing for `covered`, which must be the rows straight after the newest
+ * summary — that is what lets the previous summary be carried forward as the story so far rather
+ * than re-read. Undefined when the model would not write one.
+ */
+async function writeSummary(
+  deps: Pick<LoopDeps, 'db' | 'provider'>,
+  agent: Agent,
+  conversationId: number,
+  covered: readonly Message[],
+): Promise<Replay | undefined> {
+  const previous = latestSummary(deps.db, conversationId, agent.name);
   const earlier = previous === undefined ? '' : `The story so far:\n${previous.content}\n\n`;
   const body = earlier + keepEnd(flatten(transcript(agent.name, '', covered)), MAX_TRANSCRIPT_CHARS);
   let summary: string;
@@ -247,11 +269,11 @@ async function compact(
     summary = reply.text.trim();
   } catch (error) {
     log.error('summary failed, replaying the thread in full', { agent: agent.name, error });
-    return replay;
+    return undefined;
   }
   if (summary === '') {
     log.error('the model summarised to nothing', { agent: agent.name, conversationId });
-    return replay;
+    return undefined;
   }
 
   // Clipped like any other text the transcript carries: a model that answers with the whole
@@ -272,6 +294,29 @@ async function compact(
     throughId,
   });
   return { text: content, throughId };
+}
+
+/**
+ * The owner's compaction, budget or no budget: everything since the newest summary is folded
+ * into the next one and nothing is kept verbatim, so the agent's next turn opens on the summary
+ * and whatever the owner writes after it. Only between turns — the loop writes every result
+ * before it asks for more, so with no turn running every call this agent made is answered and
+ * the whole stretch is one legal cut. Answers how many rows the new summary stands for.
+ */
+export async function compactNow(
+  deps: Pick<LoopDeps, 'db' | 'provider'>,
+  agent: Agent,
+  conversationId: number,
+): Promise<{ covered: number } | { error: string }> {
+  const previous = latestSummary(deps.db, conversationId, agent.name);
+  const live = listMessages(deps.db, conversationId).filter(
+    (message) => message.id > (previous?.throughMessageId ?? 0),
+  );
+  if (live.length === 0) return { covered: 0 };
+  const replay = await writeSummary(deps, agent, conversationId, live);
+  return replay === undefined
+    ? { error: `the model would not summarise the thread for ${agent.name}` }
+    : { covered: live.length };
 }
 
 /**
@@ -321,6 +366,9 @@ export type Runner = {
   /** Whether a turn is in flight for this agent. A delete asks, because pulling an agent's rows
    * out from under its own loop turns every write it makes next into a foreign-key failure. */
   running(name: string): boolean;
+  /** Ends this agent's running turn at the next step boundary, or now if it is waiting on the
+   * model. False when nothing was running. */
+  stop(name: string): boolean;
 };
 
 export type LoopDeps = {
@@ -338,6 +386,14 @@ export type LoopDeps = {
   runner: Runner;
   control: Control;
   maxWorkers: number;
+  /** Fires when the owner stops the turn. */
+  signal?: AbortSignal;
+  /** Hears what a permanent agent said at the end of a turn, and why one failed: the seam a
+   * messaging channel hangs off. The thread it happened in is passed so the channel can decide
+   * whether it is one the owner reads there. */
+  deliver?:
+    | ((agent: Agent, conversationId: number, text: string, kind: 'reply' | 'failure' | 'approval') => void)
+    | undefined;
 };
 
 /** Writes the transition the moment it happens; the row, not this process, is the truth. */
@@ -370,17 +426,29 @@ function systemPrompt(
     'When something you tried has no effect, such as a parameter a site ignores, stop after',
     'the second variation and find out what works instead: from what the response itself',
     'reports back, the requests the page makes, a web search, or doing it once in the browser.',
-    'Take a screenshot when you need to see what is on screen. Only your last',
+    'Take a screenshot when you need to see what is on screen. The owner sees none of them unless',
+    'you pass show: true, which puts that screenshot inside your reply. Pass it only when the image',
+    'itself is what the owner needs: they asked to see the screen, or the answer is something only a',
+    'picture shows. Never pass it on a check, or to present a file you made: hand over the file.',
+    'At most once a turn, as your last step, and say in your reply what it shows. Only your last',
     `${MAX_FULL_OBSERVATIONS} tool results are shown in full; older ones are shortened.`,
     'The moment you have what was asked for, answer: state the result and stop, rather than',
     'checking it again or polishing. When the data is imperfect, answer with the best result',
     'and say what is uncertain; the owner can ask for more. When you are done, reply in plain',
     'text: a reply with no tool call ends your turn and everyone here can read it.',
+    'The owner cannot reach your machine, so hand them every file you made for them as a card:',
+    'write its path starting with ~/ alone on a line of its own, such as ~/workspace/report.xlsx,',
+    'with no label, sentence or other path on that line, and one line per file. That line shows as',
+    'a card they can open. A path inside a sentence shows only as a link, and a file outside your',
+    'home cannot be opened at all, so save what you hand over in ~/workspace.',
     others.length === 0
       ? 'Nobody but you and the owner is in this conversation.'
-      : `Also here: ${others.join(', ')}. Every message you are shown names who wrote it.`,
+      : `Also here: ${others.join(', ')}. Every message you are shown names who wrote it. ` +
+        'Another agent\'s reply here is addressed to the owner, like yours: read it, but do not ' +
+        'answer, thank or acknowledge it unless it asks you for something. When a message from ' +
+        'another agent needs nothing from you, say so in one line and stop.',
   ].join(' ');
-  return `${intro}\n\n${home}`;
+  return `${intro}\n\n${profilePrompt(agent.profile)}\n\n${home}`;
 }
 
 /**
@@ -450,9 +518,14 @@ export function transcript(
       ? stored
       : stored.filter((message) => message.id > replay.throughId);
   const own = kept.filter((message) => message.sender === name && message.role === 'tool');
+  // Screenshots and pictures the owner sent share one window: both are bytes in the request.
   const visible = new Set(
-    own
-      .filter((message) => message.image !== undefined)
+    kept
+      .filter(
+        (message) =>
+          message.image !== undefined &&
+          (message.role === 'user' || (message.sender === name && message.role === 'tool')),
+      )
       .slice(-MAX_REPLAYED_IMAGES)
       .map((message) => message.id),
   );
@@ -469,11 +542,21 @@ export function transcript(
 
   for (const message of kept) {
     if (message.sender !== name) {
-      if (message.role === 'tool' || message.content === '') continue;
-      pending.push({
-        role: 'user',
-        text: `Message from ${message.sender ?? 'the owner'}:\n${message.content}`,
-      });
+      if (message.role === 'tool' || (message.content === '' && message.image === undefined)) continue;
+      const text =
+        message.role === 'assistant'
+          ? `${message.sender} said here, to the owner:\n${message.content}`
+          : `Message from ${message.sender ?? 'the owner'}:\n${message.content}`;
+      if (message.image === undefined) {
+        pending.push({ role: 'user', text });
+      } else if (visible.has(message.id)) {
+        pending.push({ role: 'user', text: `${text}\n[with a picture]`, image: message.image });
+      } else {
+        pending.push({
+          role: 'user',
+          text: `${text}\n[the picture that came with this is no longer shown: only the last ${MAX_REPLAYED_IMAGES} images are kept in view]`,
+        });
+      }
       continue;
     }
 
@@ -610,7 +693,9 @@ async function dispatch(
       return { text: `error: ${request.error}`, event: { ok: false, error: request.error } };
     }
     const target = await toolTarget(deps, agent);
-    const result = await runCommand(deps.exec, target, request);
+    // The one tool a stop reaches into: a command can run for minutes, and an owner who
+    // pressed stop is not waiting that out.
+    const result = await runCommand(deps.exec, target, request, deps.signal);
     return {
       text: describe(result),
       event: { ok: true, exitCode: result.exitCode, timedOut: result.timedOut },
@@ -779,6 +864,33 @@ async function dispatch(
     };
   }
 
+  // The questions travel in the call's own arguments, which the transcript already stores: the
+  // client reads them from there and answers as an ordinary owner message. Nothing is queued.
+  if (call.name === 'ask_owner' && agent.parentId === undefined) {
+    const questions = parseAskOwner(args);
+    if ('error' in questions) {
+      return { text: `error: ${questions.error}`, event: { ok: false, error: questions.error } };
+    }
+    return {
+      text:
+        `Asked the owner ${questions.length} question${questions.length === 1 ? '' : 's'}. ` +
+        'Your turn ends here; the answers arrive as their next message.',
+      event: { ok: true, questions: questions.length },
+    };
+  }
+
+  if (call.name === 'set_profile' && agent.parentId === undefined) {
+    const profile = parseProfile(args);
+    if (typeof profile !== 'string') {
+      return { text: `error: ${profile.error}`, event: { ok: false, error: profile.error } };
+    }
+    setAgentCosmetics(deps.db, agent.name, { profile });
+    return {
+      text: 'Profile saved. It is in your system prompt from your next turn on.',
+      event: { ok: true, chars: profile.length },
+    };
+  }
+
   // A worker asking to delete something would be asking about a machine it knows nothing
   // about: it has one brief and no view of the agents around it.
   if (call.name === 'request_deletion' && agent.parentId === undefined) {
@@ -799,6 +911,7 @@ async function dispatch(
       kind: asked.kind,
       target: asked.target,
     });
+    deps.deliver?.(agent, conversationId, `Asks to ${describeApproval(asked)}: ${asked.reason}`, 'approval');
     return {
       text:
         `Asked the owner to ${describeApproval(asked)}. Nothing has been deleted. The answer ` +
@@ -920,8 +1033,9 @@ const STATE_FOR_TOOL: Record<string, AgentState> = {
  * for exactly this reply. Without that rule two agents in a group conversation would answer
  * each other forever off one message from the owner.
  */
-const WORKER_FAILED = 'I could not finish the job';
+export const WORKER_FAILED = 'I could not finish the job';
 export const RUN_FAILED = 'I could not finish this turn';
+export const STOPPED = 'I was stopped here by the owner and did not finish.';
 const NOTHING_TO_REPORT = 'I finished, but the model answered with nothing.';
 
 /**
@@ -978,12 +1092,16 @@ export async function runAgent(
           webFetchToolDef(),
           browserToolDef(),
           requestDeletionToolDef(),
+          askOwnerToolDef(),
+          setProfileToolDef(),
         ]
       : [commandToolDef(), webSearchToolDef(), webFetchToolDef()];
+  // The row, not the argument: the profile is written mid-turn by set_profile, and the next
+  // turn's prompt has to carry it.
   const system =
     parent === undefined
       ? systemPrompt(
-          agent,
+          findAgent(db, agent.name) ?? agent,
           deps.screen,
           others.map((other) => other.name),
           await homeTail(deps, agent),
@@ -992,7 +1110,9 @@ export async function runAgent(
   // Anything that lands after this belongs to the next turn. Splicing an arrival into a turn
   // already under way would answer it halfway through someone else's question; the runner
   // starts a fresh turn for it before it lets go of the agent.
-  const since = listMessages(db, conversationId).at(-1)?.id ?? 0;
+  const history = listMessages(db, conversationId);
+  const since = history.at(-1)?.id ?? 0;
+  let seen = since;
   const started = (message: Message) => message.id <= since || message.sender === agent.name;
   // Decided here with the system text rather than between steps, for the same reason: every
   // step of this turn is handed the same request head, and the summariser runs at most once.
@@ -1001,7 +1121,7 @@ export async function runAgent(
     agent,
     conversationId,
     system,
-    listMessages(db, conversationId).filter(started),
+    history,
   );
   // Connected here, with the system text and the replay, for the reason they are: every step of
   // this turn is handed the same tool list, so the request head the prompt cache keys on does
@@ -1012,22 +1132,59 @@ export async function runAgent(
   let wrote = false;
   let spawned = false;
   let refused = false;
+  let asked = false;
+  let steps = 0;
+  const usage = { promptTokens: 0, completionTokens: 0 };
+  let metered = false;
   /** Where a finished turn stands: waiting on whoever it handed work to, else on the owner. */
   const endState = (): AgentState =>
     spawned ? 'waiting_for_task_worker' : wrote ? 'waiting_for_agent' : 'waiting_for_user';
+  /**
+   * The owner pulled the plug. Every call in the last reply already has its result — the check
+   * sits between steps, never between a call and its answer — so the transcript is one the
+   * next turn can be built on. A permanent agent waits for the owner who stopped it; a worker
+   * reports the stop as the failure its parent is waiting on.
+   */
+  const halt = (): void => {
+    appendMessage(db, conversationId, { role: 'assistant', content: STOPPED, sender: agent.name });
+    recordEvent(db, agent.id, 'stop', {});
+    if (parent === undefined) {
+      transition(db, agent, 'waiting_for_user');
+    } else {
+      transition(db, agent, 'failed');
+      report(deps, agent, parent, `${WORKER_FAILED}: stopped by the owner`);
+    }
+  };
 
   try {
     for (let step = 0; step < MAX_STEPS; step += 1) {
       transition(db, agent, 'thinking');
+      if (deps.signal?.aborted) return halt();
+      // Rows are never edited and mid-turn deletes are refused, so reading only new ones is exact.
+      const fresh = listMessages(db, conversationId, seen);
+      seen = fresh.at(-1)?.id ?? seen;
+      history.push(...fresh.filter(started));
       let reply: ChatReply;
       try {
         reply = await deps.provider(
-          transcript(agent.name, system, listMessages(db, conversationId).filter(started), replay),
+          transcript(agent.name, system, history, replay),
           tools,
           (partial) => live.set(agent.name, partial),
+          deps.signal,
         );
+      } catch (error) {
+        // Nothing was stored for this step: the reply never arrived, so there is no call to
+        // answer and the history ends at the last complete exchange.
+        if (deps.signal?.aborted) return halt();
+        throw error;
       } finally {
         live.delete(agent.name);
+      }
+      steps += 1;
+      if (reply.usage !== undefined) {
+        metered = true;
+        usage.promptTokens += reply.usage.promptTokens;
+        usage.completionTokens += reply.usage.completionTokens;
       }
       appendMessage(db, conversationId, {
         role: 'assistant',
@@ -1044,6 +1201,7 @@ export async function runAgent(
         }
         transition(db, agent, endState());
         wake(deps, conversationId, others);
+        deps.deliver?.(agent, conversationId, reply.text, 'reply');
         return;
       }
 
@@ -1056,6 +1214,7 @@ export async function runAgent(
         );
         if (observation.event['ok'] === true && call.name === 'send_message') wrote = true;
         if (observation.event['ok'] === true && call.name === 'spawn_task_worker') spawned = true;
+        if (observation.event['ok'] === true && call.name === 'ask_owner') asked = true;
         if (observation.event['error'] === CONTROL_HELD) refused = true;
         appendMessage(db, conversationId, {
           role: 'tool',
@@ -1074,6 +1233,15 @@ export async function runAgent(
         transition(db, agent, endState());
         return;
       }
+      // A question to the owner is the turn's last word whatever else the reply asked for: the
+      // model cannot go on without the answer, and a model told so in the tool text still
+      // sometimes tries. The owner's reply is the next turn.
+      if (asked && parent === undefined) {
+        transition(db, agent, 'waiting_for_user');
+        deps.deliver?.(agent, conversationId, reply.text.trim() || 'Has questions for you.', 'reply');
+        return;
+      }
+      if (deps.signal?.aborted) return halt();
     }
 
     throw new Error(`gave up after ${MAX_STEPS} steps without answering`);
@@ -1091,8 +1259,12 @@ export async function runAgent(
     // A worker that dies silently leaves its parent waiting for a result nothing will ever
     // send, so the failure travels the same path the result would have.
     if (parent !== undefined) report(deps, agent, parent, `${WORKER_FAILED}: ${message}`);
+    else deps.deliver?.(agent, conversationId, `${RUN_FAILED}: ${message}`, 'failure');
     log.error('agent run failed', { agent: agent.name, error });
   } finally {
+    // What the turn cost, on every way out. The tokens are only what the endpoint reported;
+    // one that reports nothing leaves the count of model calls, which is still a cost.
+    recordEvent(db, agent.id, 'turn', { steps, ...(metered ? usage : {}) });
     // Every way out of the turn, not only the last line of the happy one: a stdio session left
     // open is a child process that outlives the turn that started it.
     await mcp?.close();
@@ -1114,6 +1286,7 @@ export type RunnerDeps = {
   /** How many turns may run at once in this process, and how many workers may be live at all. */
   maxLoops: number;
   maxWorkers: number;
+  deliver?: NonNullable<LoopDeps['deliver']> | undefined;
 };
 
 // One agent piling up messages faster than it answers them still has to let go eventually.
@@ -1127,7 +1300,16 @@ const MAX_ROUNDS = 16;
  */
 export function createRunner(deps: RunnerDeps): Runner {
   const busy = new Set<string>();
-  const runner: Runner = { start, atCapacity, running: (name) => busy.has(name) };
+  /** One per turn in flight, so a stop reaches exactly the turn that is running now. */
+  const stops = new Map<string, AbortController>();
+  const runner: Runner = { start, atCapacity, running: (name) => busy.has(name), stop };
+
+  function stop(name: string): boolean {
+    const controller = stops.get(name);
+    if (controller === undefined) return false;
+    controller.abort(new Error('stopped by the owner'));
+    return true;
+  }
 
   function atCapacity(name?: string): string | undefined {
     if (name !== undefined && busy.has(name)) return undefined;
@@ -1165,10 +1347,18 @@ export function createRunner(deps: RunnerDeps): Runner {
         return;
       }
 
+      const controller = new AbortController();
+      stops.set(agent.name, controller);
       try {
-        await runAgent({ ...deps, provider, runner }, agent, conversationId);
+        await runAgent(
+          { ...deps, provider, runner, signal: controller.signal },
+          agent,
+          conversationId,
+        );
       } catch (error) {
         log.error('agent run threw', { agent: agent.name, error });
+      } finally {
+        stops.delete(agent.name);
       }
 
       // Synchronous from here to the release. An await in between opens a window in which a

@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
+import { posix } from 'node:path';
 import { asAgent } from './agents.ts';
 import type { AgentTarget } from './agents.ts';
 import type { Exec } from './exec.ts';
 import type { ToolDef } from './provider.ts';
+import type { AgentFile, MemoryFiles } from '@schermes/shared';
 
 /**
  * How much of `~/memory/MEMORY.md` reaches the prompt. The head is kept, so the oldest lines
@@ -16,6 +18,21 @@ export const MAX_MEMORY_CHARS = 8_000;
 /** How much of a `SKILL.md` is read to find its frontmatter. The body is never loaded. */
 const MAX_FRONTMATTER_CHARS = 1_000;
 const MAX_REMEMBER_CHARS = 1_000;
+/** How much of a memory file the owner's screen is handed, and may write back. Larger than the
+ * prompt cap on purpose: the file past the cap is exactly what the owner cannot otherwise see. */
+export const MAX_MEMORY_FILE_CHARS = 64_000;
+
+/** The largest file the owner can hand an agent or take out of its home. */
+export const MAX_FILE_BYTES = 25_000_000;
+const MAX_PATH_CHARS = 1_024;
+const NO_SUCH_FILE = 3;
+const TOO_LARGE = 4;
+// The path is `$1`, never a word in the script: it comes from what a model wrote.
+const READ_FILE_SCRIPT = `set -eu
+[ -f "$1" ] || exit ${NO_SUCH_FILE}
+[ "$(stat -c %s -- "$1")" -le "$2" ] || exit ${TOO_LARGE}
+base64 -w0 -- "$1"
+`;
 
 /** Skills every agent on the machine can read, created by `infra/install.sh`. */
 export const SHARED_SKILLS = '/srv/schermes/shared/skills';
@@ -50,8 +67,62 @@ mkdir -p "$1"
 cat >> "$1/$2"
 `;
 
+/** The owner reading the two memory files: `MEMORY.md` and today's note, each up to the cap,
+ * with the marker between them so a note cannot pretend to be the other file. */
+const READ_MEMORY_SCRIPT = `set -u
+mark=$1
+[ -f "$HOME/memory/MEMORY.md" ] && head -c ${MAX_MEMORY_FILE_CHARS} "$HOME/memory/MEMORY.md"
+printf '\n%s\n' "$mark"
+[ -f "$HOME/memory/$2" ] && head -c ${MAX_MEMORY_FILE_CHARS} "$HOME/memory/$2"
+exit 0
+`;
+
+/** The owner rewriting `MEMORY.md`. Whole file, from stdin, like `remember` appends. A file past
+ * the cap was handed to the owner cut short, so writing their copy back would drop the rest. */
+const WRITE_MEMORY_SCRIPT = `set -eu
+mkdir -p "$HOME/memory"
+f="$HOME/memory/MEMORY.md"
+[ ! -f "$f" ] || [ "$(stat -c %s -- "$f")" -le ${MAX_MEMORY_FILE_CHARS} ] || exit ${TOO_LARGE}
+cat > "$f"
+`;
+
+export const HOME_READ_MEMORY = 'schermes-memory-read';
+export const HOME_WRITE_MEMORY = 'schermes-memory-write';
+
 export type Skill = { name: string; description: string; path: string };
 export type Home = { memory: string; skills: Skill[] };
+
+/** Today's note, named the way `remember` names it. */
+export function dailyNote(now = new Date()): string {
+  return `${now.toISOString().slice(0, 10)}.md`;
+}
+
+export async function readMemory(exec: Exec, target: AgentTarget): Promise<MemoryFiles> {
+  const mark = `<<${randomUUID()}>>`;
+  const { code, stdout, stderr } = await exec(
+    'sudo',
+    asAgent(target, ['bash', '-c', READ_MEMORY_SCRIPT, HOME_READ_MEMORY, mark, dailyNote()]),
+    { timeoutMs: 10_000 },
+  );
+  if (code !== 0) throw new Error(`could not read memory: ${stderr.trim() || `exit ${code}`}`);
+  const [lasting = '', today = ''] = stdout.toString().split(`\n${mark}\n`);
+  return { lasting, today: today.replace(/\n$/, '') };
+}
+
+export async function writeMemory(
+  exec: Exec,
+  target: AgentTarget,
+  lasting: string,
+): Promise<{ error: 'too large' } | undefined> {
+  const { code, stderr } = await exec(
+    'sudo',
+    asAgent(target, ['bash', '-c', WRITE_MEMORY_SCRIPT, HOME_WRITE_MEMORY]),
+    { input: lasting, timeoutMs: 10_000 },
+  );
+  if (code === TOO_LARGE) return { error: 'too large' };
+  if (code !== 0) throw new Error(`could not write memory: ${stderr.trim() || `exit ${code}`}`);
+  return undefined;
+}
 
 function frontmatter(head: string, key: string): string | undefined {
   const block = /^---\r?\n([\s\S]*?)\r?\n---/.exec(head)?.[1];
@@ -171,11 +242,42 @@ export async function remember(
 ): Promise<{ path: string } | { error: string }> {
   const dir = `${target.home}/memory`;
   const file =
-    request.scope === 'lasting' ? 'MEMORY.md' : `${new Date().toISOString().slice(0, 10)}.md`;
+    request.scope === 'lasting' ? 'MEMORY.md' : dailyNote();
   // The line goes in on stdin. Nothing the model wrote is ever an argument, let alone a path.
   const argv = asAgent(target, ['bash', '-c', APPEND_SCRIPT, HOME_APPEND, dir, file]);
   const result = await exec('sudo', argv, { input: `- ${request.text}\n` });
   return result.code === 0
     ? { path: `${dir}/${file}` }
     : { error: `could not write ${dir}/${file}: ${result.stderr.trim()}` };
+}
+
+/**
+ * Where a path an agent wrote points, if that is inside its home. `~/` is the home, as the agent
+ * writes it; `..` is resolved before the check, so it cannot climb out.
+ */
+export function homePath(home: string, raw: string): string | undefined {
+  if (raw.length > MAX_PATH_CHARS || raw.includes('\0')) return undefined;
+  const resolved = posix.normalize(raw.startsWith('~/') ? `${home}/${raw.slice(2)}` : raw);
+  return resolved.startsWith(`${home}/`) ? resolved : undefined;
+}
+
+/** A file from the agent's home, read as the agent, so it is exactly what the agent could read. */
+export async function readHomeFile(
+  exec: Exec,
+  target: AgentTarget,
+  path: string,
+): Promise<AgentFile | { error: 'missing' | 'too large' }> {
+  const argv = asAgent(target, ['bash', '-c', READ_FILE_SCRIPT, 'schermes-read-file', path, String(MAX_FILE_BYTES)]);
+  const result = await exec('sudo', argv, {
+    timeoutMs: 60_000,
+    maxBytes: Math.ceil(MAX_FILE_BYTES / 3) * 4,
+  });
+  if (result.code === NO_SUCH_FILE) return { error: 'missing' };
+  if (result.code === TOO_LARGE) return { error: 'too large' };
+  // Cut short, base64 still decodes, into a corrupt file that looks whole.
+  if (result.code !== 0 || result.truncated) {
+    throw new Error(result.stderr.trim() || `exit ${result.code}, truncated ${result.truncated}`);
+  }
+  const base64 = result.stdout.toString().trim();
+  return { name: posix.basename(path), bytes: Buffer.byteLength(base64, 'base64'), base64 };
 }

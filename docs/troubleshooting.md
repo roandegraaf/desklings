@@ -6,8 +6,8 @@ for once already.
 ## The daemon
 
 **`SQLITE_IOERR_SHMSIZE` on boot, or on the first write.** The disk is full. That is what a full
-filesystem looks like from SQLite, and it does not say so. On the Docker harness the culprit is
-usually the VM's own disk rather than the volume: check `docker system df`, and prune this
+filesystem looks like from SQLite, and it does not say so. On Docker Desktop the culprit is
+usually its Linux VM's disk rather than the volume: check `docker system df`, and prune this
 project's dangling images and build cache before blaming the database. Nothing is corrupted.
 
 **`/` answers 404.** That is correct: the daemon serves the API and nothing else. Connect with
@@ -81,10 +81,6 @@ unless told the run is unattended. The script exports `CI=true` for exactly this
 base layer, it is a full apt cycle plus a Node download, and every layer above it is invalidated.
 Budget roughly 2 GB of free space before starting one.
 
-**The Packer build stops immediately saying the ref has no daemon workspace.** `git archive`
-only sees committed files. Commit the work, or pass `-var repo_ref=<a ref that has it>`. The guard
-exists so you find out in seconds rather than fifteen minutes into a QEMU boot.
-
 ## Clients
 
 **The desktop is view-only when it should not be.** View-only is the default and unknown
@@ -100,5 +96,5 @@ the desktop. Take control, and check `GET /api/agents/:name/control`.
 Events are the structured record of what an agent did: `GET /api/agents/:name/events`, or the
 activity list in the agent view. They carry no payloads and no secrets — a screenshot event
 records the byte count, never the pixels — so they tell you what happened and when, not what was
-in it. Daemon logs go to journald on a real host (`journalctl -u schermes -f`) and to
-`docker compose logs -f schermes` in the harness.
+in it. Daemon logs go to `docker compose logs -f schermes` under Docker, and to journald on a
+bare host (`journalctl -u schermes -f`).

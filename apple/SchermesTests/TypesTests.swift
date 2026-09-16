@@ -101,14 +101,15 @@ private func encode(_ value: some Encodable) throws -> String {
 @Test func anMcpSummaryDecodesForBothTransports() throws {
     let servers: [McpServerSummary] = try decode("""
     [
-      {"name":"files","transport":"stdio","command":"npx server","secretKeys":["TOKEN"]},
+      {"name":"files","transport":"stdio","command":"npx","args":["server"],"secretKeys":["TOKEN"]},
       {"name":"remote","transport":"http","url":"https://mcp.example.com","secretKeys":[]}
     ]
     """)
     #expect(servers[0].transport == .stdio)
     #expect(servers[0].url == nil)
+    #expect(servers[0].args == ["server"])
     #expect(servers[1].transport == .http)
-    #expect(servers[1].command == nil)
+    #expect(servers[1].command == nil && servers[1].args == nil)
 
     let result: McpTestResult = try decode(#"{"ok":false,"tools":[],"error":"refused"}"#)
     #expect(!result.ok)
@@ -193,4 +194,6 @@ private func encode(_ value: some Encodable) throws -> String {
             == "http://127.0.0.1:7777/api/conversations/9/messages")
     #expect(try client.messagesURL(.conversation(9), MessageWindow(limit: 1)).absoluteString
             == "http://127.0.0.1:7777/api/conversations/9/messages?limit=1")
+    #expect(try client.messagesURL(.agent("alpha"), MessageWindow(limit: 1, images: false)).absoluteString
+            == "http://127.0.0.1:7777/api/agents/alpha/messages?limit=1&images=0")
 }

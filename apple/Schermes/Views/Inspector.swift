@@ -1,46 +1,51 @@
 import SwiftUI
 
 /// The third column on macOS and regular width: the agent's screen, small and live, above its
-/// routines and activity. The thumbnail opens the full desktop over the same connection.
+/// routines and activity. The thumbnail opens the full desktop over the same connection: in a
+/// window of its own on a Mac, so it can be resized, taken full screen or watched beside the chat.
 struct AgentInspector: View {
     let session: Session
     let agent: Agent
 
-    @State private var link = DesktopLink()
+    @Environment(Desktops.self) private var desktops
+    @Environment(\.scenePhase) private var scenePhase
+    #if os(macOS)
+    @Environment(\.openWindow) private var openWindow
+    #else
     @State private var expanded = false
+    #endif
+
+    private var link: DesktopLink { desktops.link(agent.name) }
 
     var body: some View {
         VStack(spacing: 0) {
             thumbnail
                 .padding(12)
-            AgentPages(session: session, agent: agent.name)
+            AgentPages(session: session, agent: agent)
         }
-        // Retried, unlike a desktop opened by hand: this stays up for as long as the agent is
-        // picked, which is long enough to outlive a daemon restart or a Mac put to sleep.
-        .task {
-            while !Task.isCancelled {
-                await link.run(session: session, agent: agent.name)
-                try? await Task.sleep(for: .seconds(5))
-            }
+        .task(id: scenePhase == .background) {
+            guard scenePhase != .background else { return }
+            await desktops.watch(agent.name, session: session)
         }
         #if os(iOS)
-        .fullScreenCover(isPresented: $expanded) { desktop }
-        #else
-        .sheet(isPresented: $expanded) { desktop }
+        .fullScreenCover(isPresented: $expanded) {
+            NavigationStack {
+                DesktopView(session: session, agent: agent)
+            }
+        }
         #endif
     }
 
-    private var desktop: some View {
-        NavigationStack {
-            DesktopView(session: session, agent: agent, shared: link)
-        }
+    private func expand() {
         #if os(macOS)
-        .frame(minWidth: 720, minHeight: 480)
+        openWindow(id: desktopWindowID, value: agent.name)
+        #else
+        expanded = true
         #endif
     }
 
     private var thumbnail: some View {
-        Button { expanded = true } label: {
+        Button(action: expand) {
             ZStack {
                 Color.black
                 if let screen = link.screen {
@@ -70,7 +75,7 @@ struct AgentInspector: View {
             .environment(\.colorScheme, .dark)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(agent.name)'s screen")
+        .accessibilityLabel("\(agent.title)'s screen")
         .accessibilityHint("Opens the desktop")
     }
 

@@ -145,6 +145,31 @@ export function parseMcpServers(value: unknown): { servers: McpServerSpec[] } | 
 }
 
 /**
+ * The body of a per-server write, with a blank secret filled in from what is already stored —
+ * the provider key's behaviour, because the owner's screen is never shown a stored value and so
+ * cannot send one back. A key the body leaves out is removed with it. Which block is merged
+ * follows the **stored** transport, so renaming a stdio server into an http one inherits nothing.
+ *
+ * Runs before the parse, so a spec that can be stored is still a spec that can run.
+ */
+export function withStoredSecrets(
+  body: Record<string, unknown>,
+  stored: McpServerSpec | undefined,
+): Record<string, unknown> {
+  if (stored === undefined) return body;
+  const field = isHttpServer(stored) ? 'headers' : 'env';
+  const kept: Record<string, string> = isHttpServer(stored) ? stored.headers : stored.env;
+  const sent = body[field];
+  if (sent === null || typeof sent !== 'object' || Array.isArray(sent)) return body;
+  return {
+    ...body,
+    [field]: Object.fromEntries(
+      Object.entries(sent).map(([key, value]) => [key, value === '' ? (kept[key] ?? '') : value]),
+    ),
+  };
+}
+
+/**
  * The argv that starts a stdio server **as the agent's Linux user**. The daemon's own user owns
  * the sudoers rules and the master key, and an MCP server is somebody else's code, so it never
  * runs as `schermes`. The env block rides in as operands to the `env` that `asAgent` already

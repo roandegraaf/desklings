@@ -6,7 +6,7 @@ scope for now, with the trigger that would bring it back).
 
 ## Shape of the system
 
-One Linux machine runs everything: a Node daemon under systemd, one Linux user per permanent
+One Linux machine — a Docker container by default — runs everything: a Node daemon, one Linux user per permanent
 agent, one X display per agent, and a single web port. There is no per-agent container, no VM
 per agent, and no orchestrator.
 
@@ -30,7 +30,7 @@ per agent, and no orchestrator.
   proxies VNC to the browser over its own WebSocket, which is where ownership is enforced.
 - **Requirement** — desktops are spawned detached with `setsid` as the agent user and adopted
   on daemon restart by probing the display with `xdpyinfo`. No per-agent systemd units, so the
-  same code path works in the Docker harness and on a VM.
+  same code path works in Docker and on a bare host.
 
 ### Window manager: Openbox
 
@@ -175,6 +175,15 @@ that belongs to it for as long as the row exists. Creating one through the API d
 - **Requirement** — the name is validated against `^[a-z0-9][a-z0-9-]{0,30}$` in the daemon and
   again in the shell scripts. The daemon's check is what stops an unchecked name reaching a
   shell at all; the scripts' check is what makes them safe to run by hand.
+- **Requirement** — what the owner calls an agent is its `label`, free text and cosmetic. The
+  name stays the identity: the Linux user, the agents' address for each other, the tool schemas
+  and every route are keyed on it, and a label reaches none of them. The app derives a name from
+  the label when it creates one, and shows the derived name before the owner commits to it.
+- **Recommendation** — the avatar the owner picked is a `look` column beside the label, an
+  opaque token the daemon stores under the label's rule and reads none of. It exists so a phone
+  and a Mac draw the same agent: a look kept in one device's defaults was a different agent on
+  the other. The client owns the format (`shape:colour` today) and ignores a token it cannot read
+  rather than overwriting it.
 - **Requirement** — the daemon shells out to `create-agent-user.sh` and `start-desktop.sh`
   rather than reimplementing them. `start-desktop.sh` probes the display with `xdpyinfo` and
   prints `adopted` or `started`; the daemon reads that word and does not run a probe of its own.
@@ -196,7 +205,7 @@ that belongs to it for as long as the row exists. Creating one through the API d
 
 **Restarting in the harness is not restarting on a host.** `docker compose restart` destroys the
 container's pid namespace, so every desktop dies with it and the daemon respawns all of them on
-boot. Only `systemctl restart schermes` on a real host leaves desktops running for the daemon to
+boot. Only `systemctl restart schermes` on a bare host leaves desktops running for the daemon to
 adopt. `infra/smoke.sh` therefore exercises adoption by starting a second daemon against the
 same database while the first one's desktops are up, which is the situation systemd creates.
 
@@ -380,6 +389,15 @@ window on its text alone.
   endpoint's answer to give, and the next turn tries again. The summariser runs on the turn's own
   provider with its own system text and no `onDelta`, so what it writes is never mistaken for the
   agent speaking.
+- **Requirement** — the owner can compact on demand, `POST /api/agents/:name/compact` or
+  `POST /api/conversations/:id/compact`, budget or no budget. It is the same summariser with a
+  different cut: **everything** since the newest summary is folded in and nothing is kept
+  verbatim, so the next turn opens on the summary and what the owner writes after it. One summary
+  per agent in the thread, on that agent's own projection, like the turn's pass. Refused with a
+  409 while any participant is mid-turn, for the reason a rewind is: the loop writes every result
+  before it asks for more, so *between* turns every call is answered and the whole stretch is one
+  legal cut, and inside one it is not. The answer says how many rows each agent's summary now
+  stands for; zero is an agent with nothing new, and costs no model call.
 - **Deferred** — compacting an agent's memory files, and any retention of the summarised rows.
   Nothing is deleted; the summary is a shorter *reading* of rows that all stay.
 
@@ -417,6 +435,39 @@ filesystem, a shell and `ripgrep`, and a row would be a second place to look.
   Summarising the daily notes is no longer deferred *for want of a mechanism*: the cron slice
   decided the daemon seeds no nightly job, and an agent that wants one writes it with
   `schedule_task`. See **Scheduled tasks** below.
+
+### Profile and the interview
+
+**Requirement** — an agent is created as a name and an avatar, and nothing tells it what it is
+for. It finds out by asking: its first turn is an interview of the owner, and what it learns is
+its **profile**, a Markdown text in its system prompt every turn after.
+
+- **Requirement** — the profile is a column on `agents`, not a file in the home. The owner reads
+  and edits it from the app, which means a route, and a task worker has no home to keep one in.
+  `set_profile` replaces it whole; the owner's `PATCH /api/agents/<name>` does the same, and a
+  blank clears it, which puts the agent back to asking.
+- **Requirement** — `ask_owner` takes up to four questions, each with optional choices, and the
+  owner may always type instead of picking. **The questions travel in the call's own arguments**,
+  which the transcript already stores: the client reads them from the newest unanswered call and
+  answers as an ordinary owner message. No table, no route, no queue, and a client that does not
+  know the tool shows the call folded like any other and the owner answers in the composer.
+- **Requirement** — a call to `ask_owner` **ends the turn** in `waiting_for_user`, whatever else
+  the reply asked for. The tool text says so, and a model told so still sometimes goes on; the
+  loop stops it where the approval flow relies on the model stopping itself. Every call in that
+  reply still gets its result first, so the transcript is one a strict endpoint accepts.
+- **Recommendation** — the interview opens with one free-text question, what the owner wants
+  the agent for in their own words, and the focused questions with options follow from that
+  answer. Four generic questions up front asked the owner to fit their idea into the agent's
+  categories; one open question lets the model build the categories from the idea.
+- **Requirement** — the interview starts the way a routine does: `POST /api/agents` appends the
+  kickoff as an owner message into the new agent's thread and starts a turn. With no provider
+  configured nothing can run, so the system prompt of a profile-less agent tells it to ask before
+  any other work, and the owner's first message gets the interview instead. Creating an agent
+  *with* a profile skips it, which is also what the API tests do.
+- **Requirement** — the system text reads the profile from the row at the start of the turn,
+  not from the agent passed in: `set_profile` writes mid-turn, and the next turn has to carry it.
+- **Recommendation** — a task worker gets neither tool. It is one brief, and its parent is who
+  it would be interviewing.
 
 ### Scheduled tasks
 
@@ -556,6 +607,13 @@ SDK is the only reason this is one piece of work rather than three.
   and an http server's headers are where an API key goes, so the row is encrypted as a whole
   rather than field by field. `GET /api/mcp/servers` answers with each server's identity and the
   *names* of the secrets it carries, never their values.
+- **Requirement** — never reading a secret back must not force the owner to retype one.
+  `PUT /api/mcp/servers/<name>` adds or changes **one** server and `DELETE /api/mcp/servers/<name>`
+  removes one; both read the row, edit it by name and write it back through the loader's own parse,
+  which is also what holds an append to the server cap. On the per-server `PUT` a secret sent blank
+  keeps its stored value and a key left out is removed, merged in **before** the parse so a spec
+  that can be stored is still a spec that can run. The replace-all `PUT /api/mcp/servers` stays as
+  the whole-list write.
 - **Requirement** — tools are namespaced **`mcp__<server>__<tool>`**, and a server name may not
   contain an underscore, so the name reads one way however either half is written. Routing is the
   session's own map from the namespaced name, never a split: a lookup cannot be ambiguous, and a
@@ -622,6 +680,10 @@ SDK is the only reason this is one piece of work rather than three.
   `send_message` and the group route land in the same row rather than growing a thread per
   message. A group of exactly two and the direct thread between those two are deliberately the
   same conversation: they are the same set of people.
+- **Requirement** — an owner's message may carry an image, stored on the row like a screenshot
+  observation is. It reaches every agent in the thread as a user message with the picture, and
+  it counts toward `MAX_REPLAYED_IMAGES` with the screenshots: both are bytes in the request,
+  and an old picture is one the model has already looked at.
 - **Requirement** — every message carries the name of the agent that wrote it, and a missing
   sender means the owner. The name is stored rather than an agent id: names are unique and
   immutable, there is no delete endpoint, and the transcript needs the name anyway.
@@ -641,7 +703,9 @@ SDK is the only reason this is one piece of work rather than three.
   rejects.
 - **Requirement** — the transcript is a per-agent projection of the shared conversation. What
   the agent wrote itself is replayed verbatim; everything else becomes a `user` message reading
-  `Message from <who>:`. Another agent's tool traffic is dropped along with the tool calls that
+  `Message from <who>:` when it was written to this agent, or `<who> said here, to the owner:`
+  when it is another agent's own reply in a shared thread, so a reply is not mistaken for a
+  question that needs answering. Another agent's tool traffic is dropped along with the tool calls that
   asked for it, because half of an assistant/tool pair is a transcript a strict endpoint
   rejects.
 - **Requirement** — anything the agent did not write is **buffered until the transcript is
@@ -741,6 +805,104 @@ SDK is the only reason this is one piece of work rather than three.
   that sends pointer and key events while it does not hold control is stopped by its own client
   rather than by the daemon. Enforcing view-only would need to filter RFB message types 4 and 5
   out of a stream that is not message-framed.
+
+### Stopping a turn
+
+- **Requirement** — the owner can end a turn, `POST /api/agents/:name/stop`. Without it an
+  agent that had gone in circles ran until `MAX_STEPS`, two hundred model calls, with nothing
+  the owner could do but watch. The runner holds one `AbortController` per turn in flight; the
+  route aborts it and answers `{stopped}`, false when nothing was running, because the press
+  that lands as a turn ends by itself is not an error.
+- **Requirement** — the stop lands **between steps, never between a call and its answer**. The
+  loop checks the signal before each model call and after the results of a reply have all been
+  written, so the stored transcript is one the next turn can be built on; a call that was
+  waiting on the model is aborted through the provider, and nothing of that step is stored
+  because nothing of it arrived. The turn ends with an assistant row saying it was stopped, a
+  `stop` event, and `waiting_for_user` — the owner who stopped it is who starts it again. A
+  worker reports the stop as the failure its parent is waiting on.
+- **Requirement** — a stop reaches into a running `run_command`. The abort signal travels
+  through `exec` as SIGTERM to `sudo`, which relays it to GNU `timeout`, which signals the whole
+  process group; the command's exit code becomes its tool result and the turn ends after it.
+  The computer tool is bounded at seconds and is not interrupted; an MCP call is not either.
+- **Requirement** — every turn ends with a `turn` event carrying the number of model calls and,
+  when the endpoint reported it, the prompt and completion tokens. The request asks for usage
+  with `stream_options`, and an endpoint that reports none leaves the count of calls, which is
+  still a cost.
+
+### Rewinding a thread
+
+- **Requirement** — the owner can take a thread back to an earlier point,
+  `POST /api/agents/:name/rewind` or `POST /api/conversations/:id/rewind` with `{from, retry}`.
+  Every row from `from` on is deleted; the app restores to one of the owner's messages by cutting
+  at it and putting its text back in the composer. With `retry` the cut lands just after the
+  message a reply answered, and every participant but that message's author answers it again.
+  Refused with a 409 while any participant is mid-turn, because the loop re-reads the thread
+  every step.
+- **Requirement** — a rewind never leaves a call unanswered. An owner message sent to a busy
+  agent can land between a call and its result, so a tool result answering a call from before
+  the cut is kept. Summaries reaching past the cut are deleted, or the next turn would replay
+  rows that no longer exist.
+- Known ceiling: only the thread is rewound. Files, commands, messages to other agents and
+  workers spawned in the deleted stretch stay as they are, and pending approvals asked for there
+  stay in the queue. Another client that has the deleted rows on screen keeps showing them
+  until it reopens the thread.
+
+### Files, memory, search
+
+- **Requirement** — the owner hands an agent a file through `POST /api/agents/:name/uploads`,
+  base64 in JSON like a screenshot, written into `~/uploads` **as the agent** so it owns what it
+  is given. The name is an operand to the script, never a word in it, and matches one plain path
+  segment; the client names the landed path in the message it sends next, and the agent reads
+  it with the tools it has.
+- **Requirement** — the other direction: `GET /api/agents/:name/files?path=` hands the owner a
+  file an agent names in a reply, base64 in JSON the same way. The path is `~/…` or spelled out,
+  resolved before the check so `..` cannot leave the agent's home, and read **as the agent**, so
+  it is nothing the owner could not already reach through the terminal. A truncated read is an
+  error, not a short file. The client finds the paths in the reply's text rather than the agent
+  calling a tool, so replies written before this existed get the same cards.
+- **Requirement** — `GET` and `PUT /api/agents/:name/memory` read and rewrite `MEMORY.md` as the
+  agent, and read today's note. The prompt keeps the head of the file; the owner's screen shows
+  more, because the lines past the cap are exactly what nobody could otherwise see. The daily
+  note is shown and not edited: it is the agent's own log.
+- **Requirement** — `GET /api/search?q=` reads across every thread, `LIKE` over the rows, fifty
+  newest hits cut to a snippet, no image and no tool calls. A personal machine's threads are
+  small enough for a scan, and a search is a person's request rather than a poll.
+- **Requirement** — `GET .../events?limit=` answers the newest that many, oldest first. The log
+  grows for the life of the install and a screen that polls it wants the tail; without a limit
+  the route answers as before.
+- **Recommendation** — `POST /api/settings/test` makes one model call against the stored
+  provider settings with no tools. The first message otherwise found out for the owner a turn
+  later, in an agent's thread, that the base URL had a typo.
+
+### Push notifications
+
+**Requirement** — an agent that finishes at four in the morning reaches the owner's phone. A
+push, straight from the daemon to APNs, with nothing in between: no relay service holding a
+second copy of what an agent said, no bot token, no account with anybody but Apple.
+
+- **Requirement** — the daemon speaks to APNs over `node:http2` itself. APNs speaks nothing but
+  HTTP/2 and undici's `fetch` cannot, so the client is a hundred lines over the standard library
+  rather than a dependency. One session per batch of devices, closed after.
+- **Requirement** — the provider token is an ES256 JWT over the key id and the team id, signed
+  with the `.p8` key the owner pasted into settings, which is AES-GCM encrypted with the master
+  key like the provider key and never returned. The token is cached and re-minted after fifty
+  minutes: APNs refuses one older than an hour and throttles a client that mints one per push.
+- **Requirement** — a device registers its token through `POST /api/devices` on every launch,
+  because Apple may hand it a new one, and a token APNs reports dead — a `410`, or a `400` with
+  `BadDeviceToken` or `Unregistered` — is dropped from the table by the push that learnt it.
+  Every other failure is a log line and not retried: a push is a nudge, and the thread holds the
+  truth.
+- **Requirement** — delivery hangs off the loop's one `deliver` seam: what a permanent agent said
+  at the end of a turn **in its own thread with the owner**, why a turn failed, and a deletion
+  request wherever it was made. A reply in a group is one agent talking to another and a
+  worker's report goes to its parent; neither is pushed. Nothing configured or nobody registered
+  is silence, never an error.
+- **Requirement** — `POST /api/settings/push/test` sends one push to every device, so the owner
+  learns on the settings screen whether the key, the ids and the phone line up.
+- The app needs a real Apple team and the `aps-environment` entitlement on a device build to be
+  handed a token at all. An ad-hoc build and the simulator register nothing, and the daemon then
+  simply has nobody to push to; the sandbox switch is for a development-signed device build.
+- **Deferred** — other channels. The app is the client and the phone is where the owner is.
 
 ### Restart recovery
 
@@ -869,8 +1031,8 @@ What that leaves the product responsible for is the perimeter, and there is exac
 - **Requirement** — third-party code the owner configures runs as the **agent's** Linux user and
   never as `schermes`. See [MCP](#mcp), which also says why that is a separation of duties rather
   than a boundary: the agent users have passwordless sudo already.
-- **Requirement** — the daemon binds `0.0.0.0`. It has to: a VM or a VPS is reached from another
-  machine. The port itself is the perimeter, so put a firewall or an authenticating proxy in
+- **Requirement** — the daemon binds `0.0.0.0`. It has to: the machine is reached over the
+  network from the app. The port itself is the perimeter, so put a firewall or an authenticating proxy in
   front of anything not on a trusted network.
 
 **First boot is claim-once, and that is the whole of the story.** A fresh image ships with no
@@ -910,7 +1072,8 @@ to the same routes. Exactly one port is exposed, and everything on it is `/api`.
   rather than the newest rows above it: a poll that missed a burst longer than its limit has to
   resume where it stopped instead of skipping the middle. An idle poll is an empty array rather
   than a page of base64 screenshots. `before` and `after` are alternatives; asking for both is a
-  400.
+  400. A reader that only shows *that* a row has a screenshot — the sidebar preview, polled for
+  every agent — adds `images=0`, which keeps each image's media type and drops its bytes.
 - **Requirement** — view-only is enforced by the **client**. The VNC proxy is a byte pipe with
   no RFB parser, so a viewer that does not hold control must not send pointer or key events; the
   client suppresses input before the socket is opened and allows it only when the daemon says
@@ -922,10 +1085,13 @@ to the same routes. Exactly one port is exposed, and everything on it is `/api`.
 - A page is a window on the rows, not on the turns, so a **tool row whose assistant message is
   on an earlier page** renders with a note rather than crashing; the other half arrives when the
   reader walks back one more page.
-- The **settings screen is the owner-wide one**: the provider endpoint, key, model and extra
-  request fields, the web search endpoint and key, and the MCP server list with a per-server test.
-  Both key fields are write-only and blank means "keep the stored one", and that rule lives in
-  one place on the client side so it cannot drift between the two keys.
+- The **settings screen is the owner-wide one**, and it is **one entry point with categories**
+  rather than several exits from the sidebar: the model, web search, notifications, plugins, the
+  daemon connection and about. Each category is its own page with its own Save, sending only the
+  fields it owns — `PUT /api/settings` keeps every field a body leaves out — and each follows the
+  platform's own convention for a settings surface rather than a look of its own. Every
+  write-only field takes blank as "keep the stored one", the provider key's rule, and that rule
+  lives in one place on the client side so it cannot drift between them.
 - **Scheduled tasks belong to one agent**, not to the install, so they sit beside that agent's
   chat and desktop. A client lists the rows with their next and last run, pauses and resumes
   them, cancels them and creates one from a cron expression and a prompt. It polls on the same
@@ -933,15 +1099,33 @@ to the same routes. Exactly one port is exposed, and everything on it is `/api`.
   `schedule_task`**, so the list is somebody else's as well as the owner's.
 - Every call goes through one API layer, because it is the one place a 401 is noticed: a screen
   that fetched for itself would leave an expired session on screen until something else asked.
-- Known ceilings: `GET .../events` is not paged and answers with the whole log, which grows for
-  the life of the install — tens of kilobytes today, and a `?limit=` on that route is the
-  upgrade path.
+- A client renders a reply's **Markdown**: fenced code in a box with a copy button, inline marks
+  in the text, headings and list markers folded to bold lines and bullets. The owner's own rows
+  stay plain. What a reply looks like is the client's business; the daemon stores what the
+  model wrote.
+- The composer takes **slash commands**, the way a Telegram bot does: `/` lists them with a line
+  each, letters narrow the list, the arrows and Tab move and complete, Return runs. Every one is
+  something the thread already offers — `/new` (a rewind from the first id), `/compact`, `/stop`,
+  `/retry`, `/undo`, `/remember <note>` (a line appended to `MEMORY.md` through the memory
+  routes), `/interview`, `/screen` and the four pages — so the daemon knows nothing of them; a
+  command never becomes a row. Only a whole name is a command: `/home/agent-x/…` is a path and
+  goes to the agent as written. A shared thread offers only the five that need no single agent.
+- A client shows a **stop** control while the one agent behind a thread is mid-turn, an
+  **attach** control that uploads into the agent's home before the message that names the
+  files, a **memory** page beside routines and activity, and a **search** across every thread
+  next to the agent filter. It asks `GET .../events` for the newest 200 rather than the log.
+- A client that polls while it is not in front **announces** rather than draws: a turn that
+  ended, or a deletion request that arrived, becomes a system notification. On a phone the
+  process is suspended and the push above is the answer; this is the Mac's story.
+- The owner can send a **picture** with a message, or as the whole message: base64 in the body
+  the way a screenshot travels, PNG or JPEG.
 
-## Docker dev harness
+## Docker
 
-**Recommendation** — the harness is a convenience for developing on macOS, not a deployment
-target. It builds `debian:trixie`, runs the real `infra/install.sh`, and is therefore the same
-machine a VM would be.
+**Recommendation** — the Docker image is the deployment and the dev harness, one compose file
+for both. It builds `debian:trixie`, runs the real `infra/install.sh`, and is therefore the same
+machine a bare Debian host would be. Unraid runs Docker natively, which is why the qcow2 image
+build was dropped: it duplicated the provisioning for nothing the container did not already do.
 
 `install.sh` stays the single provisioning path, but the image splits the dependency install
 out of it. `install.sh` runs first and on its own layer, because it is a full apt cycle plus a
@@ -955,16 +1139,25 @@ path does it twice.
 The container command drops to the `schermes` user with `setpriv` rather than `su`. It execs in
 place, so signals from `docker compose stop` reach the daemon instead of a shell.
 
-Three container settings are load-bearing:
+Five container settings are load-bearing:
 
 - `volumes: schermes-data:/var/lib/schermes` — without it every `docker compose up --build`
   silently started on an empty database. It is also what makes the migrations run against a
   populated database for the first time, which is how the table recreate in `0003` was caught.
+- `volumes: schermes-homes:/home` and `schermes-shared:/srv/schermes` — agent workspaces,
+  uploads, Chromium profiles and the shared directory outlive a replaced container. The Linux
+  users do not: `/etc/passwd` is in the image layer, so `create-agent-user.sh` recreates them
+  on boot and chowns a home that already exists, because the uid it is handed is not guaranteed
+  to be the one the files carry.
+- `hostname: schermes` — Chromium's profile lock is a symlink naming `hostname-pid`. Under a
+  different hostname a lock left by the previous container reads as "in use on another
+  computer" and Chromium refuses the profile; under the same one it checks the pid, finds no
+  Chromium there, and takes the lock over.
 - `init: true` — `setsid` reparents detached Xvnc and Chromium processes to PID 1. Without an
   init that reaps them, dead browsers linger as zombies and process checks misfire.
 - `security_opt: seccomp=unconfined` — Chromium's own sandbox needs `unshare(CLONE_NEWNET)`,
   which Docker's default seccomp profile denies. Relaxing the container is the better trade:
-  the alternative is `--no-sandbox`, which would also weaken Chromium on real VM deployments
+  the alternative is `--no-sandbox`, which would also weaken Chromium on bare-host deployments
   where the sandbox works fine.
 
 ## Cookie persistence and Chromium shutdown
@@ -986,9 +1179,7 @@ in about two seconds. Signalling every chromium process at once is what corrupts
 - Trimming the event log and a retention policy for old conversations. Nothing is ever deleted,
   so a long-lived install grows monotonically. Reads are paged and model requests are bounded,
   so this is disk, not correctness.
-- Running the qcow2 image build. The template is in `infra/packer/` and validates; executing it
-  needs a Linux host with QEMU and `/dev/kvm`. See [image build](image-build.md).
 - Chromium CDP automation. The computer-use tools cover the MVP; CDP would be an add-on.
 - tmux-backed persistent terminals. The terminal tool runs one command at a time for now.
 - Desktop idle shutdown. Desktops stay up for the life of the daemon.
-- TLS inside the product. Run Caddy or nginx in front.
+- TLS inside the product. The compose file ships Caddy under the `domain` profile instead.

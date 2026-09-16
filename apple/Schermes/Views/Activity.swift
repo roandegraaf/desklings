@@ -8,11 +8,11 @@ struct ActivityView: View {
 
     @State private var events: [ExecutionEvent]?
 
-    // ponytail: the events route is not paged and answers with the whole log, which grows for the
-    // life of the install; this shows the newest 200. A `?limit=` on the route is the upgrade path
-    // if the poll gets expensive, and it would be a daemon change.
+    /// The daemon answers with the newest this many, oldest first; the list reads newest first.
+    private let tail = 200
+
     private var newest: [ExecutionEvent] {
-        Array((events ?? []).suffix(200).reversed())
+        Array((events ?? []).reversed())
     }
 
     var body: some View {
@@ -41,7 +41,7 @@ struct ActivityView: View {
         }
         .task(id: agent) {
             while !Task.isCancelled {
-                if let rows = try? await session.run({ try await $0.events(agent: agent) }) {
+                if let rows = try? await session.run({ try await $0.events(agent: agent, limit: tail) }) {
                     events = rows
                 }
                 try? await Task.sleep(for: .seconds(4))
@@ -59,29 +59,43 @@ struct ActivityView: View {
         case .control: "hand.raised"
         case .schedule_dropped: "calendar.badge.minus"
         case .approval: "checkmark.seal"
+        case .stop: "stop.circle"
+        case .turn: "flag.checkered"
         }
     }
 }
 
-/// Routines and activity for one agent, one page at a time: in the inspector column on regular
-/// width, and in a sheet from the chat's toolbar on compact.
+/// Profile, routines, activity and memory for one agent, one page at a time: in the inspector
+/// column on regular width, and in a sheet from the chat's toolbar on compact.
 struct AgentPages: View {
     let session: Session
-    let agent: String
+    let agent: Agent
 
-    enum Page: String, CaseIterable {
+    enum Page: String, CaseIterable, Identifiable {
+        case profile = "Profile"
         case routines = "Routines"
         case activity = "Activity"
+        case memory = "Memory"
+
+        var id: String { rawValue }
     }
 
-    @State private var page = Page.routines
+    @State private var page: Page
+
+    init(session: Session, agent: Agent, page: Page = .profile) {
+        self.session = session
+        self.agent = agent
+        _page = State(initialValue: page)
+    }
 
     var body: some View {
         // A switch rather than both kept alive: the list that is not showing must stop polling.
         Group {
             switch page {
+            case .profile: ProfileView(session: session, agent: agent)
             case .routines: RoutinesView(session: session, agent: agent)
-            case .activity: ActivityView(session: session, agent: agent)
+            case .activity: ActivityView(session: session, agent: agent.name)
+            case .memory: MemoryView(session: session, agent: agent)
             }
         }
         // In the content rather than the toolbar: a macOS sheet has no toolbar to put a
@@ -102,13 +116,14 @@ struct AgentPages: View {
 struct RoutinesAndActivity: View {
     let session: Session
     let agent: Agent
+    var page: AgentPages.Page = .profile
 
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
-            AgentPages(session: session, agent: agent.name)
-                .navigationTitle(agent.name)
+            AgentPages(session: session, agent: agent, page: page)
+                .navigationTitle(agent.title)
                 #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
                 #endif

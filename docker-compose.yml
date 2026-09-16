@@ -2,6 +2,10 @@ services:
   schermes:
     build: .
     container_name: schermes
+    # Chromium's profile lock is a symlink naming hostname-pid. A replaced container with a fresh
+    # hostname would leave every persisted profile "in use on another computer".
+    hostname: schermes
+    restart: unless-stopped
     # tini reaps the detached Xvnc/Chromium processes that setsid reparents to PID 1.
     init: true
     shm_size: 1gb
@@ -9,16 +13,41 @@ services:
     # profile denies. Relaxing the container is preferable to running Chromium --no-sandbox.
     security_opt:
       - seccomp=unconfined
-    # The web port is the only thing schermes exposes.
+    # The web port is the only thing schermes exposes. Loopback by default; a server sets
+    # SCHERMES_BIND=0.0.0.0 in .env.
     ports:
-      - "127.0.0.1:${SCHERMES_PORT:-7777}:${SCHERMES_PORT:-7777}"
+      - "${SCHERMES_BIND:-127.0.0.1}:${SCHERMES_PORT:-7777}:${SCHERMES_PORT:-7777}"
     environment:
       SCHERMES_PORT: "${SCHERMES_PORT:-7777}"
-    # The database, the master key and the desktop state directory. Named rather than bound, so
-    # a fresh volume inherits the image's ownership and modes and master.key stays 0600 under
-    # the schermes user. Without it every rebuild silently starts on an empty database.
+    # Named rather than bound, so a fresh volume inherits the image's ownership and modes:
+    # master.key stays 0600 under schermes, /srv/schermes stays setgid agents. Without them a
+    # rebuild silently starts on an empty database with empty agent homes.
     volumes:
       - schermes-data:/var/lib/schermes
+      - schermes-homes:/home
+      - schermes-shared:/srv/schermes
+
+  # TLS for a linked domain. Off unless COMPOSE_PROFILES=domain is in .env, next to
+  # SCHERMES_DOMAIN; Caddy then gets the certificate itself and reaches the daemon over the
+  # compose network, so the daemon's own port can stay on loopback.
+  caddy:
+    image: caddy:2
+    profiles: [domain]
+    container_name: schermes-caddy
+    restart: unless-stopped
+    depends_on: [schermes]
+    ports:
+      - "${SCHERMES_HTTP_PORT:-80}:80"
+      - "${SCHERMES_HTTPS_PORT:-443}:443"
+    environment:
+      SCHERMES_DOMAIN: "${SCHERMES_DOMAIN:-}"
+      SCHERMES_PORT: "${SCHERMES_PORT:-7777}"
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
 
 volumes:
   schermes-data:
+  schermes-homes:
+  schermes-shared:
+  caddy-data:

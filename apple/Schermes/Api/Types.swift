@@ -34,11 +34,45 @@ struct WebSettingsUpdate: Codable, Sendable {
     var searchKey: String? = nil
 }
 
+/// The APNs half of the settings. The `.p8` key is reported as present or absent like the other
+/// keys; `sandbox` picks Apple's development gateway, which is where a development build lands.
+struct PushSettings: Codable, Sendable {
+    var keyId: String
+    var teamId: String
+    var bundleId: String
+    var keySet: Bool
+    var sandbox: Bool
+}
+
+struct PushSettingsUpdate: Codable, Sendable {
+    var pushKeyId: String? = nil
+    var pushTeamId: String? = nil
+    var pushBundleId: String? = nil
+    var pushKey: String? = nil
+    var pushSandbox: Bool? = nil
+}
+
+/// A device the daemon can push to. The token is APNs' hex, one row per device.
+struct Device: Codable, Sendable, Identifiable, Hashable {
+    var token: String
+    var platform: String
+    var createdAt: Int
+
+    var id: String { token }
+}
+
+struct PushTestResult: Codable, Sendable {
+    var ok: Bool
+    var sent: Int
+    var error: String?
+}
+
 struct McpServerSummary: Codable, Sendable {
     enum Transport: String, Codable, Sendable { case stdio, http }
     var name: String
     var transport: Transport
     var command: String?
+    var args: [String]?
     var url: String?
     var secretKeys: [String]
 }
@@ -67,7 +101,7 @@ enum AgentState: String, Codable, CaseIterable, Sendable {
     case completed
 }
 
-struct LiveReply: Codable, Sendable {
+struct LiveReply: Codable, Sendable, Equatable {
     var text: String
     var reasoning: String
 
@@ -77,11 +111,23 @@ struct LiveReply: Codable, Sendable {
 struct Agent: Codable, Sendable, Identifiable, Hashable {
     var id: Int
     var name: String
+    /// What the owner calls it, free text and cosmetic. `name` is still what runs as a Linux
+    /// user, what the agents address each other by and what every route is keyed on.
+    var label: String?
+    /// How a client draws it, an opaque token the daemon stores and every device reads, so the
+    /// avatar picked on one is the avatar on all of them. `BloubIdentity` owns the format.
+    var look: String?
+    /// Who it is, in Markdown, written by the agent after interviewing the owner or by the owner
+    /// on the Profile page. Absent until then, and on a task worker.
+    var profile: String?
     var display: Int
     var state: AgentState
     var parentId: Int?
     var parentConversationId: Int?
     var createdAt: Int
+
+    /// What to show a reader. Never what to send: a route, a look and a thread key take `name`.
+    var title: String { label ?? name }
 }
 
 enum ComputerActionName: String, Codable, CaseIterable, Sendable {
@@ -118,6 +164,18 @@ struct ComputerAction: Codable, Sendable {
 /// A screenshot travels as base64 in JSON; see docs/architecture.md for why.
 struct Base64Image: Codable, Sendable, Hashable {
     var mediaType: String
+    var base64: String
+}
+
+/// What `POST .../compact` did: how many rows each agent's new summary stands for. Zero is an
+/// agent with nothing since its last summary.
+struct CompactResult: Codable, Sendable {
+    var compacted: [String: Int]
+}
+
+struct AgentFile: Codable, Sendable {
+    var name: String
+    var bytes: Int
     var base64: String
 }
 
@@ -188,6 +246,42 @@ enum EventType: String, Codable, Sendable {
     case control
     case schedule_dropped
     case approval
+    case stop
+    case turn
+}
+
+struct ProviderTestResult: Codable, Sendable {
+    var ok: Bool
+    var reply: String?
+    var error: String?
+}
+
+/// `MEMORY.md` and today's note. The first is the owner's to rewrite, the second the agent's own.
+struct MemoryFiles: Codable, Sendable, Equatable {
+    var lasting: String
+    var today: String
+}
+
+struct UploadResult: Codable, Sendable {
+    var path: String
+    var bytes: Int
+}
+
+/// One row a search across every thread found, clipped to a snippet around the match.
+struct SearchHit: Codable, Sendable, Identifiable, Hashable {
+    struct Row: Codable, Sendable, Hashable {
+        var id: Int
+        var role: MessageRole
+        var content: String
+        var sender: String?
+        var createdAt: Int
+    }
+
+    var conversationId: Int
+    var participants: [String]
+    var message: Row
+
+    var id: Int { message.id }
 }
 
 enum ApprovalKind: String, Codable, Sendable {

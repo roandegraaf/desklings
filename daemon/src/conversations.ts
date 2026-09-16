@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, lt, max, ne, or } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, max, ne, or, sql } from 'drizzle-orm';
 import type {
   Agent,
   Conversation,
@@ -6,6 +6,7 @@ import type {
   ExecutionEvent,
   Message,
   MessageRole,
+  SearchHit,
   ToolCall,
 } from '@schermes/shared';
 import { AGENT_NAME, findAgent, listAgents } from './agents.ts';
@@ -92,6 +93,26 @@ export function deleteConversation(db: Db, conversationId: number): void {
   db.delete(conversations).where(eq(conversations.id, conversationId)).run();
 }
 
+/**
+ * Takes a thread back to just before `fromId`. A tool result answering a call from before the cut
+ * stays: a message to a busy agent can land between a call and its answer, and a strict endpoint
+ * rejects a call left unanswered. Summaries reaching past the cut would replay rows that are gone.
+ */
+export function rewindConversation(db: Db, conversationId: number, fromId: number): void {
+  const stored = listMessages(db, conversationId);
+  const asked = new Set(
+    stored.filter((m) => m.id < fromId).flatMap((m) => (m.toolCalls ?? []).map((call) => call.id)),
+  );
+  const gone = stored.filter(
+    (m) => m.id >= fromId && !(m.role === 'tool' && asked.has(m.toolCallId ?? '')),
+  );
+  if (gone.length === 0) return;
+  db.delete(messages).where(inArray(messages.id, gone.map((m) => m.id))).run();
+  db.delete(summaries)
+    .where(and(eq(summaries.conversationId, conversationId), gte(summaries.throughMessageId, fromId)))
+    .run();
+}
+
 export function participantAgents(db: Db, conversationId: number): Agent[] {
   const members = new Set(
     participantRows(db)
@@ -159,11 +180,11 @@ export function appendMessage(db: Db, conversationId: number, message: NewMessag
   return toMessage(row);
 }
 
-export function listMessages(db: Db, conversationId: number): Message[] {
+export function listMessages(db: Db, conversationId: number, after = 0): Message[] {
   return db
     .select()
     .from(messages)
-    .where(eq(messages.conversationId, conversationId))
+    .where(and(eq(messages.conversationId, conversationId), gt(messages.id, after)))
     .orderBy(asc(messages.id))
     .all()
     .map(toMessage);
@@ -307,15 +328,30 @@ export function pendingConversation(
     .find((row) => row.id > coveredUpTo(row.conversationId))?.conversationId;
 }
 
-/** How many messages agents have passed between themselves since the owner last spoke here. */
+/**
+ * How many messages agents have passed between themselves since the owner last spoke here. In a
+ * shared thread an agent's reply is one of them: every other agent is shown it as a message and
+ * answers it, which is how two agents kept reacting to each other under a cap that counted only
+ * `send_message`.
+ */
 export function agentChain(db: Db, conversationId: number): number {
-  const stored = listMessages(db, conversationId);
-  const spoke = stored.findLastIndex(
-    (message) => message.role === 'user' && message.sender === undefined,
-  );
+  // Not listMessages: this runs per send_message, and parsing every stored screenshot blocks the loop.
+  const stored = db
+    .select({ role: messages.role, sender: messages.sender, toolCalls: messages.toolCalls })
+    .from(messages)
+    .where(eq(messages.conversationId, conversationId))
+    .orderBy(asc(messages.id))
+    .all();
+  const spoke = stored.findLastIndex((message) => message.role === 'user' && message.sender === null);
+  const shared = participantAgents(db, conversationId).length > 1;
   return stored
     .slice(spoke + 1)
-    .filter((message) => message.role === 'user' && message.sender !== undefined).length;
+    .filter(
+      (message) =>
+        message.sender !== null &&
+        (message.role === 'user' ||
+          (shared && message.role === 'assistant' && message.toolCalls === null)),
+    ).length;
 }
 
 export function parseSendMessage(
@@ -342,7 +378,9 @@ export function sendMessageToolDef(): ToolDef {
     description:
       'Write to another agent on this machine. The message arrives in the thread you two ' +
       'share and starts that agent working, even if it is already busy. Your turn keeps going ' +
-      'after this; the reply arrives later and wakes you.',
+      'after this; the reply arrives later and wakes you. Only for asking another agent to do ' +
+      'or tell you something. Never to thank, confirm, acknowledge or report back: the owner ' +
+      'and everyone in the thread already read your reply.',
     parameters: {
       type: 'object',
       properties: {
@@ -401,14 +439,65 @@ export function recordEvent(
     .run();
 }
 
-export function listEvents(db: Db, agentId: number): ExecutionEvent[] {
-  return db
-    .select()
-    .from(events)
-    .where(eq(events.agentId, agentId))
-    .orderBy(asc(events.id))
-    .all()
-    .map((row) => ({
+export const MAX_SEARCH_HITS = 50;
+const SNIPPET_CHARS = 240;
+
+/** A case-insensitive substring search over every thread, newest hits first. `LIKE` rather than
+ * an index: a personal machine's threads are small enough, and a search is a human's request. */
+export function searchMessages(db: Db, needle: string): SearchHit[] {
+  const pattern = `%${needle.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+  const rows = db
+    .select({
+      id: messages.id,
+      conversationId: messages.conversationId,
+      role: messages.role,
+      content: messages.content,
+      sender: messages.sender,
+      createdAt: messages.createdAt,
+    })
+    .from(messages)
+    .where(sql`${messages.content} LIKE ${pattern} ESCAPE '\\'`)
+    .orderBy(desc(messages.id))
+    .limit(MAX_SEARCH_HITS)
+    .all();
+  const participants = new Map<number, string[]>();
+  return rows.map((row) => {
+    let names = participants.get(row.conversationId);
+    if (names === undefined) {
+      names = participantAgents(db, row.conversationId).map((agent) => agent.name);
+      participants.set(row.conversationId, names);
+    }
+    return {
+      conversationId: row.conversationId,
+      participants: names,
+      message: {
+        id: row.id,
+        role: row.role as MessageRole,
+        content: snippet(row.content, needle),
+        ...(row.sender === null ? {} : { sender: row.sender }),
+        createdAt: row.createdAt,
+      },
+    };
+  });
+}
+
+function snippet(content: string, needle: string): string {
+  if (content.length <= SNIPPET_CHARS) return content;
+  const at = Math.max(0, content.toLowerCase().indexOf(needle.toLowerCase()));
+  const start = Math.max(0, at - SNIPPET_CHARS / 4);
+  const piece = content.slice(start, start + SNIPPET_CHARS);
+  return `${start > 0 ? '…' : ''}${piece}${start + SNIPPET_CHARS < content.length ? '…' : ''}`;
+}
+
+/** Oldest first. With a limit, the newest that many, still oldest first: a reader that shows
+ * the tail of a log that grows for the life of the install asks for the tail, not the log. */
+export function listEvents(db: Db, agentId: number, limit?: number): ExecutionEvent[] {
+  const query = db.select().from(events).where(eq(events.agentId, agentId));
+  const rows =
+    limit === undefined
+      ? query.orderBy(asc(events.id)).all()
+      : query.orderBy(desc(events.id)).limit(limit).all().reverse();
+  return rows.map((row) => ({
       id: row.id,
       type: row.type as EventType,
       data: JSON.parse(row.data) as Record<string, unknown>,

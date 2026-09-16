@@ -16,6 +16,65 @@ private func message(_ id: Int, role: MessageRole = .user, content: String? = ni
     )
 }
 
+private let askCall = ToolCall(
+    id: "q1",
+    name: "ask_owner",
+    arguments: #"{"questions":[{"question":"What am I for?","header":"Purpose","options":[{"label":"Sheets"},{"label":"Email","description":"triage it"}],"multiple":true},{"question":"Anything else?"}]}"#
+)
+
+@Test func theNewestUnansweredQuestionIsPendingUntilTheOwnerWrites() {
+    let asked = [
+        message(1),
+        message(2, role: .assistant, content: "Hi, I am Excel. \n", toolCalls: [askCall]),
+        message(3, role: .tool, content: "Asked the owner 2 questions.", toolCallId: "q1"),
+    ]
+    let pending = pendingInterview(in: asked)
+    #expect(pending?.callId == "q1")
+    #expect(pending?.intro == "Hi, I am Excel.")
+    #expect(pending?.questions.map(\.question) == ["What am I for?", "Anything else?"])
+    #expect(pending?.questions[0].options?.map(\.label) == ["Sheets", "Email"])
+    #expect(pending?.questions[0].multiple == true)
+    #expect(pending?.questions[1].options == nil)
+
+    // Answered: nothing to show. A later question of the agent's is pending again.
+    #expect(pendingInterview(in: asked + [message(4)]) == nil)
+    let again = asked + [message(4), message(5, role: .assistant, content: "", toolCalls: [ToolCall(id: "q2", name: "ask_owner", arguments: askCall.arguments)])]
+    #expect(pendingInterview(in: again)?.callId == "q2")
+
+    // A call the daemon refused was never asked, and a call nothing asked is not one either.
+    let refused = [
+        message(1),
+        message(2, role: .assistant, content: "", toolCalls: [askCall]),
+        message(3, role: .tool, content: "error: questions must be a list", toolCallId: "q1"),
+    ]
+    #expect(pendingInterview(in: refused) == nil)
+    #expect(pendingInterview(in: [message(1), message(2, role: .assistant, toolCalls: [ToolCall(id: "c", name: "run_command", arguments: "{}")])]) == nil)
+}
+
+@Test func answersReadBackQuestionByQuestion() {
+    let questions = pendingInterview(in: [message(2, role: .assistant, content: "", toolCalls: [askCall])])!.questions
+    let reply = interviewReply(questions, answers: ["Sheets; Email", ""])
+    #expect(reply == """
+    Purpose
+    What am I for?
+    — Sheets; Email
+
+    Anything else?
+    — (skipped)
+    """)
+    // And parses back into what the card is drawn from, header and skip included.
+    #expect(interviewAnswers(reply) == [
+        InterviewAnswer(header: "Purpose", question: "What am I for?", answer: "Sheets; Email"),
+        InterviewAnswer(header: nil, question: "Anything else?", answer: nil),
+    ])
+    // A typed answer keeps its own line breaks.
+    #expect(interviewAnswers("Anything else?\n— Two things.\nNo, three.")?.first?.answer == "Two things.\nNo, three.")
+    // Anything that is not the reply shape is plain text.
+    #expect(interviewAnswers("You will be the CEO of my company") == nil)
+    #expect(interviewAnswers("Purpose\nwhat?\n— yes\n\nloose text") == nil)
+    #expect(interviewAnswers("a\nb\nc\n— too many head lines") == nil)
+}
+
 @Test func mergeKeepsOneRowPerIdAndOrdersOldestFirst() {
     let merged = merge([message(3), message(4)], [message(1), message(2)])
     #expect(merged.map(\.id) == [1, 2, 3, 4])
@@ -74,10 +133,11 @@ private func message(_ id: Int, role: MessageRole = .user, content: String? = ni
     #expect(AgentState.waiting_for_task_worker.label == "waiting for a task worker")
 }
 
-private func agent(_ id: Int, _ name: String, parentId: Int? = nil) -> Agent {
+private func agent(_ id: Int, _ name: String, label: String? = nil, parentId: Int? = nil) -> Agent {
     Agent(
         id: id,
         name: name,
+        label: label,
         display: parentId == nil ? id : 1000 + id,
         state: .idle,
         parentId: parentId,
@@ -139,6 +199,11 @@ private func agent(_ id: Int, _ name: String, parentId: Int? = nil) -> Agent {
 @Test func aBareHostIsGivenAScheme() {
     #expect(Session.parse("127.0.0.1:7777")?.absoluteString == "http://127.0.0.1:7777")
     #expect(Session.parse(" https://box.local ")?.absoluteString == "https://box.local")
+    #expect(Session.parse("schermes.example.com")?.absoluteString == "https://schermes.example.com")
+    #expect(Session.parse("schermes.example.com/")?.absoluteString == "https://schermes.example.com/")
+    #expect(Session.parse("nas.local:7777")?.absoluteString == "http://nas.local:7777")
+    #expect(Session.parse("nas:7777")?.absoluteString == "http://nas:7777")
+    #expect(Session.parse("192.168.1.20:7777")?.absoluteString == "http://192.168.1.20:7777")
     #expect(Session.parse("") == nil)
     #expect(Session.parse("   ") == nil)
 }
@@ -182,13 +247,13 @@ private func agent(_ id: Int, _ name: String, parentId: Int? = nil) -> Agent {
     #expect(firstUnread(in: [agentSays(1), ownerSends(2), routineFires(3), agentSays(4)], after: 2) == 3)
 }
 
-@Test func aReplyThatSaysSomethingAndCallsAToolShowsBoth() {
+@Test func wordsSaidAlongsideCallsFoldInWithThem() {
     let reply = message(1, role: .assistant, content: "Let me look.", toolCalls: [
         ToolCall(id: "shot-1", name: "computer", arguments: #"{"action":"screenshot"}"#)
     ])
     let result = message(2, role: .tool, content: "taken", toolCallId: "shot-1")
-    #expect(reply.hasBubble && reply.hasToolLine)
-    // Its tool line carries the call, not the words the bubble already shows.
+    #expect(!reply.hasBubble)
+    // Its tool line carries the call; the run draws the words above it.
     let line = ToolRow(message: reply, name: nil, orphaned: false)
     #expect(line.detail.contains("computer"))
     #expect(!line.detail.contains("Let me look."))
@@ -199,10 +264,11 @@ private func agent(_ id: Int, _ name: String, parentId: Int? = nil) -> Agent {
     let callOnly = message(3, role: .assistant, content: "", toolCalls: [
         ToolCall(id: "cmd-1", name: "run_command", arguments: "{}")
     ])
-    #expect(!callOnly.hasBubble && callOnly.hasToolLine)
-    #expect(!result.hasBubble && result.hasToolLine)
+    #expect(!callOnly.hasBubble)
+    #expect(!result.hasBubble)
     #expect(ToolRow(message: result, name: "computer", orphaned: false).detail.contains("taken"))
-    #expect(message(4).hasBubble && !message(4).hasToolLine)
+    #expect(message(4).hasBubble)
+    #expect(message(5, role: .assistant, content: "Done.").hasBubble)
 }
 
 @Test func aSendCatchesUpFromTheCursorItHeldBeforeIt() {
@@ -240,4 +306,92 @@ private func agent(_ id: Int, _ name: String, parentId: Int? = nil) -> Agent {
                  String(repeating: "a", count: 32)] {
         #expect(!isAgentName(name), "\(name) should be refused")
     }
+}
+
+@Test func aReaderIsShownTheOwnersNameAndAWorkerFallsBackToItsOwn() {
+    #expect(agent(1, "bob-the-builder", label: "Bob the Builder").title == "Bob the Builder")
+    #expect(agent(2, "alpha").title == "alpha")
+    #expect(titles([agent(1, "alpha", label: "Bob"), agent(2, "beta")]) == ["alpha": "Bob", "beta": "beta"])
+}
+
+@Test func aFreeTextNameIsSluggedIntoSomethingALinuxUserCanBe() {
+    #expect(slugged("Bob the Builder") == "bob-the-builder")
+    #expect(slugged("  Ünïcôdé  Ågent!! ") == "unicode-agent")
+    #expect(slugged("--Bob--") == "bob")
+    #expect(slugged("🎉🎉") == "agent", "nothing usable in it still yields a name")
+    let long = slugged(String(repeating: "ab ", count: 20))
+    #expect(long.count <= MAX_DERIVED_NAME, "room is left for a -w<n> worker name")
+    #expect(isAgentName("\(long)-w99"), "a worker of it still fits the daemon's rule")
+    #expect(!long.hasSuffix("-"), "no trailing dash after the cut")
+    for label in ["Bob the Builder", "🎉🎉", "Ünïcôdé", String(repeating: "ab ", count: 20), "北京"] {
+        #expect(isAgentName(slugged(label)), "\(label) slugged to \(slugged(label))")
+    }
+}
+
+@Test func aSlugSomethingElseAlreadyHoldsTakesTheNextNumber() {
+    #expect(agentName(for: "Bob", taken: []) == "bob")
+    #expect(agentName(for: "Bob", taken: ["bob"]) == "bob-2")
+    #expect(agentName(for: "Bob", taken: ["bob", "bob-2"]) == "bob-3")
+    let wordy = String(repeating: "a", count: 40)
+    let numbered = agentName(for: wordy, taken: [String(repeating: "a", count: MAX_DERIVED_NAME)])
+    #expect(isAgentName(numbered))
+    #expect(isAgentName("\(numbered)-w9"))
+}
+
+@Test func aLabelIsOneLineOfAReadableLength() {
+    #expect(isAgentLabel("Bob"))
+    #expect(isAgentLabel(String(repeating: "a", count: 64)))
+    #expect(!isAgentLabel(""))
+    #expect(!isAgentLabel(String(repeating: "a", count: 65)))
+    #expect(!isAgentLabel("two\nlines"))
+}
+
+@Test func toolTrafficFoldsIntoOneLinePerStretch() {
+    let say = message(1, role: .assistant, content: "Looking.", toolCalls: [
+        ToolCall(id: "a", name: "run_command", arguments: "{}")
+    ])
+    let result = message(2, role: .tool, content: "ok", toolCallId: "a")
+    let calls = message(3, role: .assistant, content: "", toolCalls: [
+        ToolCall(id: "b", name: "mcp__chrome-devtools__click", arguments: "{}"),
+        ToolCall(id: "c", name: "mcp__chrome-devtools__navigate_page", arguments: "{}"),
+    ])
+    let results = [message(4, role: .tool, toolCallId: "b"), message(5, role: .tool, toolCallId: "c")]
+    let rows = [say, result, calls] + results + [message(6, role: .assistant, content: "Done.")]
+
+    let items = chatItems(rows)
+    #expect(items.map(\.id) == ["t1", "m6"])
+    guard case .tools(let run) = items[0] else { Issue.record("no run"); return }
+    #expect(run.map(\.id) == [1, 2, 3, 4, 5])
+    #expect(toolSummary(run) == "Ran 1 shell command, called chrome-devtools 2 times")
+
+    #expect(chatItems(rows, breaks: { $0.id == 4 }).map(\.id) == ["t1", "t4", "m6"])
+    #expect(toolSummary([message(9, role: .tool, toolCallId: "gone")]) == "1 tool result")
+}
+
+@Test func onlyAScreenshotTheAgentChoseToShowLandsInItsReply() {
+    let shot = Base64Image(mediaType: "image/png", base64: "")
+    let calls = message(1, role: .assistant, content: "", toolCalls: [
+        ToolCall(id: "look", name: "computer", arguments: #"{"action":"screenshot"}"#),
+        ToolCall(id: "show", name: "computer", arguments: #"{"action":"screenshot","show":true}"#),
+    ])
+    var looked = message(2, role: .tool, toolCallId: "look")
+    looked.image = shot
+    var shown = message(3, role: .tool, toolCallId: "show")
+    shown.image = shot
+    let rows = [calls, looked, shown]
+    #expect(!isShown(looked, in: rows))
+    #expect(isShown(shown, in: rows))
+    #expect(!isShown(shown, in: [shown]), "an orphan's call is not on the page to say so")
+
+    var reply = message(4, role: .assistant, content: "Here is the screen.")
+    reply.sender = "alpha"
+    var ownRows = rows.map { row -> Message in var row = row; row.sender = "alpha"; return row }
+    ownRows.append(reply)
+    let items = chatItems(ownRows + [message(5)])
+    #expect(items.map(\.id) == ["t1", "m4", "m5"])
+    guard case .message(_, let attached) = items[1], case .message(_, let none) = items[2] else {
+        Issue.record("no replies"); return
+    }
+    #expect(attached == [shot], "only the shown one, once")
+    #expect(none.isEmpty, "the owner's next message carries nothing")
 }

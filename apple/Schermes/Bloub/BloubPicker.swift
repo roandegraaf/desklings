@@ -69,34 +69,50 @@ struct BloubPicker: View {
     }
 }
 
-/// Changing an agent's look after it exists. The same picker as the create sheet, over a big live
-/// avatar so the choice is made against the thing itself rather than a swatch.
+/// Changing an agent's name and look after it exists. The same picker as the create sheet, over a
+/// big live avatar so the choice is made against the thing itself rather than a swatch.
 struct AgentLookSheet: View {
-    let name: String
-    let state: AgentState
+    let session: Session
+    let agent: Agent
 
     @Environment(AgentLooks.self) private var looks
     @Environment(\.dismiss) private var dismiss
     @State private var identity: BloubIdentity
+    @State private var label: String
+    @State private var trouble: String?
+    /// What the daemon held when the sheet opened, so Done sends only what moved.
+    private let opened: BloubIdentity
 
-    init(name: String, state: AgentState, identity: BloubIdentity) {
-        self.name = name
-        self.state = state
+    init(session: Session, agent: Agent, identity: BloubIdentity) {
+        self.session = session
+        self.agent = agent
+        opened = identity
         _identity = State(initialValue: identity)
+        _label = State(initialValue: agent.title)
     }
+
+    private var wanted: String { label.trimmingCharacters(in: .whitespaces) }
 
     var body: some View {
         VStack(spacing: 18) {
-            BloubView(state: state.bloub, identity: identity, size: 140)
-            Text(name)
+            BloubView(state: agent.state.bloub, identity: identity, size: 140)
+
+            TextField("name", text: $label)
+                .textFieldStyle(.plain)
+                .autocorrectionDisabled()
+                .multilineTextAlignment(.center)
                 .font(.title3.weight(.semibold))
+                .onSubmit(finish)
+            Text(trouble ?? "Runs as agent-\(agent.name)")
+                .font(.footnote.monospaced())
+                .foregroundStyle(trouble == nil ? Color.secondary : Color.red)
 
             BloubPicker(identity: $identity)
 
             HStack {
-                Button("Reset") { identity = .standard(for: name) }
+                Button("Reset") { identity = .standard(for: agent.name) }
                 Spacer()
-                Button("Done") { dismiss() }
+                Button("Done", action: finish)
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
             }
@@ -107,6 +123,28 @@ struct AgentLookSheet: View {
         #else
         .frame(minWidth: 360)
         #endif
-        .onChange(of: identity) { looks[name] = identity }
+        .onChange(of: identity) { looks[agent.name] = identity }
+    }
+
+    /// Saves whatever changed — the name, the look, or both — then closes. The look is already on
+    /// this device the moment it is picked; the daemon is where the other devices read it from.
+    /// The list polls every couple of seconds, so nothing here has to tell it; a save that fails
+    /// keeps the sheet open and says why.
+    private func finish() {
+        let newLabel = wanted != agent.title ? wanted : nil
+        let newLook = identity != opened ? identity.token : nil
+        guard newLabel != nil || newLook != nil else { return dismiss() }
+        if newLabel != nil, !isAgentLabel(wanted) {
+            trouble = "One line, up to \(MAX_AGENT_LABEL) characters."
+            return
+        }
+        Task {
+            do {
+                _ = try await session.run { try await $0.updateAgent(name: agent.name, label: newLabel, look: newLook) }
+                dismiss()
+            } catch {
+                trouble = error.localizedDescription
+            }
+        }
     }
 }

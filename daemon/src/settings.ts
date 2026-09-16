@@ -1,5 +1,5 @@
 import { eq } from 'drizzle-orm';
-import type { ProviderSettings, WebSettings } from '@schermes/shared';
+import type { ProviderSettings, PushSettings, WebSettings } from '@schermes/shared';
 import type { Db } from './db.ts';
 import { log } from './log.ts';
 import { parseMcpServers } from './mcp.ts';
@@ -17,6 +17,11 @@ const EXTRA_BODY = 'provider.extraBody';
 const SEARCH_URL = 'web.searchUrl';
 const SEARCH_KEY = 'web.searchKey';
 const MCP_SERVERS = 'mcp.servers';
+const PUSH_KEY_ID = 'push.keyId';
+const PUSH_TEAM_ID = 'push.teamId';
+const PUSH_BUNDLE_ID = 'push.bundleId';
+const PUSH_KEY = 'push.key';
+const PUSH_SANDBOX = 'push.sandbox';
 
 /** The stored text as the request body fields it stands for; undefined when it is not a JSON
  * object, which is also what an empty setting is. */
@@ -110,6 +115,42 @@ export function searchConfig(db: Db, masterKey: Buffer): SearchConfig | undefine
   if (apiKey === '') return undefined;
   const url = read(db, SEARCH_URL);
   return { url: url === undefined || url.trim() === '' ? BRAVE_SEARCH_URL : url.trim(), apiKey };
+}
+
+export function readPushSettings(db: Db): PushSettings {
+  return {
+    keyId: read(db, PUSH_KEY_ID) ?? '',
+    teamId: read(db, PUSH_TEAM_ID) ?? '',
+    bundleId: read(db, PUSH_BUNDLE_ID) ?? '',
+    keySet: read(db, PUSH_KEY) !== undefined,
+    sandbox: read(db, PUSH_SANDBOX) === 'true',
+  };
+}
+
+export function writePushIds(db: Db, ids: { keyId?: string | undefined; teamId?: string | undefined; bundleId?: string | undefined }): void {
+  if (ids.keyId !== undefined) write(db, PUSH_KEY_ID, ids.keyId, false);
+  if (ids.teamId !== undefined) write(db, PUSH_TEAM_ID, ids.teamId, false);
+  if (ids.bundleId !== undefined) write(db, PUSH_BUNDLE_ID, ids.bundleId, false);
+}
+
+/** The `.p8` text, encrypted like the provider key. Empty removes it. */
+export function writePushKey(db: Db, masterKey: Buffer, pem: string): void {
+  if (pem === '') db.delete(settings).where(eq(settings.key, PUSH_KEY)).run();
+  else write(db, PUSH_KEY, encrypt(masterKey, pem), true);
+}
+
+export function writePushSandbox(db: Db, sandbox: boolean): void {
+  write(db, PUSH_SANDBOX, sandbox ? 'true' : 'false', false);
+}
+
+export type PushConfig = { keyId: string; teamId: string; bundleId: string; key: string; sandbox: boolean };
+
+/** Everything a push needs, or undefined while any of it is missing. */
+export function pushConfig(db: Db, masterKey: Buffer): PushConfig | undefined {
+  const { keyId, teamId, bundleId, sandbox } = readPushSettings(db);
+  const stored = read(db, PUSH_KEY);
+  if (!keyId || !teamId || !bundleId || stored === undefined) return undefined;
+  return { keyId, teamId, bundleId, key: decrypt(masterKey, stored), sandbox };
 }
 
 /**

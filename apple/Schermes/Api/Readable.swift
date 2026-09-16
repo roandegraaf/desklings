@@ -211,6 +211,17 @@ func sentence(for event: ExecutionEvent) -> String {
         let cron = data.text("cron").map { " (“\($0)”)" } ?? ""
         return "Dropped \(which)\(cron): it has no next run left"
 
+    case .stop:
+        return "You stopped it"
+
+    case .turn:
+        let steps = data.int("steps") ?? 0
+        var line = "Finished a turn of \(counted(steps, "model call"))"
+        if let prompt = data.int("promptTokens"), let completion = data.int("completionTokens") {
+            line += ": \(tokens(prompt)) in, \(tokens(completion)) out"
+        }
+        return line
+
     case .approval:
         let what = data.text("kind") == "conversation"
             ? "a thread"
@@ -266,6 +277,11 @@ private let actions = [
 
 private func counted(_ count: Int, _ noun: String) -> String {
     "\(count) \(noun)\(count == 1 ? "" : "s")"
+}
+
+/// Token counts read in thousands past a thousand, as every usage dashboard prints them.
+private func tokens(_ count: Int) -> String {
+    count < 1000 ? "\(count) tokens" : String(format: "%.1fk tokens", Double(count) / 1000)
 }
 
 private extension Dictionary where Key == String, Value == JSONValue {

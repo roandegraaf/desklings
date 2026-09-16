@@ -187,7 +187,8 @@ nonisolated enum BloubStates {
             baseBody: true, baseFace: false,
             pose: { _ in
                 var p = base()
-                p.gaze = BloubGaze(yaw: 6.92, pitch: -21.96, roll: 11.6)
+                // Less yaw and the capsule's fitted eyes cross to the left of its middle.
+                p.gaze = BloubGaze(yaw: 26, pitch: -21.96, roll: 11.6)
                 p.split = 18.43
                 p.eyes = pair(0.356, 0.875)
                 return p
@@ -233,8 +234,9 @@ nonisolated enum BloubStates {
                 let r = BloubDecor.notifR * (k < 1 ? pop : 1)
                 let a = (BloubDecor.notifAngle * Double.pi) / 180
                 var p = base()
-                // the gaze goes the opposite way from the badge
-                p.gaze = BloubGaze(yaw: -21.94, pitch: -5.82, roll: -12.2)
+                // Towards the badge: every agent in the app looks right, and this is the one pose
+                // that looked away.
+                p.gaze = BloubGaze(yaw: 21.94, pitch: -5.82, roll: 12.2)
                 p.split = 18.89
                 p.eyes = pair(0.505, 0.498)
                 p.notif = BloubNotif(
@@ -407,21 +409,21 @@ nonisolated enum BloubStates {
         ),
 
         BloubStateDef(
-            // The dot comes back together at 1.85 + 0.6 = 2.45, 0.05 s after the video's cut: that
-            // remainder finishes during the next fade, as in the reference. So it does not go
-            // below the measured length.
+            // In the video the dot comes back together at 1.85 + 0.6, 0.05 s after the cut. Here
+            // it never does: a terminal call outlasts the clip many times over, and replaying the
+            // collapse and the regrow read as a ball that could not make up its mind. The dot
+            // holds and the ribbons keep circling; the morph into the next state grows it back.
             id: .comet, duration: 2.4, minDuration: 2.4, morph: 0.45, blinkIn: false,
             baseBody: false, baseFace: false,
             pose: { t in
                 let collapse = 1 - (1 - BloubDecor.cometDot)
                     * BloubEase.outQuint(bloubClamp(t / 0.55))
-                let regrow = BloubEase.outQuint(bloubClamp((t - 1.85) / 0.6))
-                let fade = bloubClamp((t - 0.15) / 0.25) * bloubClamp((1.95 - t) / 0.3)
+                let fade = bloubClamp((t - 0.15) / 0.25)
                 var p = base()
-                p.sil = BloubGeometry.circle(collapse + (1 - collapse) * regrow)
+                p.sil = BloubGeometry.circle(collapse)
                 // The dot drifts 0.035 down then comes back (measured wobble).
                 p.sil.cy = sin(bloubClamp(t / 1.7) * .pi) * 0.035
-                p.eyeAlpha = bloubClamp((t - 2) / 0.35)
+                p.eyeAlpha = 0
                 p.arcs = BloubDecor.cometRibbons.enumerated().map { i, s in
                     BloubArcSpec(id: "cm\(i)", seed: s, t: t, opacity: fade)
                 }

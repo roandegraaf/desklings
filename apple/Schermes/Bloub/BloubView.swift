@@ -20,6 +20,9 @@ struct BloubView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var player: BloubPlayer
     @State private var epoch = Date()
+    #if os(macOS)
+    @State private var pointer = PointerAnchor()
+    #endif
 
     init(
         state: BloubStateId,
@@ -33,20 +36,28 @@ struct BloubView: View {
         self.size = size
         self.paper = paper
         self.frozenAt = frozenAt
-        _player = State(initialValue: BloubPlayer(state: state, shape: identity.shape))
+        // A frozen picture keeps phase 0, so the board stays reproducible to the pixel.
+        _player = State(initialValue: BloubPlayer(
+            state: state,
+            shape: identity.shape,
+            phase: frozenAt == nil ? .random(in: 0..<bloubLifePeriod) : 0
+        ))
     }
 
     var body: some View {
         Group {
             if let frozenAt {
-                canvas(at: frozenAt)
+                canvas(at: frozenAt, aim: nil)
             } else {
                 TimelineView(.animation) { timeline in
-                    canvas(at: timeline.date.timeIntervalSince(epoch))
+                    canvas(at: timeline.date.timeIntervalSince(epoch), aim: aim)
                 }
             }
         }
         .frame(width: size, height: size)
+        #if os(macOS)
+        .background(PointerAnchorView(anchor: pointer))
+        #endif
         // The name and the state are already spoken by the row and the pill beside it.
         .accessibilityHidden(true)
         .onChange(of: state) { player.setState(state, now: Date().timeIntervalSince(epoch)) }
@@ -59,10 +70,19 @@ struct BloubView: View {
         paper ?? (colorScheme == .dark ? BloubRGB(hex: 0x1c1c1e) : BloubRGB(hex: 0xf9f9f9))
     }
 
-    private func canvas(at now: Double) -> some View {
+    // ponytail: the Mac only. An iPad pointer would need a hover gesture feeding the same aim.
+    private var aim: CGPoint? {
+        #if os(macOS)
+        pointer.aim()
+        #else
+        nil
+        #endif
+    }
+
+    private func canvas(at now: Double, aim: CGPoint?) -> some View {
         // Reduce Motion keeps the morph, the blink and the drift, holds the orbit rings and the
         // comet ribbons at their phase origin, and plays a held clip only once.
-        let frame = player.sample(now, reduceMotion: reduceMotion)
+        let frame = player.sample(now, reduceMotion: reduceMotion, aim: aim)
         let ink = identity.color.rgb(dark: colorScheme == .dark)
         let paper = ground
         let scale = player.engine.scale
@@ -86,33 +106,14 @@ struct BloubView: View {
 
         if frame.dotsBehind { drawDots(frame.dots, ink: ink, paper: paper, scale: scale, into: &context) }
 
-        let body = closedPath(frame.body)
-        context.drawLayer { layer in
-            layer.opacity = frame.bodyAlpha
-            // Opaque backing in the body's exact shape: without it a ring passing behind the ball
-            // reappears inside the eyes.
-            layer.fill(body, with: .color(paper.color))
-            layer.drawLayer { inner in
-                inner.fill(body, with: .color(ink.color))
-                inner.blendMode = .destinationOut
-                for eye in frame.eyes {
-                    let capsule = Path(
-                        roundedRect: CGRect(
-                            x: -max(eye.w, 0.01) / 2,
-                            y: -max(eye.h, 0.01) / 2,
-                            width: max(eye.w, 0.01),
-                            height: max(eye.h, 0.01)
-                        ),
-                        cornerRadius: min(max(eye.w, 0.01), max(eye.h, 0.01)) / 2
-                    )
-                    inner.fill(
-                        capsule.applying(eye.transform),
-                        with: .color(.black.opacity(eye.alpha))
-                    )
-                }
-                if let notch = frame.notch {
-                    inner.fill(circle(notch), with: .color(.black))
-                }
+        // A layer per frame per avatar is the expensive part of drawing one, and at full opacity
+        // compositing it is the same as drawing straight in.
+        if frame.bodyAlpha >= 1 {
+            drawBody(frame, ink: ink, paper: paper, into: &context)
+        } else {
+            context.drawLayer { layer in
+                layer.opacity = frame.bodyAlpha
+                drawBody(frame, ink: ink, paper: paper, into: &layer)
             }
         }
 
@@ -123,6 +124,40 @@ struct BloubView: View {
         }
 
         for arc in frame.arcs { stroke(arc, arc.front, into: &context) }
+    }
+
+    private static func drawBody(
+        _ frame: BloubFrame,
+        ink: BloubRGB,
+        paper: BloubRGB,
+        into context: inout GraphicsContext
+    ) {
+        let body = closedPath(frame.body)
+        // Opaque backing in the body's exact shape: without it a ring passing behind the ball
+        // reappears inside the eyes.
+        context.fill(body, with: .color(paper.color))
+        context.drawLayer { inner in
+            inner.fill(body, with: .color(ink.color))
+            inner.blendMode = .destinationOut
+            for eye in frame.eyes {
+                let capsule = Path(
+                    roundedRect: CGRect(
+                        x: -max(eye.w, 0.01) / 2,
+                        y: -max(eye.h, 0.01) / 2,
+                        width: max(eye.w, 0.01),
+                        height: max(eye.h, 0.01)
+                    ),
+                    cornerRadius: min(max(eye.w, 0.01), max(eye.h, 0.01)) / 2
+                )
+                inner.fill(
+                    capsule.applying(eye.transform),
+                    with: .color(.black.opacity(eye.alpha))
+                )
+            }
+            if let notch = frame.notch {
+                inner.fill(circle(notch), with: .color(.black))
+            }
+        }
     }
 
     private static func drawDots(
@@ -149,10 +184,10 @@ struct BloubView: View {
             } else {
                 path = circle(BloubBlob(x: dot.x, y: dot.y, r: dot.r))
             }
-            context.drawLayer { layer in
-                layer.opacity = dot.opacity
-                layer.fill(path, with: .color(fill.color))
-            }
+            // One fill, so opacity on a copy of the context composites exactly as a layer would.
+            var faded = context
+            faded.opacity = dot.opacity
+            faded.fill(path, with: .color(fill.color))
         }
     }
 
@@ -165,18 +200,17 @@ struct BloubView: View {
         var path = Path()
         for run in runs where run.count > 1 { path.addLines(run) }
         guard !path.isEmpty else { return }
-        context.drawLayer { layer in
-            layer.opacity = arc.opacity
-            layer.stroke(
-                path,
-                with: .linearGradient(
-                    Gradient(colors: arc.stops.map(\.color)),
-                    startPoint: arc.gradientStart,
-                    endPoint: arc.gradientEnd
-                ),
-                style: StrokeStyle(lineWidth: arc.width, lineCap: .round)
-            )
-        }
+        var faded = context
+        faded.opacity = arc.opacity
+        faded.stroke(
+            path,
+            with: .linearGradient(
+                Gradient(colors: arc.stops.map(\.color)),
+                startPoint: arc.gradientStart,
+                endPoint: arc.gradientEnd
+            ),
+            style: StrokeStyle(lineWidth: arc.width, lineCap: .round)
+        )
     }
 
     private static func circle(_ blob: BloubBlob) -> Path {
@@ -216,6 +250,64 @@ struct BloubView: View {
         return path
     }
 }
+
+#if os(macOS)
+/// The avatar's own spot in AppKit, so it can find the pointer on every frame without an event
+/// stream: `NSEvent.mouseLocation` can be read at any time, in whichever window the avatar sits.
+/// A hover on the root view would miss the sheets, popovers and Settings, which are windows of
+/// their own.
+final class PointerAnchor {
+    fileprivate weak var view: NSView?
+
+    /// The direction from the avatar's centre to the pointer, y down, half length when the pointer
+    /// is three avatars away and closing on full length the further it goes; nil while the pointer
+    /// is outside the window.
+    func aim() -> CGPoint? {
+        guard let view, let window = view.window else { return nil }
+        let centre = window.convertPoint(
+            toScreen: view.convert(CGPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
+        )
+        return Self.aim(
+            mouse: NSEvent.mouseLocation,
+            centre: centre,
+            window: window.frame,
+            reach: view.bounds.width * 3
+        )
+    }
+
+    /// Mouse, centre and window in screen coordinates, which grow upwards.
+    nonisolated static func aim(mouse: CGPoint, centre: CGPoint, window: CGRect, reach: Double) -> CGPoint? {
+        guard window.contains(mouse) else { return nil }
+        let dx = mouse.x - centre.x
+        let dy = centre.y - mouse.y
+        let d = hypot(dx, dy)
+        guard d > 0 else { return .zero }
+        // Saturates smoothly instead of stopping dead at `reach`: a pointer over the avatar barely
+        // turns it, and one across the window still turns it further than one nearby.
+        let k = atan(d / max(reach, 1)) / (.pi / 2)
+        return CGPoint(x: dx / d * k, y: dy / d * k)
+    }
+}
+
+private struct PointerAnchorView: NSViewRepresentable {
+    let anchor: PointerAnchor
+
+    func makeNSView(context: Context) -> NSView {
+        let view = ClickThroughView()
+        anchor.view = view
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        anchor.view = view
+    }
+}
+
+/// Sits under avatars that live inside buttons, so it must never take the click.
+private final class ClickThroughView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+#endif
 
 extension BloubRGB {
     var color: Color { Color(red: r, green: g, blue: b) }

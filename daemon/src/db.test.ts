@@ -46,6 +46,7 @@ test('the migrations run against a database that already holds an agent, a threa
   const agent = findAgent(db, 'veteran');
   assert.ok(agent !== undefined);
   assert.equal(agent.state, 'idle');
+  assert.equal(agent.label, undefined, 'an agent from before labels has none, not an empty one');
 
   // 0003's backfill is the one statement in the repo that only does anything on a populated
   // database: the thread that belonged to this agent is now the thread it participates in.

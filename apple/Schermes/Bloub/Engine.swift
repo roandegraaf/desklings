@@ -28,17 +28,39 @@ nonisolated struct BloubFrame {
     var notch: BloubBlob?
 }
 
+/// Where the head is aimed from outside the states, as in bloub's `Look`.
+///
+/// `yaw` and `pitch` REPLACE the pose's by `mix` rather than adding to it: added, the eyes' height
+/// followed each expression's own pitch and dropped at the first change. `wander` is kept apart
+/// because a drift on top of a follow reads as hunting for the cursor without ever holding it.
+nonisolated struct BloubLook: Equatable {
+    var yaw: Double
+    var pitch: Double
+    var mix: Double
+    var wander: Double
+
+    static let none = BloubLook(yaw: 0, pitch: 0, mix: 0, wander: 1)
+
+    static func lerp(_ a: BloubLook, _ b: BloubLook, _ t: Double) -> BloubLook {
+        BloubLook(
+            yaw: bloubLerp(a.yaw, b.yaw, t),
+            pitch: bloubLerp(a.pitch, b.pitch, t),
+            mix: bloubLerp(a.mix, b.mix, t),
+            wander: bloubLerp(a.wander, b.wander, t)
+        )
+    }
+}
+
 /// A clockless engine: `sample(_:)` is a pure function of time.
 ///
 /// In practice that means pause, resume, slow motion and a jump to an arbitrary date all give
 /// exactly the same picture, and the rendering is testable without a view.
-///
-/// ponytail: bloub's pointer-following `setLook` is not ported. Nothing in this app aims the gaze,
-/// and with no target its whole contribution reduces to the resting drift this keeps. Port it back
-/// from `engine.ts` if a later slice wants the avatar to watch the cursor.
 nonisolated final class BloubEngine {
     /// radius of the resting ball, in viewBox units
     let scale: Double
+    /// Where this avatar is in its life at rest, in seconds. Two avatars on the same phase blink
+    /// and drift in step, which reads as one puppeteer behind them all.
+    let phase: Double
 
     private var cur: BloubStateId
     private var prev: BloubStateId?
@@ -54,17 +76,25 @@ nonisolated final class BloubEngine {
     private var expression: BloubExpressionId?
     private var expressionPrev: BloubExpressionId?
     private var expressionAt: Double = -10
+    private var look = BloubLook.none
+    private var lookPrev = BloubLook.none
+    private var lookAt: Double = -10
+    private var lookMorph = BloubEngine.lookMorph
 
     /// How long the morph takes when the body's shape changes.
     static let shapeMorph: Double = 0.45
+    /// How long the gaze takes to catch a new look.
+    static let lookMorph: Double = 0.24
 
     init(
         scale: Double = Bloub.radius,
         state: BloubStateId = .idle,
         shape: BloubShapeId? = nil,
-        expression: BloubExpressionId? = nil
+        expression: BloubExpressionId? = nil,
+        phase: Double = 0
     ) {
         self.scale = scale
+        self.phase = phase
         cur = state
         self.shape = shape
         self.expression = expression
@@ -78,6 +108,27 @@ nonisolated final class BloubEngine {
         expressionPrev = expression
         expression = id
         expressionAt = now
+    }
+
+    /// Aims the head, dated like the other setters, so `sample` stays a pure function of time.
+    ///
+    /// Called on every frame while the pointer moves, so the catch-up starts from the look ON
+    /// SCREEN, not the previous target: starting from the target makes the follow judder. A
+    /// non-finite look is refused, because the engine keeps the last one and a single NaN would
+    /// stay in every frame after it.
+    func setLook(_ target: BloubLook?, now: Double, morph: Double = BloubEngine.lookMorph) {
+        let next = target ?? .none
+        guard (next.yaw + next.pitch + next.mix + next.wander).isFinite else { return }
+        lookPrev = lookOnScreen(at: now)
+        look = next
+        lookAt = now
+        lookMorph = morph
+    }
+
+    private func lookOnScreen(at now: Double) -> BloubLook {
+        let k = (now - lookAt) / lookMorph
+        if k >= 1 { return look }
+        return BloubLook.lerp(lookPrev, look, BloubEase.outQuint(bloubClamp(k)))
     }
 
     /// The chosen shape. It only replaces the body on the resting states (`baseBody`): on the
@@ -176,7 +227,7 @@ nonisolated final class BloubEngine {
     /// It is READ from a table and interpolated, never recomputed: `BloubEyefit` explains why that
     /// distinction is the whole fix. The table is asked about the morph's BOUNDS, never about the
     /// interpolated profile — that one is a fresh array with no identity and exists in no table.
-    private func eyeOffset(at now: Double, state: BloubStateId) -> CGPoint {
+    private func eyeOffset(at now: Double, state: BloubStateId, following: Bool = false) -> CGPoint {
         /// One morph axis: read the table on its two bounds and interpolate with its curve.
         func onAxis(_ start: Double, _ duration: Double, _ a: CGPoint, _ b: CGPoint) -> CGPoint {
             if a == b { return b }
@@ -191,8 +242,10 @@ nonisolated final class BloubEngine {
             onAxis(
                 expressionAt,
                 Self.shapeMorph,
-                BloubEyefit.offset(shape: id, state: state, expression: expressionPrev),
-                BloubEyefit.offset(shape: id, state: state, expression: expression)
+                BloubEyefit.offset(
+                    shape: id, state: state, expression: expressionPrev, following: following
+                ),
+                BloubEyefit.offset(shape: id, state: state, expression: expression, following: following)
             )
         }
 
@@ -281,11 +334,19 @@ nonisolated final class BloubEngine {
 
         // --- life at rest ----------------------------------------------------
         let alive = pose.eyeAlpha > 0.01
-        let life = bloubLiveliness(now, wander: alive ? 1 : 0, blink: alive)
+        let aimed = lookOnScreen(at: now)
+        let life = bloubLiveliness(now + phase, wander: alive ? aimed.wander : 0, blink: alive)
+        if aimed.mix > 0 {
+            let followed = eyeOffset(at: now, state: cur, following: true)
+            offset = CGPoint(
+                x: bloubLerp(offset.x, followed.x, aimed.mix),
+                y: bloubLerp(offset.y, followed.y, aimed.mix)
+            )
+        }
 
         let gaze = BloubGaze(
-            yaw: pose.gaze.yaw + life.dYaw,
-            pitch: pose.gaze.pitch + life.dPitch,
+            yaw: bloubLerp(pose.gaze.yaw, aimed.yaw, aimed.mix) + life.dYaw,
+            pitch: bloubLerp(pose.gaze.pitch, aimed.pitch, aimed.mix) + life.dPitch,
             // the roll follows nothing: the head is tilted -13 degrees in the video and rolling it
             // breaks that signature
             roll: pose.gaze.roll + life.dRoll
@@ -293,7 +354,7 @@ nonisolated final class BloubEngine {
 
         // a blink triggered by the state change, on top of the schedule
         let forced = bloubClamp((now - blinkAt) / 0.2)
-        let forcedLid = forced < 1 ? abs(forced * 2 - 1) : 1
+        let forcedLid = forced < 1 ? bloubLidCurve(forced) : 1
         let lid = min(life.lid, forcedLid)
 
         let offX = pose.offX + life.driftX

@@ -7,15 +7,15 @@ options:
     iOS: "26.0"
     macOS: "26.0"
 
-# Ad-hoc, so a clone builds and runs in the simulator and on this Mac with no Apple account.
-# Target level, not project level: XcodeGen writes `CODE_SIGN_IDENTITY = "iPhone Developer"` onto
-# every iOS-capable target, and a target setting beats a project one. A physical iPhone needs a
-# real team; set one in Xcode's Signing & Capabilities.
+# Automatic signing on the owner's paid team, which is what a device build and the push
+# entitlement need: Xcode registers the App ID with the push capability and makes the profile
+# on the first `-allowProvisioningUpdates` build. Target level, not project level: XcodeGen
+# writes `CODE_SIGN_IDENTITY = "iPhone Developer"` onto every iOS-capable target, and a target
+# setting beats a project one. A clone without this team builds for the simulator by putting
+# `CODE_SIGN_IDENTITY: "-"`, `CODE_SIGN_STYLE: Manual` and an empty team back here.
 signing: &signing
-  CODE_SIGN_STYLE: Manual
-  CODE_SIGN_IDENTITY: "-"
-  PROVISIONING_PROFILE_SPECIFIER: ""
-  DEVELOPMENT_TEAM: ""
+  CODE_SIGN_STYLE: Automatic
+  DEVELOPMENT_TEAM: 69G9C748N4
 
 settings:
   base:
@@ -58,6 +58,10 @@ targets:
         # ZRLE is one continuous inflate stream, which is what zlib gives and the Compression
         # framework's raw-deflate API does not.
         OTHER_LDFLAGS: "-lz"
+        # Push needs the entitlement, and the entitlement needs a provisioning profile, which
+        # only a device build signed by a real team has. Ad-hoc simulator and Mac builds carry
+        # none: a Mac app with a restricted entitlement and no profile does not launch.
+        CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]: Schermes/Schermes.entitlements
 
   SchermesTests:
     type: bundle.unit-test

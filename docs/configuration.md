@@ -21,9 +21,12 @@ coordinate bounds are that shrunk view, and the coordinates the model sends back
 the display. A geometry at or below 1280x800 is used as is. Changing it restarts every desktop
 still running at the old size the next time the daemon starts, rather than adopting it.
 
-Set them in `infra/schermes.service` on a real host, or in `docker-compose.yml` for the dev
-harness. The compose file passes `SCHERMES_PORT` through and publishes the same number, so
-changing it in one place moves both.
+Set them in a `.env` next to `docker-compose.yml`, or in `infra/schermes.service` on a bare
+host. The compose file passes `SCHERMES_PORT` through and publishes the same number, so changing
+it in one place moves both. Four variables are the compose file's alone: `SCHERMES_BIND`, the
+address the port is published on (`127.0.0.1` by default, `0.0.0.0` for LAN access without a
+proxy), and for the `domain` profile `SCHERMES_DOMAIN`, `SCHERMES_HTTP_PORT` (80) and
+`SCHERMES_HTTPS_PORT` (443).
 
 Everything the daemon derives — the database path, the master key path, the migrations
 directory, the built UI, the desktop scripts — is resolved from `SCHERMES_DATA_DIR` or from
@@ -77,14 +80,37 @@ redirects are not followed — a 3xx is reported so the agent can call again wit
 There is no setting that turns this off. An agent that genuinely needs a local URL has
 `run_command` and `curl`.
 
+## Push notifications
+
+Optional, stored on the same settings row set, set from the app's settings screen through
+`PUT /api/settings` with the fields below and read back under `push` in `GET /api/settings`.
+
+| Field          | Meaning                                                                       |
+| -------------- | ----------------------------------------------------------------------------- |
+| `pushKeyId`    | The APNs key id from the Apple developer account.                              |
+| `pushTeamId`   | The team id.                                                                   |
+| `pushBundleId` | The app's bundle identifier, `dev.schermes.Schermes` unless you changed it.    |
+| `pushKey`      | The contents of the `.p8` file. AES-GCM encrypted with the master key, never returned — `GET` answers `keySet`. An empty string removes it. |
+| `pushSandbox`  | `true` for a development-signed device build, which APNs serves from its sandbox host. |
+
+Devices register themselves: `POST /api/devices` with `{token, platform}` on every launch,
+`GET /api/devices` lists them, `DELETE /api/devices/:token` forgets one, and a token APNs reports
+dead is dropped by the push that learnt it. `POST /api/settings/push/test` sends "Push works."
+to every device. What is pushed: what an agent says at the end of a turn in its own thread with
+the owner, why a turn failed, and a deletion request. The app needs a real Apple team and the
+`aps-environment` entitlement on a device build to be handed a token at all.
+
 ## MCP servers
 
 The owner's MCP servers are **one settings row**, `mcp.servers`, holding the whole list as JSON
 and **AES-GCM encrypted with the master key** — a stdio server's `env` block is where an API key
 goes and an http server's headers are where a bearer token goes. They have their own routes
-rather than fields on `PUT /api/settings`: `GET /api/mcp/servers` lists them, `PUT` replaces the
-list, and `POST /api/agents/<name>/mcp/<server>/test` connects to one as that agent and says what
-came back.
+rather than fields on `PUT /api/settings`: `GET /api/mcp/servers` lists them, `PUT /api/mcp/servers`
+replaces the list, `PUT /api/mcp/servers/<name>` adds or changes one, `DELETE /api/mcp/servers/<name>`
+removes one, and `POST /api/agents/<name>/mcp/<server>/test` connects to one as that agent and says
+what came back. The per-server routes read the row, replace or append by name, and write it back
+through the same parse the loader uses, so what may be stored is still what may be run — and the
+name in the path wins over any name in the body.
 
 A stdio server:
 
@@ -113,12 +139,15 @@ An http one:
 
 Four consequences worth knowing.
 
-**Secrets are never read back.** `GET /api/mcp/servers` returns each server's identity and the
-*names* of the variables or headers it carries, never their values — the provider key's rule. A
-`PUT` replaces the whole list, so changing one server means sending every secret again. The
-owner's panel is a JSON textarea on the settings screen and **starts empty** for that reason:
-what a `GET` returns cannot be posted back, both because the secrets are missing and because a
-stdio server's `command` and `args` come back joined.
+**Secrets are never read back, and a blank one keeps what is stored.** `GET /api/mcp/servers`
+returns each server's identity and the *names* of the variables or headers it carries, never their
+values — the provider key's rule. So on `PUT /api/mcp/servers/<name>` an `env` or `headers` entry
+whose value is `""` takes the stored value for that key, and a key the body leaves out is removed
+with it: an owner changes a server's command without ever having seen its token. The merge happens
+before the parse. The replace-all `PUT /api/mcp/servers` has no such merge — it is the whole list
+or nothing, secrets included, which is why the app writes one server at a time instead. Its
+Plugins page edits a server in a form, shows each stored value as "Stored" rather than as itself,
+and leaves it blank to keep it.
 
 **The tool list is no longer static.** A configured server's tools are offered as
 `mcp__<server>__<tool>`, sorted by name, after every built-in tool. They are connected once at
@@ -171,9 +200,31 @@ stop", not because anything reads them from the environment. Changing one is a c
 | `MAX_TYPE_CHARS`          | 2 000              | `daemon/src/computer.ts`  | One `type` action                                 |
 | `MAX_CLIPBOARD_CHARS`     | 64 KiB             | `daemon/src/computer.ts`  | A clipboard write                                 |
 | `MAX_DISPLAY`             | 999                | `daemon/src/agents.ts`    | Highest X display, so 999 permanent agents        |
+| `MAX_LABEL_CHARS`         | 64                 | `daemon/src/agents.ts`    | An agent's label, on one line; a client's `look` token follows the same rule |
+| `MAX_PROFILE_CHARS`       | 4 000              | `daemon/src/interview.ts` | An agent's profile, written by `set_profile` or `PATCH /api/agents/:name` |
+| `MAX_QUESTIONS`           | 4                  | `daemon/src/interview.ts` | Questions one `ask_owner` call may put to the owner |
+| `MAX_FILE_BYTES`          | 25 000 000         | `daemon/src/home.ts`      | One file handed to an agent through `POST /api/agents/:name/uploads`, or taken out through `GET .../files` |
+| `MAX_EVENTS`              | 1 000              | `daemon/src/app.ts`       | The most `?limit=` may ask `GET .../events` for   |
+| `MAX_SEARCH_CHARS`        | 200                | `daemon/src/app.ts`       | One `GET /api/search?q=` needle                   |
+| `MAX_SEARCH_HITS`         | 50                 | `conversations.ts`        | Rows one search answers with, newest first, each cut to a 240-character snippet |
+| `MAX_MEMORY_FILE_CHARS`   | 64 000             | `daemon/src/home.ts`      | A memory file as the owner reads or writes it through `/api/agents/:name/memory` |
+| `APNS_TOKEN_TTL_MS`       | 50 min             | `daemon/src/push.ts`      | How long one provider JWT is reused; APNs refuses one older than an hour |
+| `MAX_PUSH_BODY_CHARS`     | 200                | `daemon/src/push.ts`      | The body of a push; the thread has the rest       |
+| `MAX_IMAGE_BYTES`         | 5 000 000          | `daemon/src/app.ts`       | A picture the owner sends with a message, decoded |
 
 Agent names match `^[a-z0-9][a-z0-9-]{0,30}$`. The name becomes the Linux user `agent-<name>`,
 so it is validated at every boundary that accepts one.
+
+A name is the system identity and never changes. What the owner is shown is the agent's `label`:
+free text, any script, up to `MAX_LABEL_CHARS` on one line, and purely cosmetic — nothing
+addresses, routes, runs as or names a file after a label, and the app derives the name from it
+when an agent is created (`Bob the Builder` runs as `agent-bob-the-builder`). `PATCH
+/api/agents/:name` changes a label, a look or a profile; nothing changes a name.
+
+An agent's `profile` is what it is for, in Markdown, in its system prompt every turn. A new
+agent has none and interviews the owner with `ask_owner` to write one with `set_profile`;
+`POST /api/agents` starts that interview when a provider is configured, and a body carrying a
+`profile` skips it. A blank profile on `PATCH` clears it, which puts the agent back to asking.
 
 ## Memory and skills
 
@@ -245,6 +296,7 @@ hours on a host that sets `TZ`; neither is configurable and the schedule is the 
 
 ## TLS
 
-There is none, on purpose. schermes speaks plain HTTP on one port. Put Caddy or nginx in front
-of it — see [deployment](deployment.md). The session cookie is deliberately not `Secure`,
+There is none in the daemon, on purpose. schermes speaks plain HTTP on one port; the compose
+file's `domain` profile puts Caddy in front of it — see
+[deployment](deployment.md#a-linked-domain). The session cookie is deliberately not `Secure`,
 because a `Secure` cookie is dropped over the plain HTTP the daemon actually speaks.

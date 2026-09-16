@@ -10,12 +10,12 @@ struct ConnectView: View {
             Text("schermes")
                 .font(.largeTitle.weight(.semibold))
 
-            Text("The address of your daemon. Use https for anything off this network.")
+            Text("Your daemon's domain, or its address on this network.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
-            TextField("127.0.0.1:7777", text: $session.address)
+            TextField("schermes.example.com or 127.0.0.1:7777", text: $session.address)
                 .textFieldStyle(.plain)
                 .autocorrectionDisabled()
                 #if os(iOS)

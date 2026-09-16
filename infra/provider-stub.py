@@ -23,6 +23,10 @@ Binds 127.0.0.1 only: check.sh asserts nothing but the web port listens off loop
          are the only way the smoke run can see what the daemon put in the system prompt.
   web    STUB_SENDER asks web_fetch for STUB_URL once. The only web step that can run offline is
          the refusal: a stub served from loopback is exactly what the guard exists to block.
+  interview
+         STUB_SENDER's first call puts two questions to the owner with ask_owner, its second
+         writes a profile carrying the nonce with set_profile, and it reports from the third on.
+         Everyone else reports straight away.
 """
 
 import json
@@ -159,6 +163,7 @@ class Handler(BaseHTTPRequestHandler):
         nth = calls[who]
 
         asked = None
+        said = ""
         run = tool_call(f"cmd-{nth}", "run_command", {"command": COMMAND, "timeoutMs": TIMEOUT_MS})
         if SCRIPT == "tools" and nth == 1:
             asked = tool_call(f"shot-{nth}", "computer", {"action": "screenshot"})
@@ -186,9 +191,36 @@ class Handler(BaseHTTPRequestHandler):
             asked = tool_call(
                 f"msg-{nth}", "send_message", {"to": TO, "text": f"{NONCE} what is your hostname?"}
             )
+        elif SCRIPT == "interview" and SENDER and who == SENDER and nth == 1:
+            said = "Hi, a couple of questions first."
+            asked = tool_call(
+                f"ask-{nth}",
+                "ask_owner",
+                {
+                    "questions": [
+                        {
+                            "question": "What should I mainly do for you?",
+                            "header": "Purpose",
+                            "options": [
+                                {"label": "Spreadsheets", "description": "build and tidy them"},
+                                {"label": "Email", "description": "triage and draft replies"},
+                                {"label": "Research"},
+                            ],
+                            "multiple": True,
+                        },
+                        {"question": "Anything else I should know?"},
+                    ]
+                },
+            )
+        elif SCRIPT == "interview" and SENDER and who == SENDER and nth == 2:
+            asked = tool_call(
+                f"profile-{nth}",
+                "set_profile",
+                {"profile": f"# {who}\n\nI keep the owner's spreadsheets tidy and triage their email.\n\nNonce: {NONCE}"},
+            )
 
         message = (
-            {"role": "assistant", "content": "", "tool_calls": [asked]}
+            {"role": "assistant", "content": said, "tool_calls": [asked]}
             if asked
             else {"role": "assistant", "content": report(body, authorized)}
         )

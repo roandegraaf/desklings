@@ -1,9 +1,9 @@
 # Development guide
 
 schermes provisions a whole Linux machine, so most of it cannot be exercised on a Mac directly.
-The Docker harness exists to close that gap: the container is a real Debian 13 host built by the
-same `infra/install.sh` that a VM or VPS runs, running real Xvnc displays, real Chromium
-profiles and real `sudo` boundaries.
+The Docker harness exists to close that gap: the container is a real Debian 13 host built by
+`infra/install.sh`, running real Xvnc displays, real Chromium profiles and real `sudo`
+boundaries. It is also the deployment: the same compose file runs on the server.
 
 ## Layout
 
@@ -40,8 +40,8 @@ docker compose up -d
 ```
 
 Then the two runnable checks. Both are safe to run repeatedly, including after
-`docker compose restart` and `docker compose up --build`, because `/var/lib/schermes` is a named
-volume and they reuse the owner and the agents they find.
+`docker compose restart` and `docker compose up --build`, because `/var/lib/schermes` and `/home` are
+named volumes and they reuse the owner and the agents they find.
 
 ```sh
 ./infra/smoke.sh                                                  # the daemon

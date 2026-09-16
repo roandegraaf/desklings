@@ -134,8 +134,10 @@ done
 echo "   all refused with 400"
 
 say "creating $agent_one and $agent_two"
+# Born with a profile, or the daemon would open each thread with an interview turn against a
+# provider that is not there yet, and the transcripts below would carry that failure.
 for agent in "$agent_one" "$agent_two"; do
-  req POST /api/agents "$(jq -nc --arg n "$agent" '{name: $n}')"
+  req POST /api/agents "$(jq -nc --arg n "$agent" '{name: $n, profile: "A smoke-test agent."}')"
   case "$(cat "$tmp/status")" in
     201) echo "   created $agent" ;;
     409) echo "   $agent already exists" ;;
@@ -157,6 +159,60 @@ req GET "/api/agents/$agent_one"
 expect 200 "fetch one agent"
 req GET /api/agents/nobody
 expect 404 "fetch a missing agent"
+
+# A label is what the owner calls an agent: free text, renamable, and never the identity. Set
+# here rather than at creation so a re-run over an existing agent checks the same thing.
+say "renaming $agent_one does not move the name it runs as"
+req PATCH "/api/agents/$agent_one" "$(jq -nc '{label: "Smoke 🔥 Één"}')"
+expect 200 "rename"
+jq -e --arg a "$agent_one" '.label == "Smoke 🔥 Één" and .name == $a' "$tmp/body" >/dev/null \
+  || fail "the label did not round-trip: $(body)"
+req GET "/api/agents/$agent_one"
+jq -e '.label == "Smoke 🔥 Één"' "$tmp/body" >/dev/null || fail "the label was not kept: $(body)"
+req PATCH "/api/agents/$agent_one" '{"label": "   "}'
+expect 400 "an empty label"
+req PATCH /api/agents/nobody '{"label": "Ghost"}'
+expect 404 "renaming a missing agent"
+echo "   renamed, and $agent_one still runs as agent-$agent_one"
+
+say "a look the app picks for $agent_one is kept by the daemon for every device"
+req PATCH "/api/agents/$agent_one" '{"look": "cloud:teal"}'
+expect 200 "set a look"
+req GET "/api/agents/$agent_one"
+jq -e '.look == "cloud:teal" and .label == "Smoke 🔥 Één"' "$tmp/body" >/dev/null \
+  || fail "the look was not kept beside the label: $(body)"
+req PATCH "/api/agents/$agent_one" '{}'
+expect 400 "a change with nothing in it"
+
+say "a file handed to $agent_one lands in its home, owned by it"
+req POST "/api/agents/$agent_one/uploads" \
+  "$(jq -nc --arg b "$(printf 'smoke upload' | base64)" '{name: "smoke note.txt", base64: $b}')"
+expect 201 "upload"
+upload_path=$(jq -r '.path' "$tmp/body")
+[ "$(in_container sudo -u "agent-$agent_one" cat "$upload_path" | tr -d '\r')" = "smoke upload" ] \
+  || fail "the upload did not land at $upload_path"
+[ "$(in_container stat -c %U "$upload_path" | tr -d '\r')" = "agent-$agent_one" ] \
+  || fail "the upload is not owned by agent-$agent_one"
+req POST "/api/agents/$agent_one/uploads" '{"name": "../etc/passwd", "base64": "aGk="}'
+expect 400 "a name with a path in it"
+echo "   $upload_path"
+
+say "the owner reads and rewrites $agent_one's memory as the agent"
+req PUT "/api/agents/$agent_one/memory" '{"lasting": "- the smoke run was here\n"}'
+expect 200 "write memory"
+req GET "/api/agents/$agent_one/memory"
+expect 200 "read memory"
+jq -e '.lasting == "- the smoke run was here\n"' "$tmp/body" >/dev/null \
+  || fail "memory did not round-trip: $(body)"
+[ "$(in_container stat -c %U "/home/agent-$agent_one/memory/MEMORY.md" | tr -d '\r')" = "agent-$agent_one" ] \
+  || fail "MEMORY.md is not owned by agent-$agent_one"
+
+say "stopping an agent that is not running is a plain no"
+req POST "/api/agents/$agent_one/stop"
+expect 200 "stop while idle"
+jq -e '.stopped == false' "$tmp/body" >/dev/null || fail "nothing was running: $(body)"
+req POST /api/agents/nobody/stop
+expect 404 "stop a missing agent"
 
 # Before anything below runs, not in the section that creates one: a schedule left behind by an
 # interrupted run fires every tick, and a turn starting under its own steam in the middle of the
@@ -184,12 +240,18 @@ vnc_socket() {
   in_container ss -ltnH "sport = :$((5900 + $1))" | awk '{print $4}' | head -1 | tr -d '\r'
 }
 
+wm_pid() { in_container sh -c "pgrep -u agent-$1 -f openbox | head -1" | tr -d '\r'; }
+
+# Openbox is forked about a second after Xvnc answers, so a probe that stopped at the X server
+# would land in that gap on roughly every other run.
 wait_desktop() {
   local name=$1 display=$2 _
   for _ in $(seq 90); do
-    [ -n "$(xvnc_pid "$name" "$display")" ] && [ -n "$(vnc_socket "$display")" ] && return 0
+    [ -n "$(xvnc_pid "$name" "$display")" ] && [ -n "$(vnc_socket "$display")" ] \
+      && [ -n "$(wm_pid "$name")" ] && return 0
     sleep 1
   done
+  [ -z "$(xvnc_pid "$name" "$display")" ] || fail "agent $name has an X server on :$display but no window manager after 90s"
   fail "agent $name has no live desktop on :$display after 90s"
 }
 
@@ -205,8 +267,6 @@ assert_desktops() {
     [ -n "$home" ] || fail "agent $name has no linux user"
     in_container test -d "$home/workspace" || fail "agent $name has no workspace in $home"
     in_container test -d "$home/uploads" || fail "agent $name has no uploads dir in $home"
-    [ -n "$(in_container sh -c "pgrep -u agent-$name -f openbox | head -1")" ] \
-      || fail "agent $name has an X server but no window manager"
 
     socket=$(vnc_socket "$display")
     case "$socket" in
@@ -539,6 +599,11 @@ req PUT /api/settings \
      '{baseUrl: $u, model: $m, apiKey: $k}')"
 expect 200 "settings for the stub"
 
+say "the stored provider settings answer a test call"
+req POST /api/settings/test
+expect 200 "provider test"
+jq -e '.ok == true' "$tmp/body" >/dev/null || fail "the stub did not answer the test: $(body)"
+
 say "a message with no text, and a message to an agent that does not exist, are refused"
 req POST "/api/agents/$agent_one/messages" '{"text":"   "}'
 expect 400 "an empty message"
@@ -600,7 +665,7 @@ jq -e --arg n "$nonce" '
 answer=$(jq -r '[.[] | select(.role == "assistant")] | last | .content' "$tmp/body")
 echo "   the agent answered: $answer"
 for want in "nonce=$nonce" "model=$stub_model" 'auth=yes' 'system=yes' 'png=yes' \
-            'tools=cancel_schedule,computer,list_schedules,pause_schedule,remember,run_command,schedule_task,send_message,spawn_task_worker,web_fetch,web_search' 'valid=yes'; do
+            'tools=ask_owner,browser,cancel_schedule,computer,list_schedules,pause_schedule,remember,request_deletion,run_command,schedule_task,send_message,set_profile,spawn_task_worker,web_fetch,web_search' 'valid=yes'; do
   case $answer in
     *"$want"*) ;;
     *) fail "the model never saw $want — it reported: $answer" ;;
@@ -1181,6 +1246,21 @@ echo "   $asked tool calls, $answered results, and the model accepted the transc
 
 # ---------------------------------------------------------------- memory and skills
 
+say "a search finds what was said, across every thread"
+req GET "/api/search?q=$(printf '%s' "$nonce" | jq -sRr @uri)"
+expect 200 "search"
+jq -e --arg a "$agent_one" '[.[] | select(.participants == [$a])] | length > 0' "$tmp/body" >/dev/null \
+  || fail "the nonce was said in $agent_one's thread and not found: $(body | head -c 300)"
+req GET "/api/agents/$agent_one/events"
+expect 200 "the whole event log"
+newest_three=$(jq -c '[.[-3:][] | .id]' "$tmp/body")
+jq -e 'any(.[]; .type == "turn" and .data.steps > 0)' "$tmp/body" >/dev/null \
+  || fail "no turn event records what a turn cost: $(body | head -c 300)"
+req GET "/api/agents/$agent_one/events?limit=3"
+expect 200 "the newest three events"
+[ "$(jq -c '[.[] | .id]' "$tmp/body")" = "$newest_three" ] \
+  || fail "limit=3 should be the newest three, oldest first: $(body)"
+
 say "$agent_one starts from an empty memory and no skills"
 # Idempotent, and both halves have to be: only the head of MEMORY.md is ever loaded, so a file
 # left growing across runs would stop carrying the newest line, and the skills index below is
@@ -1223,7 +1303,7 @@ settle "$agent_one"
 req GET "/api/agents/$agent_one/messages"
 expect 200 "the transcript after the restart"
 remembered=$(jq -r '[.[] | select(.role == "assistant")] | last | .content' "$tmp/body")
-for want in 'memory=yes' 'skills=deploy' 'tools=cancel_schedule,computer,list_schedules,pause_schedule,remember,run_command,schedule_task,send_message,spawn_task_worker,web_fetch,web_search'; do
+for want in 'memory=yes' 'skills=deploy' 'tools=ask_owner,browser,cancel_schedule,computer,list_schedules,pause_schedule,remember,request_deletion,run_command,schedule_task,send_message,set_profile,spawn_task_worker,web_fetch,web_search'; do
   case $remembered in
     *"$want"*) ;;
     *) fail "the model never saw $want — it reported: $remembered" ;;

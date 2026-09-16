@@ -94,9 +94,11 @@ export async function runCommand(
   exec: Exec,
   target: AgentTarget,
   request: ResolvedCommand,
+  signal?: AbortSignal,
 ): Promise<CommandResult> {
   const result = await exec('sudo', asAgent(target, commandArgv(request)), {
     timeoutMs: request.timeoutMs + BACKSTOP_MS,
+    ...(signal === undefined ? {} : { signal }),
   });
 
   if (request.background) {
