@@ -19,6 +19,8 @@ services:
       - "${SCHERMES_BIND:-127.0.0.1}:${SCHERMES_PORT:-7777}:${SCHERMES_PORT:-7777}"
     environment:
       SCHERMES_PORT: "${SCHERMES_PORT:-7777}"
+      SCHERMES_APNS_KEY_FILE: /run/secrets/apns.p8
+      SCHERMES_APNS_KEY_ID: "${SCHERMES_APNS_KEY_ID:-}"
     # Named rather than bound, so a fresh volume inherits the image's ownership and modes:
     # master.key stays 0600 under schermes, /srv/schermes stays setgid agents. Without them a
     # rebuild silently starts on an empty database with empty agent homes.
@@ -26,6 +28,9 @@ services:
       - schermes-data:/var/lib/schermes
       - schermes-homes:/home
       - schermes-shared:/srv/schermes
+      # The APNs key, when SCHERMES_APNS_KEY in .env names the AuthKey_<KEYID>.p8 on the host.
+      # Without it /dev/null is mounted, which the daemon reads as no key.
+      - "${SCHERMES_APNS_KEY:-/dev/null}:/run/secrets/apns.p8:ro"
 
   # TLS for a linked domain. Off unless COMPOSE_PROFILES=domain is in .env, next to
   # SCHERMES_DOMAIN; Caddy then gets the certificate itself and reaches the daemon over the

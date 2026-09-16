@@ -85,9 +85,9 @@ unread threads and pending requests.
 
 The daemon pushes over APNs when an agent finishes a turn or asks for something, so a phone hears
 about it with the app closed. The app asks for notification permission, registers for remote
-notifications, and hands the device token to the daemon (`POST /api/devices`); the APNs key, key
-id, team id and bundle id go in the app's settings, with Sandbox on for a development build, and
-"Send test push" proves the path. Only a **device build signed by a real team** gets a token: the
+notifications, and hands the device token to the daemon (`POST /api/devices`) together with
+its bundle id, team id and `aps-environment`, read off its own embedded provisioning profile, so
+the daemon's push settings fill themselves in; "Send test push" proves the path. Only a **device build signed by a real team** gets a token: the
 `aps-environment` entitlement in `Schermes/Schermes.entitlements` is applied to `iphoneos` builds
 only (`CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]` in `project.yml`), because it needs a provisioning
 profile, which the team's automatic signing supplies for a device. The simulator and the Mac
@@ -95,10 +95,12 @@ build register no token, so on them the Settings screen shows why under Devices 
 has nobody to push to.
 
 The APNs key itself comes from the developer portal, once per team: Certificates, Identifiers &
-Profiles ▸ Keys ▸ add a key with **Apple Push Notifications service (APNs)** enabled, download the
-`AuthKey_<KEYID>.p8` (it can be downloaded only once) and paste its contents, the Key ID and the
-Team ID (`69G9C748N4`) into Settings ▸ Push notifications, with Sandbox on for an Xcode-installed
-build. Then install on the phone, allow notifications, and press "Send test push".
+Profiles ▸ Keys ▸ add a key with **Apple Push Notifications service (APNs)** enabled and download
+the `AuthKey_<KEYID>.p8` (it can be downloaded only once). Put its path and id in the daemon's
+`.env` as `SCHERMES_APNS_KEY=/path/to/AuthKey_<KEYID>.p8` and `SCHERMES_APNS_KEY_ID=<KEYID>`,
+restart the container, install on the phone, allow notifications, and press "Send test push" in
+Settings ▸ Notifications. That screen also takes a pasted key for a daemon nothing can be mounted
+into.
 
 ## Deleting things
 

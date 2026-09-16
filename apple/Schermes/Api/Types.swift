@@ -46,10 +46,7 @@ struct PushSettings: Codable, Sendable {
 
 struct PushSettingsUpdate: Codable, Sendable {
     var pushKeyId: String? = nil
-    var pushTeamId: String? = nil
-    var pushBundleId: String? = nil
     var pushKey: String? = nil
-    var pushSandbox: Bool? = nil
 }
 
 /// A device the daemon can push to. The token is APNs' hex, one row per device.

@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { createApp } from './app.ts';
 import { config } from './config.ts';
 import { loadMasterKey } from './secrets.ts';
+import { seedPushKey } from './settings.ts';
 import { log } from './log.ts';
 import { openDb } from './db.ts';
 import { reconcileDesktops, systemDesktop } from './agents.ts';
@@ -18,6 +19,9 @@ const db = openDb(config.dbPath, config.migrationsDir);
 // process is doing, and transcripts a strict model endpoint would reject.
 reconcileAgents(db);
 const masterKey = loadMasterKey(config.masterKeyPath);
+if (config.apnsKeyFile !== undefined && seedPushKey(db, masterKey, config.apnsKeyFile, config.apnsKeyId)) {
+  log.info('push key loaded', { file: config.apnsKeyFile });
+}
 const { app, runner } = createApp({ db, masterKey, desktop: systemDesktop, exec: systemExec });
 
 const server = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, (info) => {

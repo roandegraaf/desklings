@@ -49,6 +49,8 @@ the Docker tab, **Add Container**, switch to advanced view, and fill in:
 | Path | container `/var/lib/schermes`, host `/mnt/cache/appdata/schermes/data` |
 | Path | container `/home`, host `/mnt/cache/appdata/schermes/home` |
 | Path | container `/srv/schermes`, host `/mnt/cache/appdata/schermes/shared` |
+| Path (push, optional) | container `/run/secrets/AuthKey_<KEYID>.p8`, host `/mnt/cache/appdata/schermes/AuthKey_<KEYID>.p8`, read only |
+| Variable (push, optional) | `SCHERMES_APNS_KEY_FILE` = `/run/secrets/AuthKey_<KEYID>.p8` |
 | Extra parameters | `--hostname=schermes --init --shm-size=1g --security-opt=seccomp=unconfined` |
 
 The extra parameters are the four load-bearing compose settings below, spelled for `docker
@@ -56,6 +58,10 @@ run`. The paths are plain bind mounts: the entrypoint fixes their ownership on e
 an empty appdata directory is fine. Keep them on the pool (`/mnt/cache/...`, or whatever the
 pool is called) rather than under `/mnt/user/...`: that path is a FUSE filesystem, and SQLite
 memory-maps its WAL index, which FUSE handles badly. Updates are Unraid's own update button.
+
+For push, drop the `AuthKey_<KEYID>.p8` from the developer portal into the appdata directory
+(the `appdata` SMB share, or `cat > ... <<'EOF'` in the web terminal) and map it under its own
+name: the daemon reads the key id off the filename, so `SCHERMES_APNS_KEY_ID` is not needed.
 
 Five settings in the `schermes` service are load-bearing and have to survive any rewrite: the
 three named volumes, `hostname`, `init` and `seccomp=unconfined`.

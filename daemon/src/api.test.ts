@@ -1450,7 +1450,17 @@ test('the push settings round-trip with the key stored encrypted, and devices re
 
   assert.equal((await post(app, '/api/devices', { token: 'zz', platform: 'ios' }, cookie)).status, 400);
   assert.equal((await post(app, '/api/devices', { token: 'ab'.repeat(32), platform: 'watch' }, cookie)).status, 400);
-  assert.equal((await post(app, '/api/devices', { token: 'AB'.repeat(32), platform: 'ios' }, cookie)).status, 201);
+  assert.equal((await post(app, '/api/devices', { token: 'ab'.repeat(32), platform: 'ios', teamId: 'short' }, cookie)).status, 400);
+  assert.equal((await post(app, '/api/devices', { token: 'ab'.repeat(32), platform: 'ios', environment: 'staging' }, cookie)).status, 400);
+  assert.equal(
+    (await post(app, '/api/devices', { token: 'AB'.repeat(32), platform: 'ios', teamId: 'ABCDE12345', bundleId: 'dev.x.App', environment: 'production' }, cookie)).status,
+    201,
+  );
+  assert.deepEqual(
+    ((await getJson(app, '/api/settings', cookie)) as Record<string, unknown>)['push'],
+    { keyId: 'K1', teamId: 'ABCDE12345', bundleId: 'dev.x.App', keySet: false, sandbox: false },
+    'the registering build says who it is',
+  );
   assert.equal((await post(app, '/api/devices', { token: 'ab'.repeat(32), platform: 'macos' }, cookie)).status, 201);
   const listed = (await getJson(app, '/api/devices', cookie)) as Record<string, unknown>[];
   assert.equal(listed.length, 1, 'one row per token, case folded');

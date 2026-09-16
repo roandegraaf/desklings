@@ -306,7 +306,9 @@ private struct WebSearchPage: View {
     }
 }
 
-/// The APNs credentials the daemon pushes with, and the devices it has to push to.
+/// The APNs key the daemon pushes with, and the devices it has to push to. The ids are not
+/// typed: the build that registers a device reports its own, and a key mounted into the
+/// container is stored at boot, so this page is a status screen unless a key has to be pasted.
 private struct NotificationsPage: View {
     let session: Session
 
@@ -324,28 +326,9 @@ private struct NotificationsPage: View {
             afterSave: { pushed = nil }
         ) { form, stored, unchanged in
             Section {
-                LabeledContent("Key ID") {
-                    TextField("Key ID", text: form.pushKeyId, prompt: Text("ABC123DEFG"))
-                        .rowField()
-                }
-                LabeledContent("Team ID") {
-                    TextField("Team ID", text: form.pushTeamId, prompt: Text("A1B2C3D4E5"))
-                        .rowField()
-                }
-                LabeledContent("Bundle ID") {
-                    TextField("Bundle ID", text: form.pushBundleId, prompt: Text(verbatim: "dev.schermes.Schermes"))
-                        .rowField()
-                }
-                TextField(
-                    "Key (.p8)",
-                    text: form.pushKey,
-                    prompt: Text(stored.push.keySet ? "Stored" : "Not set"),
-                    axis: .vertical
-                )
-                .font(.caption.monospaced())
-                .lineLimit(1...4)
-                .rowField()
-                Toggle("Sandbox", isOn: form.pushSandbox)
+                LabeledContent("App", value: stored.push.bundleId.isEmpty ? "Not yet registered" : stored.push.bundleId)
+                LabeledContent("Team", value: stored.push.teamId.isEmpty ? "Not yet registered" : stored.push.teamId)
+                LabeledContent("Gateway", value: stored.push.bundleId.isEmpty ? "Not yet registered" : stored.push.sandbox ? "Sandbox (development build)" : "Production")
                 LabeledContent("Devices", value: deviceLine)
                 Button(pushing ? "Sending…" : "Send test push", action: testPush)
                     .buttonStyle(.borderless)
@@ -360,7 +343,27 @@ private struct NotificationsPage: View {
                     .textSelection(.enabled)
                 }
             } footer: {
-                Text("An APNs key from the Apple Developer portal, so the daemon reaches your phone when an agent finishes or asks something. Sandbox is on for a development build. The key is paste-once: blank keeps the stored one. Save, then send a test.")
+                Text("The daemon pushes to your phone when an agent finishes or asks something. The app, team and gateway come from the build that registered a device; open the app on the phone and they fill in.")
+            }
+
+            Section {
+                LabeledContent("Key ID") {
+                    TextField("Key ID", text: form.pushKeyId, prompt: Text("ABC123DEFG"))
+                        .rowField()
+                }
+                TextField(
+                    "Key (.p8)",
+                    text: form.pushKey,
+                    prompt: Text(stored.push.keySet ? "Stored" : "Not set"),
+                    axis: .vertical
+                )
+                .font(.caption.monospaced())
+                .lineLimit(1...4)
+                .rowField()
+            } header: {
+                Text(stored.push.keySet ? "Key" : "Key (not set)")
+            } footer: {
+                Text("Mount the AuthKey_<KEYID>.p8 from the Apple Developer portal into the container and point SCHERMES_APNS_KEY_FILE at it; then nothing here needs filling in. Paste it only when you cannot: blank keeps the stored one.")
             }
         }
         .task {
@@ -369,9 +372,11 @@ private struct NotificationsPage: View {
     }
 
     private var deviceLine: String {
-        guard !devices.isEmpty else { return "None registered" }
+        let count = devices.isEmpty ? "None registered" : "\(devices.count) registered"
         let mine = registration.token.map { token in devices.contains { $0.token == token } } ?? false
-        return "\(devices.count) registered" + (mine ? ", this one included" : "") + (registration.failure.map { " · this device: \($0)" } ?? "")
+        if mine { return count + ", this one included" }
+        if let failure = registration.failure { return count + " · this device: \(failure)" }
+        return count + (registration.token == nil ? " · this device: no APNs token yet" : " · this device: not registered yet")
     }
 
     private func testPush() {

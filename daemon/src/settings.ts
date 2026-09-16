@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { basename } from 'node:path';
 import { eq } from 'drizzle-orm';
 import type { ProviderSettings, PushSettings, WebSettings } from '@schermes/shared';
 import type { Db } from './db.ts';
@@ -141,6 +143,27 @@ export function writePushKey(db: Db, masterKey: Buffer, pem: string): void {
 
 export function writePushSandbox(db: Db, sandbox: boolean): void {
   write(db, PUSH_SANDBOX, sandbox ? 'true' : 'false', false);
+}
+
+/**
+ * The `.p8` mounted into the container, stored at boot the way a pasted one is, so the screen
+ * never has to see it. Apple names the download `AuthKey_<KEYID>.p8`, which is where the key id
+ * comes from unless one is given. An empty file is no file: compose mounts /dev/null when the
+ * owner has not set one.
+ */
+export function seedPushKey(db: Db, masterKey: Buffer, path: string, keyId?: string): boolean {
+  let pem: string;
+  try {
+    pem = readFileSync(path, 'utf8').trim();
+  } catch {
+    return false;
+  }
+  if (!pem.includes('-----BEGIN PRIVATE KEY-----')) return false;
+  const id = keyId?.trim() || /^AuthKey_([A-Z0-9]+)\.p8$/i.exec(basename(path))?.[1];
+  if (!id) throw new Error(`the APNs key id is not in ${JSON.stringify(basename(path))}: set SCHERMES_APNS_KEY_ID`);
+  writePushKey(db, masterKey, pem);
+  writePushIds(db, { keyId: id });
+  return true;
 }
 
 export type PushConfig = { keyId: string; teamId: string; bundleId: string; key: string; sandbox: boolean };

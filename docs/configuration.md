@@ -4,7 +4,7 @@ Everything schermes reads from its environment, and the limits it does not.
 
 ## Environment variables
 
-The daemon reads exactly five, all in `daemon/src/config.ts`. Each is validated at startup and
+The daemon reads exactly seven, all in `daemon/src/config.ts`. Each is validated at startup and
 a bad value stops the daemon rather than being silently replaced by a default.
 
 | Variable               | Default             | Meaning                                                       |
@@ -14,6 +14,8 @@ a bad value stops the daemon rather than being silently replaced by a default.
 | `SCHERMES_GEOMETRY`    | `1920x1200`         | Desktop size. The model sees it shrunk to fit 1280x800.        |
 | `SCHERMES_MAX_LOOPS`   | `8`                 | Concurrent agent turns. A request above it gets a 429.         |
 | `SCHERMES_MAX_WORKERS` | `4`                 | Concurrent task workers, counted across all parents.           |
+| `SCHERMES_APNS_KEY_FILE` | unset             | An APNs `.p8`, stored encrypted at boot like a pasted one. Empty or missing is no key. |
+| `SCHERMES_APNS_KEY_ID` | from the file name  | The key id. Needed when the file is not named `AuthKey_<KEYID>.p8`; the daemon refuses to start without one. |
 
 `SCHERMES_GEOMETRY` is the size `Xvnc` is started with. The model never sees it directly: a
 screenshot is shrunk to fit 1280x800 (1920x1200 becomes exactly 1280x800), the computer tool's
@@ -23,9 +25,11 @@ still running at the old size the next time the daemon starts, rather than adopt
 
 Set them in a `.env` next to `docker-compose.yml`, or in `infra/schermes.service` on a bare
 host. The compose file passes `SCHERMES_PORT` through and publishes the same number, so changing
-it in one place moves both. Four variables are the compose file's alone: `SCHERMES_BIND`, the
+it in one place moves both. Five variables are the compose file's alone: `SCHERMES_BIND`, the
 address the port is published on (`127.0.0.1` by default, `0.0.0.0` for LAN access without a
-proxy), and for the `domain` profile `SCHERMES_DOMAIN`, `SCHERMES_HTTP_PORT` (80) and
+proxy), `SCHERMES_APNS_KEY`, the host path of the `AuthKey_<KEYID>.p8` that compose mounts at
+`/run/secrets/apns.p8` (with `SCHERMES_APNS_KEY_ID` next to it, since the mount loses the name),
+and for the `domain` profile `SCHERMES_DOMAIN`, `SCHERMES_HTTP_PORT` (80) and
 `SCHERMES_HTTPS_PORT` (443).
 
 Everything the daemon derives — the database path, the master key path, the migrations
@@ -82,8 +86,10 @@ There is no setting that turns this off. An agent that genuinely needs a local U
 
 ## Push notifications
 
-Optional, stored on the same settings row set, set from the app's settings screen through
-`PUT /api/settings` with the fields below and read back under `push` in `GET /api/settings`.
+Optional, stored on the same settings row set, read back under `push` in `GET /api/settings`.
+Nothing has to be typed: the key comes in through `SCHERMES_APNS_KEY_FILE` at boot, and the
+ids come in with the first device that registers. `PUT /api/settings` still takes every field,
+for a setup where the file cannot be mounted or a build reports the wrong thing.
 
 | Field          | Meaning                                                                       |
 | -------------- | ----------------------------------------------------------------------------- |
@@ -94,8 +100,11 @@ Optional, stored on the same settings row set, set from the app's settings scree
 | `pushSandbox`  | `true` for a development-signed device build, which APNs serves from its sandbox host. |
 
 Devices register themselves: `POST /api/devices` with `{token, platform}` on every launch,
-`GET /api/devices` lists them, `DELETE /api/devices/:token` forgets one, and a token APNs reports
-dead is dropped by the push that learnt it. `POST /api/settings/push/test` sends "Push works."
+plus the build's own `bundleId`, `teamId` and `environment` (`development` or `production`) as
+read off its embedded provisioning profile, which become `pushBundleId`, `pushTeamId` and
+`pushSandbox`. The last build to register decides the gateway. `GET /api/devices` lists them,
+`DELETE /api/devices/:token` forgets one, and a token APNs reports dead is dropped by the push
+that learnt it. `POST /api/settings/push/test` sends "Push works."
 to every device. What is pushed: what an agent says at the end of a turn in its own thread with
 the owner, why a turn failed, and a deletion request. The app needs a real Apple team and the
 `aps-environment` entitlement on a device build to be handed a token at all.

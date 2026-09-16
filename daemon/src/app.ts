@@ -179,6 +179,8 @@ function withImages(c: Context, rows: Message[]): Message[] {
 
 const MAX_EVENTS = 1_000;
 const DEVICE_TOKEN = /^[0-9a-f]{32,200}$/i;
+const TEAM_ID = /^[A-Z0-9]{10}$/;
+const BUNDLE_ID = /^[A-Za-z0-9.-]{1,155}$/;
 /** A picture the owner sends an agent. Decoded size, the model request carries it as base64. */
 export const MAX_IMAGE_BYTES = 5_000_000;
 const MAX_SEARCH_CHARS = 200;
@@ -432,16 +434,31 @@ export function createApp({
   });
 
   // The devices a push goes to. The app registers its token on every launch, because Apple
-  // may hand it a new one; a token Apple reports dead is dropped by the push itself.
+  // may hand it a new one; a token Apple reports dead is dropped by the push itself. The build
+  // that registers also says who it is: its bundle id, team and `aps-environment` are read off
+  // its own signature, which is where APNs learnt them too, so nobody types them.
   app.get('/api/devices', (c) => c.json(listDevices(db)));
 
   app.post('/api/devices', async (c) => {
     const body = await jsonBody(c);
     const token = stringField(body, 'token') ?? '';
     const platform = stringField(body, 'platform');
+    const teamId = stringField(body, 'teamId');
+    const bundleId = stringField(body, 'bundleId');
+    const environment = stringField(body, 'environment');
     if (!DEVICE_TOKEN.test(token)) return c.json({ error: 'token must be the hex APNs device token' }, 400);
     if (platform !== 'ios' && platform !== 'macos') return c.json({ error: 'platform must be ios or macos' }, 400);
+    if (teamId !== undefined && !TEAM_ID.test(teamId)) return c.json({ error: 'teamId must be the ten-character Apple team id' }, 400);
+    if (bundleId !== undefined && !BUNDLE_ID.test(bundleId)) return c.json({ error: 'bundleId must be a bundle identifier' }, 400);
+    if (environment !== undefined && environment !== 'development' && environment !== 'production') {
+      return c.json({ error: 'environment must be development or production' }, 400);
+    }
     upsertDevice(db, token.toLowerCase(), platform);
+    // ponytail: one gateway for every device; the last build to register picks it. Store the
+    // environment per device and group the send by host if a TestFlight and an Xcode build
+    // ever have to be pushed to at once.
+    writePushIds(db, { teamId, bundleId });
+    if (environment !== undefined) writePushSandbox(db, environment === 'development');
     return c.json({ ok: true }, 201);
   });
 

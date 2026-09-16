@@ -185,7 +185,7 @@ struct ConsoleView: View {
         // costs one request and changes nothing.
         .task(id: registration.token) {
             guard let token = registration.token, token != session.registeredDevice else { return }
-            if (try? await session.run({ try await $0.registerDevice(token: token, platform: registration.platform) })) != nil {
+            if (try? await session.run({ try await $0.registerDevice(registration, token: token) })) != nil {
                 session.registeredDevice = token
             }
         }

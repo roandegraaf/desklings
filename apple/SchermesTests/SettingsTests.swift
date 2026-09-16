@@ -46,12 +46,7 @@ private func body(_ value: some Encodable) throws -> [String: JSONValue] {
         "extraBody": .string(#"{"reasoning":{"effort":"high"}}"#),
     ])
     #expect(try body(form.webUpdate) == ["searchUrl": .string("")])
-    #expect(try body(form.pushUpdate) == [
-        "pushKeyId": .string("K1"),
-        "pushTeamId": .string("T1"),
-        "pushBundleId": .string("dev.schermes.Schermes"),
-        "pushSandbox": .bool(true),
-    ])
+    #expect(try body(form.pushUpdate) == ["pushKeyId": .string("K1")])
 
     form.apiKey = "sk-new"
     form.searchKey = "brave"
@@ -60,9 +55,7 @@ private func body(_ value: some Encodable) throws -> [String: JSONValue] {
     #expect(try body(form.modelUpdate)["apiKey"] == .string("sk-new"))
     #expect(try Set(body(form.webUpdate).keys) == ["searchUrl", "searchKey"])
     #expect(try body(form.webUpdate)["searchKey"] == .string("brave"))
-    #expect(try Set(body(form.pushUpdate).keys) == [
-        "pushKeyId", "pushTeamId", "pushBundleId", "pushSandbox", "pushKey",
-    ])
+    #expect(try Set(body(form.pushUpdate).keys) == ["pushKeyId", "pushKey"])
     #expect(try body(form.pushUpdate)["pushKey"] == .string("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"))
 }
 

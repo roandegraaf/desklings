@@ -90,9 +90,6 @@ struct SettingsForm: Equatable {
     var extraBody: String
     var searchUrl: String
     var pushKeyId: String
-    var pushTeamId: String
-    var pushBundleId: String
-    var pushSandbox: Bool
     var apiKey = ""
     var searchKey = ""
     var pushKey = ""
@@ -103,9 +100,6 @@ struct SettingsForm: Equatable {
         extraBody = settings.provider.extraBody
         searchUrl = settings.web.searchUrl
         pushKeyId = settings.push.keyId
-        pushTeamId = settings.push.teamId
-        pushBundleId = settings.push.bundleId
-        pushSandbox = settings.push.sandbox
     }
 
     /// One page at a time: `PUT /api/settings` keeps every field a body leaves out, so a page
@@ -138,13 +132,7 @@ struct SettingsForm: Equatable {
         DaemonSettingsUpdate(
             provider: ProviderSettingsUpdate(),
             web: WebSettingsUpdate(),
-            push: PushSettingsUpdate(
-                pushKeyId: pushKeyId,
-                pushTeamId: pushTeamId,
-                pushBundleId: pushBundleId,
-                pushKey: pushKey.isEmpty ? nil : pushKey,
-                pushSandbox: pushSandbox
-            )
+            push: PushSettingsUpdate(pushKeyId: pushKeyId, pushKey: pushKey.isEmpty ? nil : pushKey)
         )
     }
 }
@@ -505,8 +493,11 @@ struct SchermesClient: Sendable {
     }
 
     /// This device, so the daemon can reach it when the app is not running. Upserted by token.
-    func registerDevice(token: String, platform: String) async throws {
-        let _: Empty = try await send("POST", url("/api/devices"), body: ["token": token, "platform": platform])
+    /// The build says who it is alongside, which is what the daemon's push settings are made of.
+    func registerDevice(_ registration: PushRegistration, token: String) async throws {
+        var body = ["token": token, "platform": registration.platform, "bundleId": registration.bundleId, "environment": registration.environment]
+        if let teamId = registration.teamId { body["teamId"] = teamId }
+        let _: Empty = try await send("POST", url("/api/devices"), body: body)
     }
 
     func unregisterDevice(token: String) async throws {

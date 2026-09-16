@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, verify } from 'node:crypto';
-import { resolve } from 'node:path';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { openDb } from './db.ts';
 import { APNS_TOKEN_TTL_MS, listDevices, providerToken, sendPush, upsertDevice } from './push.ts';
 import type { PushSend } from './push.ts';
+import { pushConfig, readPushSettings, seedPushKey } from './settings.ts';
 
 const MIGRATIONS = resolve(import.meta.dirname, '../migrations');
 const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
@@ -63,4 +66,27 @@ test('a push reaches every device with the apns headers and payload, and a dead 
   assert.equal(failed.sent, 0);
   assert.match(failed.error ?? '', /500/);
   assert.equal(listDevices(db).length, 1, 'a 500 drops nothing');
+});
+
+test('a mounted AuthKey_<KEYID>.p8 is stored at boot with its id read off the name, and an empty mount is nothing', () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const masterKey = Buffer.alloc(32, 7);
+  const dir = mkdtempSync(join(tmpdir(), 'apns-'));
+  const named = join(dir, 'AuthKey_KEY123.p8');
+  writeFileSync(named, pem);
+  assert.equal(seedPushKey(db, masterKey, named), true);
+  assert.deepEqual(readPushSettings(db), { keyId: 'KEY123', teamId: '', bundleId: '', keySet: true, sandbox: false });
+
+  const anonymous = join(dir, 'apns.p8');
+  writeFileSync(anonymous, pem);
+  assert.throws(() => seedPushKey(db, masterKey, anonymous), /SCHERMES_APNS_KEY_ID/);
+  assert.equal(seedPushKey(db, masterKey, anonymous, 'KEY456'), true);
+  assert.equal(readPushSettings(db).keyId, 'KEY456');
+  assert.equal(pushConfig(db, masterKey), undefined, 'the ids arrive with the first device');
+
+  const empty = join(dir, 'empty.p8');
+  writeFileSync(empty, '');
+  assert.equal(seedPushKey(db, masterKey, empty), false);
+  assert.equal(seedPushKey(db, masterKey, join(dir, 'missing.p8')), false);
+  assert.equal(readPushSettings(db).keySet, true, 'a bad mount keeps what is stored');
 });

@@ -16,8 +16,11 @@ enum Notifier {
         guard !asked else { return }
         asked = true
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
-            guard granted else { return }
             Task { @MainActor in
+                guard granted else {
+                    pushRegistration.failure = "notifications are off for Schermes in the system settings"
+                    return
+                }
                 #if os(iOS)
                 UIApplication.shared.registerForRemoteNotifications()
                 #else
@@ -53,6 +56,34 @@ final class PushRegistration {
     #else
     let platform = "macos"
     #endif
+
+    /// What APNs will want to hear about this build, read off its own signature rather than
+    /// typed: the bundle id, the team, and whether the profile says development or production.
+    let bundleId = Bundle.main.bundleIdentifier ?? ""
+    let teamId: String?
+    let environment: String
+
+    init() {
+        let entitlements = Self.profileEntitlements()
+        teamId = entitlements?["com.apple.developer.team-identifier"] as? String
+        environment = entitlements?["aps-environment"] as? String ?? "production"
+    }
+
+    /// The entitlements inside the embedded provisioning profile: a CMS blob wrapping a plist. An
+    /// App Store install has no profile, which is the one case that is always production.
+    private static func profileEntitlements() -> [String: Any]? {
+        #if os(iOS)
+        let url = Bundle.main.bundleURL.appending(path: "embedded.mobileprovision")
+        #else
+        let url = Bundle.main.bundleURL.appending(path: "Contents/embedded.provisionprofile")
+        #endif
+        guard let data = try? Data(contentsOf: url),
+              let start = data.range(of: Data("<plist".utf8)),
+              let end = data.range(of: Data("</plist>".utf8), in: start.lowerBound..<data.endIndex),
+              let plist = try? PropertyListSerialization.propertyList(from: data[start.lowerBound..<end.upperBound], format: nil)
+        else { return nil }
+        return (plist as? [String: Any])?["Entitlements"] as? [String: Any]
+    }
 }
 
 /// Shared between the app delegate, which hears from APNs, and the views, which tell the daemon.

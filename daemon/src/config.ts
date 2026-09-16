@@ -53,6 +53,8 @@ export const config = {
   screen: screen(),
   dbPath: resolve(dataDir, 'schermes.db'),
   masterKeyPath: resolve(dataDir, 'master.key'),
+  apnsKeyFile: process.env['SCHERMES_APNS_KEY_FILE'],
+  apnsKeyId: process.env['SCHERMES_APNS_KEY_ID'],
   migrationsDir: resolve(import.meta.dirname, '../migrations'),
   // Resolves to /opt/schermes/infra/desktop on a real host, which is the path the sudoers
   // rule for create-agent-user.sh names literally. The two must keep agreeing.
