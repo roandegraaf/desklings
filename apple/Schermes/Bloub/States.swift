@@ -59,6 +59,9 @@ nonisolated enum BloubStateId: String, CaseIterable, Sendable {
     case burst, comet
     /// an interface transition, not one of the catalogue's animations: outside `sequence`
     case swirl
+    /// the app's own, outside `sequence`: a failed agent keeps its body, and `BloubView` crosses
+    /// its eyes
+    case failed
 }
 
 nonisolated struct BloubStateDef {
@@ -392,6 +395,19 @@ nonisolated enum BloubStates {
         ),
 
         BloubStateDef(
+            id: .failed, duration: 2, minDuration: nil, morph: 0.45, blinkIn: false,
+            baseBody: true, baseFace: false,
+            pose: { _ in
+                var p = base()
+                // Nearly frontal, as the canvas's specimen: turned like the rest face, the two
+                // crosses foreshorten into one smudge.
+                p.gaze = BloubGaze(yaw: 10, pitch: 8, roll: 0)
+                p.split = 17
+                return p
+            }
+        ),
+
+        BloubStateDef(
             // the body is back together at 1.7 + 0.7
             id: .burst, duration: 2.6, minDuration: 2.4, morph: 0.4, blinkIn: false,
             baseBody: false, baseFace: false,
@@ -459,6 +475,7 @@ nonisolated enum BloubStates {
         case .play: 0.9
         case .orbit: 1.2
         case .swirl: 0.5
+        case .failed: 1
         case .burst: 0.45
         case .comet: 1.15
         }

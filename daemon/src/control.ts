@@ -1,3 +1,5 @@
+import type { ToolDef } from './provider.ts';
+
 /**
  * Who holds a desktop's mouse and keyboard. Xvnc knows nothing about owners, so the daemon is
  * the only thing that can hold one.
@@ -38,3 +40,35 @@ export function createControl(): Control {
     },
   };
 }
+
+export const MAX_HANDS_REASON_CHARS = 400;
+
+export function askForHandsToolDef(): ToolDef {
+  return {
+    name: 'ask_for_hands',
+    description:
+      'Ask the owner to take your screen and do something only a person should or can do there: ' +
+      'a login, a CAPTCHA, a choice you may not make. Say exactly what they should do. Calling ' +
+      'this ends your turn; you hear from them when they give the screen back.',
+    parameters: {
+      type: 'object',
+      properties: {
+        reason: {
+          type: 'string',
+          maxLength: MAX_HANDS_REASON_CHARS,
+          description: 'what the owner should do on the screen, and why you cannot',
+        },
+      },
+      required: ['reason'],
+    },
+  };
+}
+
+export function parseHandsReason(args: Record<string, unknown>): string | { error: string } {
+  const reason = typeof args['reason'] === 'string' ? args['reason'].trim() : '';
+  if (reason === '') return { error: 'reason is required' };
+  if (reason.length > MAX_HANDS_REASON_CHARS) return { error: `reason is longer than ${MAX_HANDS_REASON_CHARS} characters` };
+  return reason;
+}
+
+export const HANDS_BACK = 'The owner gave the screen back.';

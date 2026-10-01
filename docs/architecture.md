@@ -167,7 +167,9 @@ setup and login needs a session.
 ### Agents and their desktops
 
 **Requirement** — an agent is a row in `agents`, a Linux user `agent-<name>`, and one X display
-that belongs to it for as long as the row exists. Creating one through the API does all three.
+that belongs to it for as long as the row exists. Creating one through the API does all three;
+with a `description` the desktop follows in the background (see
+[forwarding and new agents](#forwarding-and-new-agents)).
 
 - **Requirement** — the daemon allocates display numbers, lowest free first from `:1`. `:0` is
   reserved for a physical console. Reusing the gap a removed agent leaves keeps the numbers
@@ -197,7 +199,8 @@ that belongs to it for as long as the row exists. Creating one through the API d
   when creating one. Desktops outlive the daemon, so a restart adopts the ones still answering
   and respawns the rest. A desktop that will not come up is logged and skipped; it does not stop
   the daemon or the other agents.
-- Creating an agent whose desktop fails to start drops the row again. The Linux user and its
+- Creating an agent without a description whose desktop fails to start drops the row again
+  (one created from a description is kept, and its desktop comes up later). The Linux user and its
   home survive, so a retry reuses them, and the display goes back in the pool rather than being
   stranded by a half-created agent.
 - A killed X server leaves `/tmp/.X<n>-lock` behind. The X server clears a stale lock only when
@@ -307,16 +310,26 @@ The `browser` tool fills it through the DevTools Protocol of the Chromium alread
   one tab is the two-loops-one-mouse problem the computer tool already avoids.
 - `Page.loadEventFired` is waited for with a timeout and the page is read either way: a page that
   keeps a request open never fires load, and what has rendered is still the answer.
+- **Requirement** — **a watchdog**, because a wedged Chromium answered nothing and the turn sat on
+  it. Reaching the browser means connecting *and* a trivial `Runtime.evaluate` answering within
+  five seconds. A stall before the action, or during a `navigate` or `read`, kills Chromium as the
+  agent, starts it again and redoes the action once; the `tool_result` event says `restarted`. An
+  `evaluate` that timed out is **never redone**, because it may already have clicked.
+- A second stall is the owner's: the tool result starts with `BROWSER_HUNG`, the event carries
+  `hung`, and the turn ends in `waiting_for_user`. That tool row *is* the Needs you item and the
+  chat's card — nothing else is stored. `POST /api/agents/:name/browser/restart` with `browser`
+  or `desktop` (409 mid-turn) restarts one or the other, then writes an owner line in the thread
+  that hung and starts a turn there; the owner line is also what clears the item.
 - **Deferred** — tab selection (the first page target wins), an accessibility tree, and a
   screenshot from CDP rather than `scrot`. Each is one more action when a model asks for it.
 
 ### The model provider
 
-- **Requirement** — one seam, one implementation. `Provider` is a function from a transcript
-  and a set of tool definitions to a reply, and `openAiProvider` is the only thing behind it:
-  chat completions with tool calling and vision, against the base URL, model and API key the
-  owner stored. There is no provider registry and no second client; a different endpoint is a
-  different base URL.
+- **Requirement** — one seam, one client. `Provider` is a function from a transcript and a set
+  of tool definitions to a reply, and `openAiProvider` is the only thing behind it: chat
+  completions with tool calling and vision. There is no second client; a different vendor is a
+  different base URL. What varies is **which endpoint** a call uses, which is the
+  [model registry](#model-registry-and-recovery) below.
 - **Requirement** — tool definitions are generated from the same constants and the same action
   list the validators enforce, in `computer.ts` and `terminal.ts`. A separate schema file would
   be a second copy of the vocabulary and would drift; a test asserts the advertised bounds are
@@ -328,6 +341,40 @@ The `browser` tool fills it through the DevTools Protocol of the Chromium alread
   immediately by one tool message per call id and nothing else, so with two tool calls in a
   turn an image placed inline would split the pair and a strict endpoint would reject the whole
   transcript. Every tool result for a turn is emitted first, then the images.
+
+### Model registry and recovery
+
+**Requirement** — the owner keeps several models and each agent runs on one. The single
+`provider.*` setting became a `models` table: a name, a base URL, a model id, an extra request
+body, and a key encrypted with the master key. The default and an optional backup are two
+settings rows holding a model id; `agents.model_id` is the agent's own, null meaning the default.
+
+- **Requirement** — `providerConfig` in `models.ts` is **the one resolver**: the agent's model,
+  else the default, and a worker runs on its parent's. Every model call — a turn, the interview
+  kickoff, compaction, the retry and forward gates, search and the new-agent suggestion — asks
+  it, so there is no second place that decides which endpoint is used.
+- **Requirement** — boot moves the old `provider.*` rows into the first registry entry and makes
+  it the default, carrying the key across as ciphertext, once, before anything reads them. The
+  provider fields of `GET`/`PUT /api/settings` still exist and read and write the default entry;
+  the app uses `/api/models` instead.
+- Routes: `GET`/`POST /api/models`, `PUT`/`DELETE /api/models/:id`, `PUT /api/models/default` and
+  `/backup`, `POST /api/models/:id/test`, `PUT /api/agents/:name/model`. A delete is a 409 while
+  an agent is assigned the model, and for the default while another model could take its place:
+  the owner picks the successor, the daemon does not guess. A key is write-only, reported as
+  `apiKeySet`.
+- **Requirement** — `openAiProvider` is **one attempt**, and `withRetries` in front of it decides
+  whether to ask again. A dropped socket, a stream silent for two minutes, a 408, a 429 or a 5xx
+  is retryable; up to five attempts, the wait doubling from two seconds or following
+  `Retry-After`, capped at two minutes. Anything else fails the turn at once. A stop cuts the
+  wait.
+- **Requirement** — while a turn waits, the wait rides on `GET .../live` as `retry`, and
+  `POST /api/agents/:name/retry` with `now` or `backup` are the owner's two levers. Both act only
+  while a wait is in progress. The backup is **offered, never switched to on its own**: a
+  different model mid-turn is the owner's call.
+- **Requirement** — a 401 or 403 is not retried and not handed to the backup: the same key cannot
+  go differently. It is recorded as one settings row per model, first refusal kept, and shown as
+  one `provider-auth` item under [Needs you](#needs-you) that hides the per-agent failures behind
+  it. A changed key, a delete, a passing test or any call that answers clears it.
 
 ### The agent loop
 
@@ -403,6 +450,10 @@ window on its text alone.
   before it asks for more, so *between* turns every call is answered and the whole stretch is one
   legal cut, and inside one it is not. The answer says how many rows each agent's summary now
   stands for; zero is an agent with nothing new, and costs no model call.
+- **Recommendation** — `GET /api/agents` reports each agent's **context fullness**, 0-100: the
+  characters its own thread would replay since its newest summary, measured the way the budget
+  above measures them, against that budget. It is a reading of rows the daemon already has, only
+  on the list route, so the app can show how close the next compaction is without a model call.
 - **Deferred** — compacting an agent's memory files, and any retention of the summarised rows.
   Nothing is deleted; the summary is a shorter *reading* of rows that all stay.
 
@@ -532,8 +583,9 @@ asleep. A heartbeat is a schedule with a fixed prompt, **not a second mechanism*
   records a `schedule_dropped` event, so a job that stopped existing on its own leaves a trace in
   the agent's activity log rather than just ceasing to appear. The tick's *other* drop — a row
   whose agent is gone — has none and can have none: `events.agent_id` is `NOT NULL` and references
-  `agents`, so there is no row to hang the event on. That case is also unreachable through the
-  API, which has no route that deletes an agent.
+  `agents`, so there is no row to hang the event on. It is also unreachable in practice:
+  `DELETE /api/agents/:name` removes the agent's schedules in the same synchronous pass that
+  removes the agent.
 
 ### Web search and fetch
 
@@ -548,7 +600,7 @@ per page against one tool call and some text. `web_search` finds a URL, `web_fet
   setting so it can be pointed at a proxy or a mirror, **not** so a differently shaped API can be
   swapped in.
 - **Requirement** — the endpoint and the key are **settings rows**, and the key is AES-GCM
-  encrypted with the master key exactly like the provider key. `GET /api/settings` answers with
+  encrypted with the master key exactly like a model key. `GET /api/settings` answers with
   `searchKeySet` as a boolean, and the error body an endpoint echoes back goes through
   `withoutKey` before it becomes an observation, an event or a log line — the same reason
   `provider.ts` strips it there.
@@ -572,8 +624,8 @@ per page against one tool call and some text. `web_search` finds a URL, `web_fet
   being buffered at all, and the extracted text is then clipped to `MAX_OBSERVATION_CHARS` like
   every other observation. A response whose content type is not text, JSON or XML is refused
   rather than converted.
-- **Recommendation** — a **task worker is offered both tools**, which makes them the only ones it
-  shares with a permanent agent. `remember` and the schedule tools are withheld because a worker
+- **Recommendation** — a **task worker is offered both tools** (the full list is under
+  [agent tools](#agent-tools)). `remember` and the schedule tools are withheld because a worker
   has no home and is never started again; neither applies to an HTTP request the daemon makes on
   its behalf, and "go read this and report" is the job a worker exists for. It costs nothing
   besides: a worker already has `run_command` and therefore `curl`.
@@ -589,7 +641,7 @@ per page against one tool call and some text. `web_search` finds a URL, `web_fet
   guard has checked it, so an answer that changes in between is not caught. Closing it means
   connecting to the address already checked and carrying the name in a `Host` header, which needs
   a dispatcher `fetch` does not expose.
-- **Requirement** — the search key is a field on the settings screen with the provider key's
+- **Requirement** — the search key is a field on the settings screen with a model key's
   write-only behaviour: `searchKeySet` says whether one is stored, the field is never filled in
   from a response, and a blank field is **left out of the body** rather than sent as `''`, which
   the daemon would write. The endpoint beside it is not write-only and its placeholder says that
@@ -608,7 +660,7 @@ SDK is the only reason this is one piece of work rather than three.
   `asAgent` already builds, which is the only way through: neither sudoers rule grants `SETENV`,
   so `sudo` strips the environment it was handed.
 - **Requirement** — the servers are **one settings row**, `mcp.servers`, holding the whole list
-  as JSON and encrypted with the master key like the provider key. A stdio server's `env` block
+  as JSON and encrypted with the master key like a model key. A stdio server's `env` block
   and an http server's headers are where an API key goes, so the row is encrypted as a whole
   rather than field by field. `GET /api/mcp/servers` answers with each server's identity and the
   *names* of the secrets it carries, never their values.
@@ -649,8 +701,7 @@ SDK is the only reason this is one piece of work rather than three.
   An owner-scoped test would have to spawn a stdio server as `schermes`, which is exactly the
   thing this section forbids; one connect path means a test cannot be right about a spawn a turn
   gets wrong.
-- **Recommendation** — a **task worker is offered no MCP tools**, which makes the web pair still
-  the only ones it shares with a permanent agent. A worker has no Linux user of its own, so a
+- **Recommendation** — a **task worker is offered no MCP tools**. A worker has no Linux user of its own, so a
   stdio server would run as its parent, and it is one job that reports back and is never started
   again.
 - **Deferred** — running as the agent's user is **a separation of duties, not a boundary**, for
@@ -690,8 +741,11 @@ SDK is the only reason this is one piece of work rather than three.
   it counts toward `MAX_REPLAYED_IMAGES` with the screenshots: both are bytes in the request,
   and an old picture is one the model has already looked at.
 - **Requirement** — every message carries the name of the agent that wrote it, and a missing
-  sender means the owner. The name is stored rather than an agent id: names are unique and
-  immutable, there is no delete endpoint, and the transcript needs the name anyway.
+  sender means the owner. The name is stored rather than an agent id: names are unique, the
+  transcript needs the name anyway, and a rename rewrites the column in the same transaction as
+  the row. A sender that does not match the agent-name pattern is the daemon speaking for
+  something that is not the owner: `Trigger` and `Idle work` rows are delivered like the owner's
+  but do not count as the owner having spoken.
 - **Requirement** — reading a thread over HTTP is **paged**, because a thread carries base64
   screenshots and the whole of one is not a response anybody wants. `?limit=` (50 by default,
   200 at most) and `?before=<message id>` walk it backwards; no cursor is the newest page,
@@ -731,11 +785,11 @@ SDK is the only reason this is one piece of work rather than three.
   `waiting_for_agent` for exactly that reply. Without that rule two agents in a group would
   answer each other forever off one message from the owner.
 - **Requirement** — two agents cannot write to each other forever. A conversation counts the
-  messages agents have passed since the owner last spoke in it, and `send_message` refuses past
-  the cap with an observation the model can act on. It is a query over the rows rather than a
-  counter on the message, so nothing has to be threaded through the loop. Known ceiling: an
-  agent-to-agent thread the owner never posts to reaches the cap permanently, and a post from
-  the owner clears it.
+  messages agents have passed since the owner last wrote in any thread one of its participants
+  is in, and `send_message` refuses past the cap with an observation the model can act on. Only
+  senders that are agent names count, so a trigger firing or an idle note never blocks a
+  `send_message`. It is a query over the rows rather than a counter on the message, so nothing
+  has to be threaded through the loop.
 
 ### Task workers
 
@@ -745,10 +799,13 @@ SDK is the only reason this is one piece of work rather than three.
   desktop or a display: it runs as its parent's own Linux user, in a directory under that
   agent's workspace, so it needs no new sudoers rule. `parent_id` is what tells the two apart,
   and the desktop reconcile skips anything that has one — `start-desktop.sh` takes three digits,
-  and a worker's `display` is a placeholder above that range because the column is unique.
-- **A worker gets `run_command` and nothing else.** It shares its parent's X display, so giving
-  it the computer tool would put two loops on one mouse. It cannot spawn workers of its own and
-  nobody can `send_message` to it: it reads one brief, does the job and answers once.
+  and a worker's `display` is a placeholder above that range because the column is unique. The
+  one exception is a [goal helper](#goals-and-helpers) worker, which gets a real display of its
+  own, still under its parent's user, for as long as the goal is open.
+- **A worker gets `run_command`, `web_search` and `web_fetch`**, plus `computer` only when it has
+  a screen of its own. On its parent's display the computer tool would put two loops on one
+  mouse. It cannot spawn workers of its own and nobody can `send_message` to it: it reads one
+  brief, does the job and answers once. See [agent tools](#agent-tools).
 - Its brief is the first message of a thread of its own, so it never sees the conversation it
   was spawned out of, and the daemon derives its working directory from its name rather than
   letting the model choose a path. The directory is created before the row exists, so no worker
@@ -798,7 +855,9 @@ SDK is the only reason this is one piece of work rather than three.
   route answers 409. The refusal ends that turn in `waiting_for_user` — every call in the reply
   still gets its tool result first, because a reply answered by fewer results than it asked for
   is the broken shape restart recovery exists to repair. Returning control does not restart the
-  turn; the owner's next message does, the same answer restart recovery gives.
+  turn; the owner's next message does, the same answer restart recovery gives. The exception is
+  a screen the agent *asked* for with `ask_for_hands` or `request_form`: giving that back writes
+  the owner line and starts the turn.
 - Taking control **does not interrupt a tool call already in flight**. There would be no result
   to hand back, and a half-finished drag would leave a mouse button down; a computer action is
   bounded at 60s anyway. It refuses what the agent asks for next.
@@ -809,7 +868,8 @@ SDK is the only reason this is one piece of work rather than three.
 - Known ceiling: the proxy is a byte pipe with no backpressure and no RFB parsing, so a viewer
   that sends pointer and key events while it does not hold control is stopped by its own client
   rather than by the daemon. Enforcing view-only would need to filter RFB message types 4 and 5
-  out of a stream that is not message-framed.
+  out of a stream that is not message-framed. The recorder behind "Show how" does frame the
+  viewer's bytes, but only reads a copy of them; it filters nothing.
 
 ### Stopping a turn
 
@@ -847,10 +907,14 @@ SDK is the only reason this is one piece of work rather than three.
   agent can land between a call and its result, so a tool result answering a call from before
   the cut is kept. Summaries reaching past the cut are deleted, or the next turn would replay
   rows that no longer exist.
-- Known ceiling: only the thread is rewound. Files, commands, messages to other agents and
-  workers spawned in the deleted stretch stay as they are, and pending approvals asked for there
-  stay in the queue. Another client that has the deleted rows on screen keeps showing them
-  until it reopens the thread.
+- **Requirement** — the agents' **files can go back too**, with `files: true`, from the
+  workspace snapshots described under [snapshots](#snapshots-and-putting-files-back). A `GET` on
+  the same path with `?from=` is the confirmation's preview and changes nothing.
+- Known ceiling: what left the machine stays done — messages to other agents, mail, installs,
+  approved actions, filled forms, trigger fires — and the preview lists exactly those rather than
+  pretending otherwise. Workers spawned in the deleted stretch stay, and pending approvals asked
+  for there stay in the queue. Another client that has the deleted rows on screen keeps showing
+  them until it reopens the thread.
 
 ### Files, memory, search
 
@@ -869,14 +933,11 @@ SDK is the only reason this is one piece of work rather than three.
   agent, and read today's note. The prompt keeps the head of the file; the owner's screen shows
   more, because the lines past the cap are exactly what nobody could otherwise see. The daily
   note is shown and not edited: it is the agent's own log.
-- **Requirement** — `GET /api/search?q=` reads across every thread, `LIKE` over the rows, fifty
-  newest hits cut to a snippet, no image and no tool calls. A personal machine's threads are
-  small enough for a scan, and a search is a person's request rather than a poll.
 - **Requirement** — `GET .../events?limit=` answers the newest that many, oldest first. The log
   grows for the life of the install and a screen that polls it wants the tail; without a limit
   the route answers as before.
-- **Recommendation** — `POST /api/settings/test` makes one model call against the stored
-  provider settings with no tools. The first message otherwise found out for the owner a turn
+- **Recommendation** — `POST /api/settings/test` makes one model call against the default
+  model with no tools, as `POST /api/models/:id/test` does for any one. The first message otherwise found out for the owner a turn
   later, in an agent's thread, that the base URL had a typo.
 
 ### Push notifications
@@ -890,7 +951,7 @@ second copy of what an agent said, no bot token, no account with anybody but App
   rather than a dependency. One session per batch of devices, closed after.
 - **Requirement** — the provider token is an ES256 JWT over the key id and the team id, signed
   with the `.p8` key the owner pasted into settings, which is AES-GCM encrypted with the master
-  key like the provider key and never returned. The token is cached and re-minted after fifty
+  key like a model key and never returned. The token is cached and re-minted after fifty
   minutes: APNs refuses one older than an hour and throttles a client that mints one per push.
 - **Requirement** — a device registers its token through `POST /api/devices` on every launch,
   because Apple may hand it a new one, and a token APNs reports dead — a `410`, or a `400` with
@@ -898,16 +959,317 @@ second copy of what an agent said, no bot token, no account with anybody but App
   Every other failure is a log line and not retried: a push is a nudge, and the thread holds the
   truth.
 - **Requirement** — delivery hangs off the loop's one `deliver` seam: what a permanent agent said
-  at the end of a turn **in its own thread with the owner**, why a turn failed, and a deletion
-  request wherever it was made. A reply in a group is one agent talking to another and a
-  worker's report goes to its parent; neither is pushed. Nothing configured or nobody registered
-  is silence, never an error.
+  at the end of a turn **in its own thread with the owner** (its questions, a hand-over, a form
+  and a hung browser included), why a turn failed, and any approval or deletion request wherever
+  it was made. A reply in a group is one agent talking to another, a worker's report goes to its
+  parent and an idle pass delivers nothing; none is pushed. Nothing configured or nobody
+  registered is silence, never an error.
+- **Requirement** — a push about something waiting is **actionable**. The item the turn left is
+  found again at delivery time; the push carries its [Needs you](#needs-you) id and an APNs
+  category (`needs.approval`, `needs.delete`, `needs.yours`, `needs.watch`, `needs.open`) whose
+  buttons the app registers. A button answers through `POST /api/needs-you/:id/action`, which only
+  approves or denies; everything else opens the app. A plain reply is about nothing and carries
+  neither.
+- **Recommendation** — a permanent agent's turn is also an iOS **Live Activity**, sent from
+  `liveactivity.ts` over the same APNs client. The phone registers push-to-start and per-activity
+  tokens through `POST /api/live-activities`; a turn's start goes to every push-to-start token,
+  updates (its goal updated, an approval asked; throttled to one per five seconds) and the end go
+  to that agent's activity tokens, which are then dropped. One send chain per agent with a
+  strictly increasing timestamp, so an end never overtakes its start. The content is the goal's
+  title and step count, or the owner's last line, the number of waiting items and the state.
 - **Requirement** — `POST /api/settings/push/test` sends one push to every device, so the owner
   learns on the settings screen whether the key, the ids and the phone line up.
 - The app needs a real Apple team and the `aps-environment` entitlement on a device build to be
   handed a token at all. An ad-hoc build and the simulator register nothing, and the daemon then
   simply has nobody to push to; the sandbox switch is for a development-signed device build.
 - **Deferred** — other channels. The app is the client and the phone is where the owner is.
+
+### Agent tools
+
+Which built-in tools a turn is offered is decided in one place, the start of `runAgent`, by what
+kind of agent is running. Most permanent-only tools are also checked again at dispatch, so a
+worker naming one anyway gets the unknown-tool answer; an idle pass refuses everything outside
+its set.
+
+| Who | Tools |
+| --- | --- |
+| Permanent agent | `computer`, `run_command`, `send_message`, `spawn_task_worker`, `remember`, `schedule_task`, `list_schedules`, `pause_schedule`, `cancel_schedule`, `web_search`, `web_fetch`, `browser`, `request_approval`, `request_deletion`, `ask_owner`, `ask_for_hands`, `request_form`, `propose_trigger`, `update_goal`, `add_helper`, `set_profile`, `set_name`, then MCP tools |
+| Task worker | `run_command`, `web_search`, `web_fetch` |
+| Goal helper worker | the worker's three plus `computer`, on its own display |
+| Idle pass | `run_command`, `remember` (lasting only), `schedule_task` (a suggestion), `list_schedules`, `request_deletion`, `request_approval` (cleanups only), `leave_note` |
+
+- **Requirement** — `ask_owner`, `ask_for_hands` and `request_form` **end the turn** in
+  `waiting_for_user` whatever else the reply asked for, and so does a browser the watchdog could
+  not bring back. Every call in the reply still gets its result first.
+- **Requirement** — what an agent asks the owner for travels in the call's own arguments or in a
+  row keyed by the call. The waiting item is then *derived* from the thread, which is what
+  [Needs you](#needs-you) is.
+- A temporary goal helper is a permanent agent row and gets the permanent set, but `update_goal`
+  and `add_helper` refuse it: the lead keeps the plan.
+
+### Needs you
+
+**Requirement** — one list of everything waiting on the owner, `GET /api/needs-you`, which the
+app, the menu bar, the badge and the notification buttons all read. It is **derived on every
+read** from rows that already say so, and nothing about it is stored, so nothing has to be cleared.
+
+- Sources: standing approvals; a model whose key was refused; an agent's newest unanswered
+  `ask_owner`, `ask_for_hands` or `request_form` per thread; a browser the watchdog gave up on; an
+  IMAP trigger still without a login; an open goal with something "next from you"; a permanent
+  agent in `failed`. Items are sorted by when they arose.
+- **Requirement** — a call is waiting while its result is not an error and **no owner row**
+  (role `user`, no sender) follows it. That is the chat's own rule, so the list and the chat never
+  disagree. It is also why the lines the daemon writes on the owner's behalf — a filled form, the
+  screen given back, a restarted browser — carry no sender, and the lines it writes as itself —
+  `Trigger`, `Idle work` — do: the first kind answers the question, the second must not.
+- Every item has a stable id, `<kind>:<row id>`, and the actions it offers. Kinds and actions are
+  open strings on the wire, so an older app still counts what it cannot draw.
+- **Requirement** — `POST /api/needs-you/:id/action` exists for a notification button, which has
+  no app state behind it. It finds the item again by id, so one already answered is a 404 rather
+  than a second answer, and it answers only `approve`, `always` and `deny`, through the same
+  decision as `POST /api/approvals/:id`.
+- Known ceiling: a read walks every thread of every agent. Keep an "asked" row if that shows up.
+
+### Approvals and the rules ladder
+
+**Requirement** — an agent asks before it does something the owner may not want done without
+them, and the owner decides per agent what needs asking.
+
+- **Requirement** — `request_approval` (a category, a reason, and optionally a target, an amount
+  and a site) and `request_deletion` (an agent, or the thread it is in) both write an `approvals`
+  row through one path, capped at twenty standing across the install. **Nothing is performed by asking.** The
+  answer arrives as an owner line in the thread the agent asked in, with a turn.
+- **Requirement** — approving an *action* performs nothing either: the daemon cannot spend money
+  or send a message for the agent, so it tells it to go ahead. That is also why an action can be
+  answered while its asker is mid-turn, where a deletion is a 409.
+- **Requirement** — the ladder is four levels per category — on its own, if pre-approved, ask
+  first, hand to you — plus a pre-approved list of sites and recipients, in a nullable JSON column
+  on `agents` (null is the defaults). `GET`/`PUT /api/agents/:name/rules`; a worker has none and
+  runs under its parent's. **Passwords and security are always hand to you**, forced on read and
+  refused on write, and an approved request in a hand-to-you category tells the agent the owner
+  will do it themselves, never to go ahead.
+- **Requirement** — the rules reach the model as prompt text in the once-per-turn tail. **One of
+  them is enforced in code**: `guardCommand` runs before every `run_command` and reads deletes and
+  installs off the words in command position (behind `sudo`, `env`, `xargs`, `find -delete`,
+  `python -m pip` and the like). A refusal says exactly how to ask. `run_command` is the only
+  path it guards because there is no file-delete tool.
+- **Requirement** — approving a delete or an install grants a **one-shot pass** for that exact
+  category and target, spent only when the whole command may run, so a refused command never
+  costs an approval. "Always allow" exists only for a site or a message recipient — never a path,
+  a package or a password — and adds it to the pre-approved list.
+- Known ceiling: the guard is a heuristic for an agent that means well, not a sandbox. `bash -c`,
+  `eval`, a script, the computer tool and an MCP server all get past it; those stay prompt rules.
+
+### Hand-over, forms and teaching
+
+**Requirement** — some things only the owner should do on an agent's screen, and some things the
+owner knows that the agent must never see.
+
+- **Requirement** — `ask_for_hands` asks the owner to take the screen and ends the turn. Giving
+  the screen back (`DELETE .../control`) writes "the owner gave the screen back" and starts a turn
+  **only** when a hand-over or a form is waiting; an ordinary take-over is returned silently.
+- **Requirement** — `request_form` gives only a reason. **The daemon reads the form**, over CDP
+  from the agent's own Chromium, never the model. The origin shown to the owner is the one
+  Chromium reports for the top frame, not one the model wrote. Controls are tagged with a
+  per-read token and their values are never read. The result is a `forms` row keyed by the thread
+  and the call.
+- **Requirement** — a field is secret when it is a password or its autocomplete says
+  current/new password, one-time code or card data. A secret field on a page that is neither HTTPS
+  nor loopback is **not offered** and goes to the screen instead: its value would cross the
+  network in the clear.
+- **Requirement** — `POST /api/agents/:name/forms/:id` fills it (409 mid-turn). The page must still
+  be on the stored origin; each field is focused and checked to have focus before
+  `Input.insertText`, which types wherever focus is. Nothing is submitted. The agent then reads an
+  owner line naming the fields, secret ones marked hidden — **never a value**.
+- **Requirement** — `form_vault` remembers values per agent and origin when the owner ticks
+  Remember: the list of saved field keys in plain text, so the form can say "saved", the values
+  encrypted. A saved value fills only a field the owner left blank, and only when the owner presses
+  Fill; nothing is ever filled on the agent's say-so.
+- **Requirement** — secret values just typed are replaced by `[hidden]` in every tool result
+  before it is stored, so an agent reading the field back does not put it in its transcript.
+  Known ceiling: that list lives in memory, so after a restart a read-back is not hidden.
+- **Recommendation** — **teaching a skill**: `POST /api/agents/:name/recording` takes the screen
+  and records the owner's hands by tapping the bytes the viewer sends through the VNC proxy. The
+  parser skips the fixed handshake and stops trusting the stream at a message type it does not
+  know. Steps are kept in model coordinates with a few screenshots, capped at 200 steps, 12
+  pictures and 30 minutes. Giving the screen back saves `~/recordings/<time>/` as the agent and
+  hands it over in one owner line that asks the agent to write a `SKILL.md`, then a turn.
+- **Requirement** — typing in a recording is **secret when the Secret toggle is on, or when CDP
+  says the focused control is a password or secret field, a frame it cannot see into, or cannot
+  tell** — it fails closed. A secret run is stored with no text and no length. A secret that is
+  not a masked password stops screenshots for the rest of the recording and drops one taken while
+  it was typed. Known ceiling: typing outside the browser reads as not secret; a password typed
+  into a terminal is recorded unless the toggle is on.
+
+### Feedback
+
+- **Requirement** — `PUT /api/messages/:id/feedback` rates one agent reply up or down, with an
+  optional reason, or clears it with `null`. The `feedback` row is keyed on the message and
+  cascades with it, so a deleted thread, a rewind or a deleted agent takes it along.
+- **Requirement** — a thumbs down becomes a line under `## Feedback` in the answering agent's
+  `MEMORY.md` (a worker's goes to its parent), **before** it is stored: a failed write stores
+  nothing and answers 500, so pressing again retries. Memory is where the next turn looks anyway;
+  a second channel into the prompt would be one more thing to load.
+
+### Idle work
+
+**Recommendation** — an agent may use the hours the owner sleeps to tidy its own house, and it may
+not do anything the owner has to undo.
+
+- Settings are a nullable JSON column on `agents`: off by default, a window of hours, which
+  conditions count, a daily token budget, a model-call cap per pass, an optional model.
+  `GET`/`PUT /api/agents/:name/idle`; workers have none.
+- **Requirement** — **a pre-check costs no tokens.** Once per window, per agent, the tick asks the
+  database (new messages not its own, new feedback) and one shell probe (memory over the load cap,
+  stale files). No match is a `skipped` pass. A match is `due`, and starts only if the day's budget
+  is not spent, the agent is at rest and the loop cap has room; otherwise it stays `due` with the
+  reason and its signals carry to the next window.
+- **Requirement** — the turn is an ordinary runner turn in the agent's own thread, opened by a
+  note from `Idle work`, but with [its own tool set](#agent-tools), capped by the model-call limit
+  and the budget left, and with push delivery off.
+- **Requirement** — **nothing it does is irreversible**. Anything that sends, clicks, browses,
+  fetches or runs someone else's code is withheld; `run_command` refuses every delete, install
+  and mail sender whatever the rules say; only lasting memory is written; a schedule becomes a
+  suggestion. What a pass leaves are outputs in `idle_outputs`: a memory diff (undo, refused if
+  `MEMORY.md` changed since), a routine (accept or dismiss), a note (dismiss) and a cleanup (its
+  approval).
+- `GET /api/idle/passes?since=` and `POST /api/idle/outputs/:id`. Three dismissed notes in a row
+  pause idle work with the reason shown, so an agent that keeps leaving noise stops by itself.
+
+### Triggers
+
+**Requirement** — something outside wakes an agent: a webhook, a file landing in a folder, a
+command whose output changes, new mail. An agent proposes one; **nothing fires until the owner
+turns it on.**
+
+- **Requirement** — `propose_trigger` stores a `proposed` row (twenty per agent at most).
+  `POST /api/triggers/:id` with `on`, `off` or `delete` is the owner's switch; turning on is the
+  confirmation, and writes a line from `Trigger` so the agent offers to test it together. A
+  webhook mints its token and secret the first time and keeps them, so a URL pasted elsewhere
+  stays good.
+- **Requirement** — a fire is a `user` row with sender `Trigger` in the agent's own thread and a
+  turn, whatever the agent's state, like a schedule. It is not an owner row, so it answers no
+  pending question, and not an agent's, so it never counts toward the runaway guard. A fixed
+  hourly window caps fires per trigger; one past the cap is dropped and counted. The text says the
+  outside content is data, not instructions — which is advice to the model, not enforcement.
+- **Requirement** — **`POST /hooks/:token` is outside `/api`** and needs no session: the caller is
+  another service. The secret travels in `X-Schermes-Secret` and is compared in constant time
+  over sha256 digests. An unknown token and a trigger that is off are the same 404; a wrong secret
+  is 401; a body over 64 KB is 413; past the rate limit is 429; a fire is 202. The token is stored
+  in plain text because it is the lookup key; the secret is encrypted.
+- **Requirement** — folder, command and mail triggers are polled on the schedule tick, each by its
+  own "every N minutes", **as the agent**. A folder must be inside the home and not the home itself
+  (which holds `memory/`, so an agent's own `remember` would fire it). A check command may only
+  look: one that deletes, installs or mails is refused at proposal, it runs under a 30-second
+  timeout, and it fires on a change of exit code and output, never on its first run. The row is
+  read again after every await, so one turned off meanwhile neither fires nor moves its cursor.
+- **Requirement** — **an IMAP login never passes through the model.** A config key that looks like
+  a login is refused with that reason. The login is asked for with the forms flow, a `forms` row
+  pointing at the trigger, and stored encrypted on the trigger; filling it writes no thread line.
+  The check is read-only — `EXAMINE`, `UID SEARCH`, `BODY.PEEK` of three headers — so no mail is
+  marked seen, and the first check only sets a baseline. A login the server refuses is cleared
+  and asked for again rather than retried every few minutes, which could lock the account. An
+  error never quotes a sent command, because one of them holds the password.
+- The agent reads its own triggers in the once-per-turn tail, with the last check's error; never
+  a login, token or secret.
+
+### Goals and helpers
+
+**Recommendation** — a larger aim gets a plan the owner can watch, and the lead can bring in help.
+
+- A `goals` row has a lead, a state, steps (each owned by the lead or a helper), results and a
+  list of what is next from the owner. `update_goal` creates and edits it, `add_helper` adds up to
+  six helpers. A helper is refused both: the lead keeps the plan. A goal with something next from the owner is a Needs
+  you item; a change updates the lead's Live Activity.
+- **Requirement** — two kinds of helper. A **worker** is a task worker with a real display of its
+  own, still under the lead's Linux user, so it gets the computer tool without sharing a mouse. A
+  **temporary agent**, `<lead>-g<goal>-<n>`, is a permanent agent with its own Linux user and
+  desktop, the lead's rules and model, and a helper profile instead of an interview; it is briefed
+  in the lead's thread with it. The lead waits in `waiting_for_task_worker` or `waiting_for_agent`.
+- **Requirement** — finishing or deleting a goal (409 while an unkept helper is mid-turn) removes
+  what it brought in: a temporary agent is deleted with its desktop, a worker loses its display and
+  stays as an ordinary finished worker, because its report lives in the lead's thread. The owner
+  can **keep** a temporary agent, which makes it an ordinary agent that survives the goal.
+- Routes: `GET /api/goals`, `GET /api/goals/:id`, `POST /api/goals/:id/finish`,
+  `DELETE /api/goals/:id`, `POST /api/goals/:id/helpers/:name/keep`.
+
+### Search
+
+**Requirement** — `POST /api/search` takes a question, not a phrase, and searches messages, the
+agents' files and the text in stored pictures.
+
+- **Requirement** — the default model gets **only** the question, today's date and the agent
+  names, and answers with filters: kinds, an agent, a date range, words. Anything it says that
+  does not name a real agent, kind or date is dropped. With no model, a failed call or an
+  unreadable answer, the question's own words are searched; the answer says which happened.
+- **Requirement** — the index is FTS5, created outside the drizzle schema in a `--custom`
+  migration (drizzle generates the empty file, the SQL is filled in by hand). `messages_fts` is external content over `messages`, kept true by SQLite triggers, so
+  every write and every delete — a rewind included — updates it without any code remembering to.
+- `files_fts` is refreshed by a periodic `find` in each permanent agent's home **as that agent**,
+  dot entries skipped. `screenshots_fts` holds the text `tesseract` reads from stored pictures, a
+  few per pass, newest first; an empty text marks a picture read with nothing in it, and without
+  `tesseract` nothing is marked, so the pictures are read once it is installed.
+- Words become quoted prefix terms joined by `OR`; up to twenty hits per kind, merged newest first.
+
+### Snapshots and putting files back
+
+**Requirement** — a rewind can take an agent's files back to where the thread was.
+
+- **Requirement** — before every permanent agent's turn, idle ones included, one script run as
+  the agent snapshots its home into `~/.schermes-snapshots`: a manifest of size, mtime and path
+  and a tar of those files. Dot entries and `node_modules` are left out. An unchanged manifest
+  hard-links the previous tar. A snapshot is named after the newest message id when the turn
+  began, which is how a rewind finds the one from just before the cut. A failed snapshot is
+  logged and the turn goes on.
+- **Requirement** — `GET .../rewind?from=` is the preview: the rows that would go, each agent's
+  changed, deleted and new files, which agents have no snapshot, and what **cannot** be undone —
+  messages sent, mail, installs, approved actions, filled forms, trigger fires — read off the rows
+  being removed.
+- **Requirement** — `POST .../rewind` with `files: true` is all or nothing: every permanent
+  participant needs a snapshot, or it is a 409 with nothing touched. Files go back **first**,
+  because they can fail and deleting rows cannot, then the rows go, then one owner line per agent
+  says what was put back, before any retry turn reads the thread.
+- Snapshots older than seven days are pruned hourly. Known ceiling: a changed home is a full tar
+  per turn; a home of many gigabytes wants `rsync --link-dest`.
+
+### Forwarding and new agents
+
+- **Requirement** — `POST /api/agents/:name/forward` hands another agent a message, a file, or
+  both, with a note. A file is read as the agent whose home holds it (a worker's parent) and
+  written into the target's `~/uploads` through the upload path. The target gets one owner line
+  in its own thread and a turn. Capacity is checked before the copy and again after it, because
+  the copy awaited.
+- **Requirement** — `POST /api/agents/suggest` turns what the owner wants into a starting point
+  and **creates nothing**. The default model gets only the description; every field of its answer
+  is checked — the look against the shared shape and colour lists, the rule levels leniently but
+  passwords never loosened, the routine through the schedule parser, the name made free — and
+  without a model a plain fallback comes back.
+- **Requirement** — `POST /api/agents` with a `description` writes the chosen rules and routine,
+  starts an interview seeded with the description at once and brings the desktop up in the
+  background, because an interview needs no screen. A desktop that fails is logged and the agent
+  kept; the boot reconcile brings it up later. Without a description the old path — desktop first,
+  rolled back on failure — is unchanged.
+
+### Background work
+
+`main.ts` owns the boot order and every clock. Before the server starts: migrations, the old
+provider settings moved into the registry, restart recovery, the APNs key seeded from a file.
+Then the server starts, the desktop reconcile runs once it is listening, and five timers start.
+
+| Timer | Every | Does |
+| --- | --- | --- |
+| Schedules | the tick, one pass at boot | fires due `schedules` rows |
+| Idle work | the tick, one pass at boot | pre-checks and starts idle passes |
+| Triggers | the tick, one pass at boot | polls folder, command and mail triggers that are due |
+| Search index | 10 minutes, one pass at boot | rescans homes, reads a few pictures |
+| Snapshot pruner | hourly | deletes snapshots older than seven days |
+
+- **Requirement** — the idle, trigger and index passes await shell work, so each carries a
+  `running` flag and skips a tick that lands while the last pass is still going. The schedule
+  tick stays synchronous for the reason under [scheduled tasks](#scheduled-tasks); the hourly
+  pruner has none.
+- **Requirement** — every timer is `unref`'d and every pass catches its own errors: a failed pass
+  is a log line, never a dead daemon.
 
 ### Restart recovery
 
@@ -947,12 +1309,20 @@ second copy of what an agent said, no bot token, no account with anybody but App
 
 ### Secrets and logging
 
-- **Requirement** — the provider API key is AES-256-GCM encrypted with a 32-byte master key at
-  `/var/lib/schermes/master.key`, mode 0600, owned by `schermes`, generated on first boot. The
-  file is created with an exclusive open, so two daemons starting at once cannot both generate
-  a key and leave one of them unable to decrypt.
-- **Requirement** — the API key is never returned by the API. Reading settings reports
-  `apiKeySet` as a boolean and nothing else.
+- **Requirement** — every stored secret is AES-256-GCM encrypted with a 32-byte master key at
+  `/var/lib/schermes/master.key`, mode 0600, owned by `schermes`, generated on first boot: model
+  keys, the search key, the MCP server list, the APNs key, webhook secrets, IMAP logins and the
+  form vault's values. The file is created with an exclusive open, so two daemons starting at
+  once cannot both generate a key and leave one of them unable to decrypt.
+- **Requirement** — a key the owner typed is never returned by the API: models and settings
+  report `apiKeySet` and nothing else, MCP servers report secret *names*, an IMAP trigger reports
+  `hasLogin`, the form vault reports which fields are saved. The one secret the daemon mints
+  rather than receives, a webhook's, is shown to the owner so they can paste it elsewhere, and
+  never to the agent.
+- **Requirement** — a secret the owner enters for an agent **never reaches the model or the
+  transcript**. The rules for forms, the vault, IMAP logins and a recording's typed passwords are
+  under [hand-over, forms and teaching](#hand-over-forms-and-teaching) and
+  [triggers](#triggers).
 - **Requirement** — logs are structured JSON written through one function that recursively
   redacts secret-looking field names before serialising. Redaction is by key name, which cannot
   catch a secret pasted into free text, so routes do not log request bodies at all. That keeps
@@ -964,20 +1334,34 @@ second copy of what an agent said, no bot token, no account with anybody but App
 better-sqlite3, with Drizzle for the schema and the migrations. There is no second store, no
 cache and no queue: the rows are the queue.
 
-Ten tables, defined in `daemon/src/schema.ts`.
+Twenty-two tables are defined in `daemon/src/schema.ts`, and three full-text tables live beside
+them outside the drizzle schema.
 
 | Table                       | Holds                                                                 |
 | --------------------------- | --------------------------------------------------------------------- |
 | `owner`                     | One row: the scrypt hash of the owner password                        |
 | `sessions`                  | Session ids and their expiry, so a restart does not log you out       |
-| `settings`                  | Key/value, with an `encrypted` flag — the provider API key lives here  |
-| `agents`                    | Name, X display, durable state, and a worker's parent and thread      |
+| `settings`                  | Key/value with an `encrypted` flag: search, push, MCP, the default and backup model ids, refused-key markers |
+| `models`                    | The model registry: name, base URL, model id, extra body, encrypted key |
+| `agents`                    | Name, label, look, profile, X display, state, a worker's parent and thread, and JSON columns for rules, one-shot grants and idle settings, plus its model |
 | `conversations`             | A thread, identified only by its id                                   |
 | `conversation_participants` | Who is in a thread. The owner is in every one and is never listed     |
 | `messages`                  | Role, content, sender, tool calls, tool call id, an optional image    |
 | `summaries`                 | A compacted stretch of a thread, for one agent, and the ids it covers  |
 | `schedules`                 | A standing job for one agent: cron, prompt, paused, and when it is next due |
 | `events`                    | The structured record of what an agent did                            |
+| `approvals`                 | A standing request: kind, category, target, amount, site, reason      |
+| `devices`                   | APNs device tokens                                                    |
+| `live_activity_tokens`      | Push-to-start and per-activity tokens for Live Activities             |
+| `forms`                     | A form the daemon read for `request_form`, or an IMAP login request   |
+| `form_vault`                | Remembered form values per agent and origin, values encrypted         |
+| `feedback`                  | The owner's thumbs on one reply, cascading with the message           |
+| `idle_passes`               | One idle-work pass: what matched, the outcome, the reason, the tokens |
+| `idle_outputs`              | What a pass left: a memory diff, a routine, a note or a cleanup, and how it was resolved |
+| `triggers`                  | A proposed or live trigger, its rate window, cursor, last error, webhook token and encrypted secret or login |
+| `goals`                     | A goal: lead, state, steps, results, next from the owner              |
+| `goal_helpers`              | Which agents help which goal, of which kind, and whether kept         |
+| `messages_fts`, `files_fts`, `screenshots_fts` | FTS5 indexes for [search](#search), created by hand-written SQL in migration 0024 |
 
 - **Requirement** — durable state is the database, not the process. An agent's `state` column is
   the truth and the loop is a process that can be killed. What is deliberately *not* persisted
@@ -1005,9 +1389,12 @@ Ten tables, defined in `daemon/src/schema.ts`.
   named volume is seeded from the image with its ownership and modes, which is what keeps
   `master.key` at 0600 owned by `schermes`. Agent home directories are deliberately outside it:
   a recreated container rebuilds the Linux users and desktops from the surviving agent rows.
-- **Deferred** — retention and trimming. Nothing is ever deleted, so a long-lived install grows
-  monotonically. Reads are paged and model requests are bounded, so this is disk, not
-  correctness.
+- **Requirement** — `messages_fts` is kept by SQLite triggers on `messages`, not by the code that
+  writes rows. A migration that recreates `messages` has to recreate those triggers too.
+- **Deferred** — retention and trimming. Deletes happen only when someone asks — an agent or a
+  thread deleted, a rewind, a finished goal's helpers — and workspace snapshots are pruned after
+  seven days; the event log and old conversations otherwise grow for the life of the install.
+  Reads are paged and model requests are bounded, so this is disk, not correctness.
 
 ## Security model
 
@@ -1021,10 +1408,13 @@ What that leaves the product responsible for is the perimeter, and there is exac
   `5900 + display` and is reachable only through the daemon's proxy, which checks the session
   cookie *and* the input-ownership state before piping a byte. `infra/desktop/check.sh`
   enumerates listening sockets and fails if anything but the web port is bound off loopback.
-- **Requirement** — the auth guard is registered before any route and denies by default. Three
-  paths are public: health, first-run setup, and login. The static UI is public too, because it
-  is a login form until the API answers and putting it behind the session would only mean
-  serving a login page in front of the login page.
+- **Requirement** — the auth guard is registered on `/api/*` before any route and denies by
+  default. Three of its paths are public: health, first-run setup, and login.
+- **Requirement** — **one route outside `/api`**, `POST /hooks/:token`, takes requests from other
+  services with no session. It proves itself with a per-trigger secret in a header, compared in
+  constant time, and can do exactly one thing: fire a trigger the owner turned on, rate-limited,
+  with a capped body the agent is told to treat as data. See [triggers](#triggers). The VNC
+  WebSocket upgrade is the other non-`/api` path, and it checks the session itself.
 - **Requirement** — the daemon runs as the unprivileged `schermes` user with the two sudoers
   rules under [privilege model](#privilege-model), and nothing widens that.
 - **Requirement** — secrets at rest and out of logs, under
@@ -1036,6 +1426,17 @@ What that leaves the product responsible for is the perimeter, and there is exac
 - **Requirement** — third-party code the owner configures runs as the **agent's** Linux user and
   never as `schermes`. See [MCP](#mcp), which also says why that is a separation of duties rather
   than a boundary: the agent users have passwordless sudo already.
+- **Requirement** — **the owner's secrets stay out of the model.** A form is read and filled by
+  the daemon over CDP, the origin comes from Chromium rather than the model, a secret field is
+  offered only on HTTPS or loopback, and the agent learns which fields were filled, never a value.
+  An IMAP login is entered the same way and stored encrypted. A recording drops what was typed
+  into a secret field. See [hand-over, forms and teaching](#hand-over-forms-and-teaching). Known
+  ceiling: the agent still drives the browser the values were typed into, and has sudo; this keeps
+  secrets out of prompts, transcripts and the model provider, not away from a hostile agent.
+- **Requirement** — the rules ladder's hard limits (passwords are always the owner's, a delete or
+  install through `run_command` needs the level or a grant) and idle work's fence are enforced in
+  the daemon; the rest of the ladder is prompt text. See
+  [approvals and the rules ladder](#approvals-and-the-rules-ladder).
 - **Requirement** — the daemon binds `0.0.0.0`. It has to: the machine is reached over the
   network from the app. The port itself is the perimeter, so put a firewall or an authenticating proxy in
   front of anything not on a trusted network.
@@ -1051,14 +1452,15 @@ seconds after it boots. Boot it on a network you trust and claim it promptly.
 - **Requirement** — the session cookie is `HttpOnly`, `SameSite=Lax`, and deliberately **not**
   `Secure`: a `Secure` cookie is dropped over the plain HTTP the daemon speaks, so setting it
   would break login for every deployment without a TLS proxy.
-- **Deferred** — TLS inside the product, a credential vault beyond the encrypted settings row,
-  and any notion of a second user. See [deployment](deployment.md) for the proxy.
+- **Deferred** — TLS inside the product, a password manager beyond the per-site form vault, and
+  any notion of a second user. See [deployment](deployment.md) for the proxy.
 
 ## Clients
 
 **Requirement** — the daemon is an HTTP API and nothing else. It serves no static files and has
 no bundled front end; the native SwiftUI app in `apple/` is the client, and any other one talks
-to the same routes. Exactly one port is exposed, and everything on it is `/api`.
+to the same routes. Exactly one port is exposed, and everything on it is `/api`, except the VNC
+WebSocket and `/hooks/:token`. [`apple/README.md`](../apple/README.md) owns the app's own detail.
 
 - **Deferred** — the React + Vite web UI that used to be served off this port, removed once the
   native app reached parity. It cost a build stage in the image, a dev-dependency tree, and a
@@ -1067,7 +1469,7 @@ to the same routes. Exactly one port is exposed, and everything on it is `/api`.
   recoverable from this repository**: the UI was deleted while it was still uncommitted, so it
   is in no commit and `git log -- ui/` finds nothing.
 - **Recommendation** — a client learns that something changed by **polling**, not by a WebSocket
-  event stream. The daemon has no push side at all, so a stream would be a new module, a
+  event stream. A stream would be a new module on the daemon, a
   subscription registry and a reconnect story on both ends; a timer is none of those, it heals
   itself after a laptop sleep or a rebuild, and — because nothing on the server depends on it —
   closing the client cannot stop agent work. Push is the upgrade path if an install ever wants
@@ -1079,8 +1481,8 @@ to the same routes. Exactly one port is exposed, and everything on it is `/api`.
   than a page of base64 screenshots. `before` and `after` are alternatives; asking for both is a
   400. A reader that only shows *that* a row has a screenshot — the sidebar preview, polled for
   every agent — adds `images=0`, which keeps each image's media type and drops its bytes.
-- **Requirement** — view-only is enforced by the **client**. The VNC proxy is a byte pipe with
-  no RFB parser, so a viewer that does not hold control must not send pointer or key events; the
+- **Requirement** — view-only is enforced by the **client**. The VNC proxy is a byte pipe that
+  filters nothing, so a viewer that does not hold control must not send pointer or key events; the
   client suppresses input before the socket is opened and allows it only when the daemon says
   this client holds the desktop. Unknown ownership is view-only.
 - A **task worker** is nested under the agent that spawned it, opening a read-only transcript. It
@@ -1095,7 +1497,7 @@ to the same routes. Exactly one port is exposed, and everything on it is `/api`.
   daemon connection and about. Each category is its own page with its own Save, sending only the
   fields it owns — `PUT /api/settings` keeps every field a body leaves out — and each follows the
   platform's own convention for a settings surface rather than a look of its own. Every
-  write-only field takes blank as "keep the stored one", the provider key's rule, and that rule
+  write-only field takes blank as "keep the stored one", the model key's rule, and that rule
   lives in one place on the client side so it cannot drift between them.
 - **Scheduled tasks belong to one agent**, not to the install, so they sit beside that agent's
   chat and desktop. A client lists the rows with their next and last run, pauses and resumes
@@ -1124,6 +1526,14 @@ to the same routes. Exactly one port is exposed, and everything on it is `/api`.
   process is suspended and the push above is the answer; this is the Mac's story.
 - The owner can send a **picture** with a message, or as the whole message: base64 in the body
   the way a screenshot travels, PNG or JPEG.
+- The surfaces the redesign added all read the routes above and add no protocol of their own:
+  a **Needs you** page and badge (polling `/api/needs-you`, not `/api/approvals`), per-agent
+  **Rules**, **When idle** and **Routines and triggers** pages, a **Models** settings page, a
+  **goals** section in the sidebar, a **search** panel, restore and forward sheets, the form sheet,
+  and "Show how" on the desktop. Beyond the app itself there are actionable notifications, a
+  Live Activity widget and a share extension on iOS, and a menu bar panel and a Services entry on
+  the Mac. A notification button or a share runs without a logged-in window, so each signs in
+  with the stored address and Keychain password on its own.
 
 ## Docker
 
@@ -1179,12 +1589,10 @@ in about two seconds. Signalling every chromium process at once is what corrupts
 
 ## Deferred
 
-- Streaming model responses, a second provider, and a provider registry. One implementation
-  behind the seam, chosen by settings.
-- Trimming the event log and a retention policy for old conversations. Nothing is ever deleted,
-  so a long-lived install grows monotonically. Reads are paged and model requests are bounded,
-  so this is disk, not correctness.
-- Chromium CDP automation. The computer-use tools cover the MVP; CDP would be an add-on.
+- A second provider client. One implementation behind the seam; the registry varies only the
+  endpoint.
+- Trimming the event log and a retention policy for old conversations. See the
+  [persistence model](#persistence-model).
 - tmux-backed persistent terminals. The terminal tool runs one command at a time for now.
 - Desktop idle shutdown. Desktops stay up for the life of the daemon.
 - TLS inside the product. The compose file ships Caddy under the `domain` profile instead.

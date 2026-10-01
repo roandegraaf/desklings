@@ -45,7 +45,7 @@ function bytes(data: RawData): Buffer {
  * viewer that sends pointer and key events while it does not hold control is stopped by its own
  * client rather than by us — filtering RFB message types 4 and 5 would need a real parser.
  */
-function pipe(ws: WebSocket, vnc: Socket, agent: string): void {
+function pipe(ws: WebSocket, vnc: Socket, agent: string, tap?: (chunk: Buffer) => void): void {
   const stop = () => {
     vnc.destroy();
     ws.close();
@@ -58,7 +58,11 @@ function pipe(ws: WebSocket, vnc: Socket, agent: string): void {
     stop();
   });
 
-  ws.on('message', (data: RawData) => vnc.write(bytes(data)));
+  ws.on('message', (data: RawData) => {
+    const chunk = bytes(data);
+    tap?.(chunk);
+    vnc.write(chunk);
+  });
   ws.on('close', stop);
   ws.on('error', (error) => {
     log.error('vnc viewer failed', { agent, error });
@@ -70,7 +74,13 @@ function pipe(ws: WebSocket, vnc: Socket, agent: string): void {
  * The owner's window onto one agent's desktop, on the web port every other route is on and
  * behind the same session guard. `noServer` means this binds nothing of its own.
  */
-export function attachVncProxy(server: Upgradable, db: Db, dial: Dial = dialVnc): void {
+export function attachVncProxy(
+  server: Upgradable,
+  db: Db,
+  dial: Dial = dialVnc,
+  /** A reader of the viewer's input per socket, for "Show the agent how". */
+  tap?: (display: number) => (chunk: Buffer) => void,
+): void {
   const sockets = new WebSocketServer({ noServer: true });
 
   server.on('upgrade', (request, socket, head) => {
@@ -90,7 +100,7 @@ export function attachVncProxy(server: Upgradable, db: Db, dial: Dial = dialVnc)
 
     sockets.handleUpgrade(request, socket, head, (ws) => {
       log.info('vnc viewer connected', { agent: agent.name, display: agent.display });
-      pipe(ws, dial(agent.display), agent.name);
+      pipe(ws, dial(agent.display), agent.name, tap?.(agent.display));
     });
   });
 }

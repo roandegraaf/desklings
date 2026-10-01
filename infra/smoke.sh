@@ -96,6 +96,28 @@ req POST /api/auth/login "{\"password\":\"$password\"}"
 expect 200 "login"
 grep -q schermes_session "$tmp/jar" || fail "login did not set a session cookie"
 
+agent_one=smoke-one
+agent_two=smoke-two
+registry_name=smoke-registry
+registry_key='sk-registry-shouldnevershowup'
+
+# Before the settings round-trip: that writes whichever model is the default, and a leftover the
+# run made the default must not be the one it writes.
+say "no registry model is left over from an earlier run"
+req GET /api/models
+expect 200 "list models"
+keeper=$(jq -r --arg n "$registry_name" '[.[] | select(.name != $n)][0].id // empty' "$tmp/body")
+for stale in $(jq -r --arg n "$registry_name" '.[] | select(.name == $n) | .id' "$tmp/body"); do
+  for agent in "$agent_one" "$agent_two"; do req PUT "/api/agents/$agent/model" '{"id":null}'; done
+  if [ -n "$keeper" ]; then
+    req PUT /api/models/default "{\"id\":$keeper}"
+    expect 200 "move the default off leftover model $stale"
+  fi
+  req DELETE "/api/models/$stale"
+  expect 200 "remove model $stale, left behind by an earlier run"
+  echo "   removed leftover model $stale"
+done
+
 say "settings round-trip"
 req PUT /api/settings "{\"baseUrl\":\"$base_url\",\"model\":\"$model\",\"apiKey\":\"$api_key\"}"
 expect 200 "settings write"
@@ -118,8 +140,6 @@ else
   echo "   skipped: not running against a docker compose service"
 fi
 
-agent_one=smoke-one
-agent_two=smoke-two
 second_port=${SCHERMES_SMOKE_SECOND_PORT:-7778}
 # The second daemon runs one loop at a time, which is what lets the run hit the cap on purpose.
 # Caps are per process, so the daemon on $base is unaffected and keeps its own.
@@ -226,11 +246,101 @@ for agent in "$agent_one" "$agent_two"; do
     expect 200 "remove schedule $stale, left behind by an earlier run"
     echo "   removed a leftover schedule from $agent"
   done
+  req GET "/api/agents/$agent/triggers"
+  expect 200 "list $agent's triggers"
+  for stale in $(jq -r '.[].id' "$tmp/body"); do
+    req POST "/api/triggers/$stale" '{"action":"delete"}'
+    expect 200 "remove trigger $stale, left behind by an earlier run"
+    echo "   removed a leftover trigger from $agent"
+  done
 done
 
+# ---------------------------------------------------------------- the model registry
+
+say "a second model joins the registry and its key never comes back"
+req GET /api/models
+expect 200 "list models"
+first_default=$(jq -r '[.[] | select(.isDefault)][0].id // empty' "$tmp/body")
+[ -n "$first_default" ] || fail "the settings round-trip left no default model: $(body)"
+req POST /api/models \
+  "$(jq -nc --arg n "$registry_name" --arg u "$base_url" --arg m "$model-registry" --arg k "$registry_key" \
+     '{name: $n, baseUrl: $u, model: $m, apiKey: $k}')"
+expect 201 "create a model"
+grep -q shouldnevershowup "$tmp/body" && fail "the new model's key came back in the create response"
+registry_id=$(jq -r '.id' "$tmp/body")
+jq -e '.apiKeySet == true and .isDefault == false' "$tmp/body" >/dev/null \
+  || fail "the new model should have a key set and not be the default: $(body)"
+req GET /api/models
+expect 200 "list models with the new one"
+grep -q shouldnevershowup "$tmp/body" && fail "a key came back in the model listing"
+jq -e --argjson id "$registry_id" 'any(.[]; .id == $id and .apiKeySet)' "$tmp/body" >/dev/null \
+  || fail "the listing does not show model $registry_id with its key set: $(body)"
+echo "   model $registry_id listed with apiKeySet only"
+
+say "the default and the backup move, and the settings read the default"
+req PUT /api/models/default "{\"id\":$registry_id}"
+expect 200 "make the new model the default"
+jq -e --argjson id "$registry_id" '[.[] | select(.isDefault) | .id] == [$id]' "$tmp/body" >/dev/null \
+  || fail "model $registry_id is not the one default: $(body)"
+req GET /api/settings
+expect 200 "settings with the new default"
+jq -e --arg m "$model-registry" '.model == $m' "$tmp/body" >/dev/null \
+  || fail "the settings do not read the new default: $(body)"
+req PUT /api/models/backup "{\"id\":$first_default}"
+expect 200 "make the old default the backup"
+jq -e --argjson id "$first_default" '[.[] | select(.isBackup) | .id] == [$id]' "$tmp/body" >/dev/null \
+  || fail "model $first_default is not the backup: $(body)"
+req PUT /api/models/backup '{"id":null}'
+expect 200 "no backup"
+jq -e 'all(.[]; .isBackup | not)' "$tmp/body" >/dev/null || fail "a backup is still set: $(body)"
+# Back before anything below: the stub and the rebuild checks write and read "the default".
+req PUT /api/models/default "{\"id\":$first_default}"
+expect 200 "put the default back"
+echo "   default and backup moved, and put back"
+
+say "a model an agent uses cannot be deleted"
+req PUT "/api/agents/$agent_one/model" "{\"id\":$registry_id}"
+expect 200 "assign the new model to $agent_one"
+jq -e --argjson id "$registry_id" '.modelId == $id' "$tmp/body" >/dev/null \
+  || fail "$agent_one is not on model $registry_id: $(body)"
+req DELETE "/api/models/$registry_id"
+expect 409 "delete a model in use"
+jq -e --arg a "$agent_one" '.error | test($a + ".* still use")' "$tmp/body" >/dev/null \
+  || fail "the refusal does not name $agent_one: $(body)"
+req PUT "/api/agents/$agent_one/model" '{"id":null}'
+expect 200 "put $agent_one back on the default"
+jq -e 'has("modelId") | not' "$tmp/body" >/dev/null || fail "$agent_one still has a model: $(body)"
+req DELETE "/api/models/$registry_id"
+expect 200 "delete the unused model"
+echo "   409 while $agent_one used it, deleted once it did not"
+
+if [ "$harness" = true ]; then
+  compose logs --no-color schermes 2>/dev/null | grep -q shouldnevershowup \
+    && fail "a model key appears in the daemon log"
+fi
+
+# ---------------------------------------------------------------- rules
+
+say "the owner reads and sets $agent_one's rules, and passwords stay the owner's"
+req PUT "/api/agents/$agent_one/rules" '{"levels":{"delete_files":"ask_first"},"preApproved":[]}'
+expect 200 "set $agent_one's rules"
+req GET "/api/agents/$agent_one/rules"
+expect 200 "read $agent_one's rules"
+jq -e '.levels.delete_files == "ask_first" and .levels.passwords_security == "hand_to_you" and .preApproved == []' \
+  "$tmp/body" >/dev/null || fail "the rules did not round-trip: $(body)"
+req PUT "/api/agents/$agent_one/rules" '{"levels":{"passwords_security":"on_its_own"}}'
+expect 400 "hand passwords to the agent"
+req PUT "/api/agents/$agent_one/rules" '{"preApproved":["Example.com","example.com"]}'
+expect 200 "a pre-approved site"
+jq -e '.preApproved == ["example.com"]' "$tmp/body" >/dev/null || fail "the list was not lowercased and deduped: $(body)"
+req PUT "/api/agents/$agent_one/rules" '{"preApproved":[]}'
+expect 200 "clear the list"
+echo "   Ask first for deletes, passwords refused, the list lowercased and deduped"
+
 if [ "$harness" != true ]; then
-  printf '\nOK: health, setup, login, auth guard, settings and the agents API all behave\n'
-  printf '    (desktop assertions skipped: not running against a docker compose service)\n'
+  printf '\nOK: health, setup, login, auth guard, settings, the model registry, rules and the agents API\n'
+  printf '    all behave (skipped, as they need the docker compose service: desktops, agent turns, the\n'
+  printf '    rules refusal, approvals and Needs you, the webhook trigger and search)\n'
   exit 0
 fi
 
@@ -616,24 +726,39 @@ req GET "/api/agents/$agent_one/events"
 expect 200 "events before the turn"
 last_event=$(jq -r '[.[].id] | max // 0' "$tmp/body")
 
-# Polls until an agent stops working and leaves the answer in $state. Not a subshell: `fail`
-# has to be able to end the run from in here.
+# The newest event of an agent that a settle has already accounted for. Waiting for the owner is
+# also the state a turn starts from, and the snapshot before it can take seconds, so a settle is
+# only done once a turn has ended past the mark. Seeded here so a re-run ignores the last run's.
+mark_turns() { req GET "/api/agents/$1/events?limit=1"; jq -r '.[0].id // 0' "$tmp/body" > "$tmp/mark-$1"; }
+mark_turns "$agent_one"
+mark_turns "$agent_two"
+
+# Polls until an agent has finished a turn since the last settle and leaves the answer in $state.
+# Not a subshell: `fail` has to be able to end the run from in here.
 settle() {
-  local agent=$1 _
+  local agent=$1 mark _
+  mark=$(cat "$tmp/mark-$agent")
   state=''
   for _ in $(seq 180); do
     req GET "/api/agents/$agent"
     state=$(jq -r '.state' "$tmp/body")
     case $state in
-      waiting_for_user|waiting_for_agent) return 0 ;;
+      waiting_for_user|waiting_for_agent)
+        req GET "/api/agents/$agent/events?limit=200"
+        if jq -e --argjson m "$mark" 'any(.[]; .id > $m and .type == "turn")' "$tmp/body" >/dev/null; then
+          jq -r '[.[].id] | max' "$tmp/body" > "$tmp/mark-$agent"
+          return 0
+        fi
+        ;;
       failed)
-        req GET "/api/agents/$agent/events"
-        fail "$agent failed: $(jq -c '[.[] | select(.type == "failure")] | last' "$tmp/body")"
+        req GET "/api/agents/$agent/events?limit=200"
+        jq -e --argjson m "$mark" 'any(.[]; .id > $m and .type == "turn")' "$tmp/body" >/dev/null \
+          && fail "$agent failed: $(jq -c '[.[] | select(.type == "failure")] | last' "$tmp/body")"
         ;;
     esac
     sleep 1
   done
-  fail "$agent is $state and never settled"
+  fail "$agent is $state and never finished a turn"
 }
 
 say "posting a message to $agent_one"
@@ -665,7 +790,7 @@ jq -e --arg n "$nonce" '
 answer=$(jq -r '[.[] | select(.role == "assistant")] | last | .content' "$tmp/body")
 echo "   the agent answered: $answer"
 for want in "nonce=$nonce" "model=$stub_model" 'auth=yes' 'system=yes' 'png=yes' \
-            'tools=ask_owner,browser,cancel_schedule,computer,list_schedules,pause_schedule,remember,request_deletion,run_command,schedule_task,send_message,set_profile,spawn_task_worker,web_fetch,web_search' 'valid=yes'; do
+            'tools=add_helper,ask_for_hands,ask_owner,browser,cancel_schedule,computer,list_schedules,pause_schedule,propose_trigger,remember,request_approval,request_deletion,request_form,run_command,schedule_task,send_message,set_name,set_profile,spawn_task_worker,update_goal,web_fetch,web_search' 'valid=yes'; do
   case $answer in
     *"$want"*) ;;
     *) fail "the model never saw $want — it reported: $answer" ;;
@@ -1246,11 +1371,15 @@ echo "   $asked tool calls, $answered results, and the model accepted the transc
 
 # ---------------------------------------------------------------- memory and skills
 
-say "a search finds what was said, across every thread"
-req GET "/api/search?q=$(printf '%s' "$nonce" | jq -sRr @uri)"
+say "a question finds what was said, across every thread"
+# The stub's reply is not filters, so this is the plain-text fallback the daemon falls back to.
+req POST /api/search "$(jq -nc --arg q "$nonce" '{q: $q}')"
 expect 200 "search"
-jq -e --arg a "$agent_one" '[.[] | select(.participants == [$a])] | length > 0' "$tmp/body" >/dev/null \
+jq -e '(.understoodAs | length) > 0 and (.byModel | type) == "boolean"' "$tmp/body" >/dev/null \
+  || fail "the answer does not say what the question was understood as: $(body | head -c 300)"
+jq -e --arg a "$agent_one" 'any(.hits[]; .kind == "message" and .participants == [$a])' "$tmp/body" >/dev/null \
   || fail "the nonce was said in $agent_one's thread and not found: $(body | head -c 300)"
+echo "   understood as: $(jq -r '.understoodAs | join("; ")' "$tmp/body")"
 req GET "/api/agents/$agent_one/events"
 expect 200 "the whole event log"
 newest_three=$(jq -c '[.[-3:][] | .id]' "$tmp/body")
@@ -1303,7 +1432,7 @@ settle "$agent_one"
 req GET "/api/agents/$agent_one/messages"
 expect 200 "the transcript after the restart"
 remembered=$(jq -r '[.[] | select(.role == "assistant")] | last | .content' "$tmp/body")
-for want in 'memory=yes' 'skills=deploy' 'tools=ask_owner,browser,cancel_schedule,computer,list_schedules,pause_schedule,remember,request_deletion,run_command,schedule_task,send_message,set_profile,spawn_task_worker,web_fetch,web_search'; do
+for want in 'memory=yes' 'skills=deploy' 'tools=add_helper,ask_for_hands,ask_owner,browser,cancel_schedule,computer,list_schedules,pause_schedule,propose_trigger,remember,request_approval,request_deletion,request_form,run_command,schedule_task,send_message,set_name,set_profile,spawn_task_worker,update_goal,web_fetch,web_search'; do
   case $remembered in
     *"$want"*) ;;
     *) fail "the model never saw $want — it reported: $remembered" ;;
@@ -1428,8 +1557,104 @@ case $web_answer in
 esac
 echo "   and the turn carried on and answered: $(printf '%s' "$web_answer" | cut -c1-60)..."
 
+# ---------------------------------------------------------------- rules, approvals, Needs you, a webhook
+
+guarded_file=smoke-guarded.txt
+hook_nonce="$nonce-hook"
+
+# A denial starts a turn in the asker's thread, so any leftover is answered with a stub that only
+# reports: the guarded script below counts its calls from the first.
+say "no approval is left over from an earlier run"
+start_stub true 5000 memory
+req GET /api/approvals
+expect 200 "list approvals"
+for stale in $(jq -r --arg a "$agent_one" '.[] | select(.agent == $a) | .id' "$tmp/body"); do
+  req POST "/api/approvals/$stale" '{"approve":false}'
+  expect 200 "deny approval $stale, left behind by an earlier run"
+  settle "$agent_one"
+  echo "   denied a leftover approval"
+done
+
+say "$agent_one's delete is refused by its rules and nothing is removed"
+run_cmd "touch ~/$guarded_file"
+expect 200 "create the file the agent will try to delete"
+start_stub "rm -f ~/$guarded_file" 30000 guarded "$agent_one"
+req GET "/api/agents/$agent_one/messages"
+expect 200 "the thread before the guarded turn"
+guarded_before=$(jq -r '[.[].id] | max // 0' "$tmp/body")
+req POST "/api/agents/$agent_one/messages" '{"text":"Clear out your scratch file, and set up a way for me to wake you."}'
+expect 202 "post the message that makes it delete"
+settle "$agent_one"
+[ "$state" = waiting_for_user ] || fail "$agent_one is $state after the guarded turn, not waiting"
+req GET "/api/agents/$agent_one/messages?after=$guarded_before"
+expect 200 "the thread after the guarded turn"
+refused=$(jq -r '[.[] | select(.role == "tool")][0].content' "$tmp/body")
+case $refused in
+  *"rules say to ask the owner"*"Nothing was run"*) ;;
+  *) fail "the delete was not refused by the rules, the tool said: $refused" ;;
+esac
+run_cmd "test -f ~/$guarded_file"
+expect 200 "look for the file"
+jq -e '.exitCode == 0' "$tmp/body" >/dev/null || fail "the refused delete removed the file anyway"
+echo "   $(printf '%s' "$refused" | cut -c1-90)..."
+
+say "the approval it asked for waits under Needs you, and answering it clears it everywhere"
+req GET /api/approvals
+expect 200 "list approvals"
+approval_id=$(jq -r --arg n "$nonce" '[.[] | select(.target == $n and .category == "delete_files")][0].id // empty' "$tmp/body")
+[ -n "$approval_id" ] || fail "$agent_one's request_approval left no approval: $(body | head -c 300)"
+req GET /api/needs-you
+expect 200 "Needs you"
+jq -e --arg id "approval:$approval_id" 'any(.[]; .id == $id and (.actions | index("deny")))' "$tmp/body" >/dev/null \
+  || fail "approval $approval_id is not under Needs you with a deny action: $(body | head -c 300)"
+# Denied, not approved: an approval is a one-shot pass, and the next run's delete must be refused too.
+req POST "/api/needs-you/approval:$approval_id/action" '{"action":"deny"}'
+expect 200 "deny from Needs you"
+settle "$agent_one"
+req GET /api/needs-you
+expect 200 "Needs you after the answer"
+jq -e --arg id "approval:$approval_id" 'all(.[]; .id != $id)' "$tmp/body" >/dev/null \
+  || fail "approval $approval_id is still under Needs you"
+req GET /api/approvals
+expect 200 "approvals after the answer"
+jq -e --argjson id "$approval_id" 'all(.[]; .id != $id)' "$tmp/body" >/dev/null \
+  || fail "approval $approval_id is still listed"
+req POST "/api/needs-you/approval:$approval_id/action" '{"action":"deny"}'
+expect 404 "a second answer to the same item"
+echo "   approval:$approval_id listed, denied, and gone"
+
+say "the webhook it proposed fires a turn once the owner turns it on"
+req GET "/api/agents/$agent_one/triggers"
+expect 200 "$agent_one's triggers"
+trigger_id=$(jq -r --arg n "$nonce" \
+  '[.[] | select(.kind == "webhook" and .state == "proposed" and (.reason | contains($n)))][0].id // empty' "$tmp/body")
+[ -n "$trigger_id" ] || fail "$agent_one's propose_trigger left no proposed webhook: $(body | head -c 300)"
+req POST "/api/triggers/$trigger_id" '{"action":"on"}'
+expect 200 "turn the trigger on"
+hook_path=$(jq -r '.webhook.path // empty' "$tmp/body")
+hook_secret=$(jq -r '.webhook.secret // empty' "$tmp/body")
+[ -n "$hook_path" ] && [ -n "$hook_secret" ] || fail "turning the webhook on minted no url and secret: $(body)"
+settle "$agent_one"
+# Plain curl, no cookie jar: the caller is another service with a secret, not the owner.
+hook() { curl -sS -o "$tmp/body" -w '%{http_code}' -X POST "$@" --data "$hook_nonce" "$base$hook_path"; }
+[ "$(hook)" = 401 ] || fail "a hook with no secret was not refused: $(body)"
+[ "$(hook -H 'x-schermes-secret: wrong')" = 401 ] || fail "a hook with the wrong secret was not refused: $(body)"
+[ "$(hook -H "x-schermes-secret: $hook_secret")" = 202 ] || fail "the hook with its secret did not fire: $(body)"
+settle "$agent_one"
+req GET "/api/agents/$agent_one/messages?after=$guarded_before"
+expect 200 "the thread after the hook"
+jq -e --arg p "Trigger $trigger_id fired:" --arg n "$hook_nonce" \
+  'any(.[]; .sender == "Trigger" and (.content | startswith($p)) and (.content | contains($n)))' "$tmp/body" >/dev/null \
+  || fail "no fired row carrying the request body in $agent_one's thread: $(body | head -c 400)"
+req POST "/api/triggers/$trigger_id" '{"action":"delete"}'
+expect 200 "delete the trigger"
+[ "$(hook -H "x-schermes-secret: $hook_secret")" = 404 ] || fail "a deleted hook still answered: $(body)"
+echo "   401 without the secret, 202 with it, and the fired row is in $agent_one's thread"
+run_cmd "rm -f ~/$guarded_file"
+expect 200 "clean up the guarded file"
+
 printf '\nOK: health, setup, login, auth guard, an api-only surface on the one exposed port,\n'
-printf '    settings, two agents with adopted desktops,\n'
+printf '    settings, the model registry, rules, two agents with adopted desktops,\n'
 printf '    a tool layer that screenshots, drives input, uses the clipboard and runs commands,\n'
 printf '    an agent loop that reaches a model, calls both tools and answers durably,\n'
 printf '    a message taken by a busy agent, two agents holding a conversation the owner can\n'
@@ -1439,5 +1664,7 @@ printf '    owner and an agent stood down while a human held its mouse, and a da
 printf '    tool call whose agent comes back repaired and answerable, and an agent that\n'
 printf '    remembers a fact, survives a restart and is handed it back in its next prompt, and a\n'
 printf '    scheduled task that fired on the clock the daemon keeps, into the owner thread\n'
-printf '    and a web_fetch that refused the daemon its own address before making a request\n'
+printf '    and a web_fetch that refused the daemon its own address before making a request,\n'
+printf '    a question answered by search, a delete refused by the rules, an approval answered\n'
+printf '    from Needs you, and a webhook trigger that fired a turn\n'
 

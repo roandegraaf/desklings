@@ -13,7 +13,7 @@ extension AgentState {
         case .using_terminal: .comet
         case .waiting_for_user: .idle
         case .waiting_for_agent, .waiting_for_task_worker: .wide
-        case .failed: .exclaim
+        case .failed: .failed
         case .completed: .sleep
         case .idle: .idle
         }
@@ -37,8 +37,8 @@ extension BloubStateId {
     }
 
     /// How far the pointer can swing this face's gaze, as a share of `BloubLook.followTurn`; nil
-    /// where it cannot. Only faces whose eyes hold still follow: thinking, failed and completed
-    /// show no eyes at all, and orbit and comet fly them round the ball as the clip. `wide` and
+    /// where it cannot. Only faces whose eyes hold still follow: thinking and completed show no
+    /// eyes at all, failed crosses them, and orbit and comet fly them round the ball as the clip. `wide` and
     /// `notify` have the biggest eyes, and on a capsule or a triangle the full swing puts them
     /// through the edge wherever the face is placed.
     nonisolated var pointerReach: Double? {
@@ -118,47 +118,6 @@ nonisolated final class BloubPlayer {
             following = false
         }
         return engine.sample(now, decorStill: reduceMotion)
-    }
-}
-
-/// An agent's look: a body shape and a colour from bloub's catalogue. Stored on the daemon as
-/// `Agent.look`, in the `token` form, so every device draws the same avatar; kept locally too,
-/// so the list has a look before the first poll answers.
-struct BloubIdentity: Codable, Equatable, Sendable {
-    var shape: BloubShapeId
-    var color: BloubColorId
-
-    /// The daemon's opaque form: `shape:colour`. A token from a newer catalogue that this build
-    /// cannot read is left alone rather than overwritten, so `init` is failable.
-    var token: String { "\(shape.rawValue):\(color.rawValue)" }
-
-    init(shape: BloubShapeId, color: BloubColorId) {
-        self.shape = shape
-        self.color = color
-    }
-
-    init?(token: String) {
-        let parts = token.split(separator: ":", maxSplits: 1).map(String.init)
-        guard parts.count == 2,
-              let shape = BloubShapeId(rawValue: parts[0]),
-              let color = BloubColorId(rawValue: parts[1])
-        else { return nil }
-        self.init(shape: shape, color: color)
-    }
-
-    /// The look an agent has before anyone picks one. Derived from the name, so an agent seen for
-    /// the first time already looks like itself and still does after a relaunch — `hashValue` is
-    /// seeded per process and would not. Shape and colour are read off different parts of the same
-    /// hash, so the two do not move together.
-    static func standard(for name: String) -> BloubIdentity {
-        var hash: UInt64 = 5381
-        for byte in name.utf8 { hash = (hash &* 33) &+ UInt64(byte) }
-        let shapes = BloubShapeId.allCases
-        let colors = BloubColorId.allCases
-        return BloubIdentity(
-            shape: shapes[Int(hash % UInt64(shapes.count))],
-            color: colors[Int((hash / UInt64(shapes.count)) % UInt64(colors.count))]
-        )
     }
 }
 

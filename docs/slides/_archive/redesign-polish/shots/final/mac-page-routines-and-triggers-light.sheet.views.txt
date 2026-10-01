@@ -1,0 +1,58 @@
+NSThemeFrame (0.0, 0.0, 720.0, 600.0) layer=NSViewBackingLayer
+  NSVisualEffectView (0.0, 0.0, 720.0, 600.0) layer=NSViewBackingLayer
+  BackdropView (0.0, 0.0, 0.0, 0.0) layer=CABackdropLayer
+  SheetHostingView<SheetContent> (0.0, 0.0, 720.0, 600.0) layer=NSViewBackingLayer
+    _FocusRingView (20.0, 554.0, 30.0, 30.0) layer=NSViewBackingLayer
+    _FocusRingView (643.0, 554.0, 57.0, 30.0) layer=NSViewBackingLayer
+    PlatformContainer (0.0, 0.0, 720.0, 542.0) layer=NSViewBackingLayer
+      HostingScrollView (0.0, 0.0, 720.0, 542.0) layer=NSViewBackingLayer
+        HostingClipView (0.0, 0.0, 720.0, 542.0) layer=NSViewBackingLayer
+          DocumentView (0.0, 9.0, 720.0, 533.0) layer=NSViewBackingLayer
+            PlatformGroupContainer (0.0, 9.0, 720.0, 533.0) layer=NSViewBackingLayer
+              _NSGraphicsView (36.0, 298.0, 648.0, 89.0) layer=NSViewBackingLayer
+                AppKitPlatformViewHost<PlatformViewRepresentableAdaptor<Switch>> (630.0, 361.0, 54.0, 24.0) layer=NSViewBackingLayer
+                  PlatformSwitch (630.0, 361.0, 54.0, 24.0) layer=NSViewBackingLayer
+                    _NSCoreHostingView<AppKitSwitch> (630.0, 361.0, 54.0, 24.0) layer=NSViewBackingLayer
+              AppKitPlatformViewHost<PlatformViewRepresentableAdaptor<SwipeTrackpadScrollAdapter>> (36.0, 298.0, 648.0, 89.0) layer=NSViewBackingLayer
+                SwipeScrollHostView (36.0, 298.0, 648.0, 89.0) layer=NSViewBackingLayer
+              AppKitPlatformViewHost<PlatformViewRepresentableAdaptor<PlatformTextFieldAdaptor>> (170.0, 180.0, 514.0, 24.0) layer=NSViewBackingLayer
+                AppKitTextField (170.0, 180.0, 514.0, 24.0) layer=NSViewBackingLayer
+                  _NSCoreHostingView<AppKitTextField> (170.0, 180.0, 514.0, 24.0) layer=NSViewBackingLayer
+                  NSSimpleLabel (174.0, 184.0, 506.0, 16.0) layer=NSViewBackingLayer hidden
+                  _NSKeyboardFocusClipView (174.0, 184.0, 506.0, 16.0) layer=NSViewBackingLayer
+                    _SystemTextFieldFieldEditor (174.0, 184.0, 506.0, 16.0) layer=NSViewBackingLayer
+                      _NSTextSelectionView (174.0, 184.0, 506.0, 16.0) layer=NSViewBackingLayer
+                        _NSTextViewportSelectionLineView (176.0, 176.0, 71.0, 24.0) layer=NSViewBackingLayer bg=<CGColor 0x750124f640> [<CGColorSpace 0x105701fd0> (kCGColorSpaceICCBased; kCGColorSpaceModelRGB; sRGB IEC61966-2.1)] headroom = 1.000000 ( 0.862745 0.862745 0.862745 1 ) hidden
+                      _NSTextRenderingSurfacesGroupView (174.0, 184.0, 506.0, 16.0) layer=NSViewBackingLayer
+                      _NSTextContentView (174.0, 184.0, 506.0, 16.0) layer=NSViewBackingLayer
+              AppKitPlatformViewHost<PlatformViewRepresentableAdaptor<PlatformTextFieldAdaptor>> (36.0, 119.0, 648.0, 40.0) layer=NSViewBackingLayer
+                AppKitTextField (36.0, 119.0, 648.0, 40.0) layer=NSViewBackingLayer
+                  _NSCoreHostingView<AppKitTextField> (36.0, 119.0, 648.0, 40.0) layer=NSViewBackingLayer
+                  NSSimpleLabel (40.0, 123.0, 640.0, 32.0) layer=NSViewBackingLayer
+              _FocusRingView (36.0, 62.0, 124.0, 36.0) layer=NSViewBackingLayer
+        NSScroller (0.0, 442.0, 0.0, 100.0) layer=NSViewBackingLayer hidden
+    KeyViewProxy (20.0, 554.0, 30.0, 30.0) layer=NSViewBackingLayer
+    KeyViewProxy (643.0, 554.0, 57.0, 30.0) layer=NSViewBackingLayer
+  NSTitlebarContainerView (0.0, 600.0, 720.0, 0.0) layer=NSViewBackingLayer
+    NSTitlebarBackgroundView (0.0, 600.0, 720.0, 0.0) layer=NSViewBackingLayer
+      NSScrollPocket (0.0, 600.0, 720.0, 0.0) layer=NSViewBackingLayer
+        PocketMask (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer hidden
+          NSView (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer
+            NSView (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer bg=<CGColor 0x74fc58ad00> [<CGColorSpace 0x7502ca40c0> (kCGColorSpaceICCBased; kCGColorSpaceModelMonochrome; Generic Gray Gamma 2.2 Profile)] ( 0 1 ) hidden
+        PocketBlur (0.0, 600.0, 0.0, 0.0) layer=CABackdropLayer hidden
+          PortalView (0.0, 600.0, 0.0, 0.0) layer=CAPortalLayer
+        NSHardPocketView (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer hidden
+          _NSLayerBasedFillColorView (0.0, 600.0, 0.0, 1.0) layer=NSViewBackingLayer bg=<CGColor 0x74fc600af0> [<CGColorSpace 0x105701fd0> (kCGColorSpaceICCBased; kCGColorSpaceModelRGB; sRGB IEC61966-2.1)] headroom = 1.000000 ( 0 0 0 0.05 )
+        LuminanceAdjustment (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer hidden
+          NSView (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer
+            NSView (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer
+              BackdropView (0.0, 600.0, 0.0, 0.0) layer=CABackdropLayer hidden
+              _NSScrollViewContentBackgroundView (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer
+                NSVisualEffectView (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer
+            NSView (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer
+              NSView (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer bg=<CGColor 0x74fc58ae80> [<CGColorSpace 0x7502ca40c0> (kCGColorSpaceICCBased; kCGColorSpaceModelMonochrome; Generic Gray Gamma 2.2 Profile)] ( 0 1 )
+              NSView (0.0, 600.0, 0.0, 0.0) layer=NSViewBackingLayer bg=<CGColor 0x74fc58adc0> [<CGColorSpace 0x7502ca40c0> (kCGColorSpaceICCBased; kCGColorSpaceModelMonochrome; Generic Gray Gamma 2.2 Profile)] ( 1 1 )
+          PortalView (0.0, 600.0, 0.0, 0.0) layer=CAPortalLayer
+    NSTitlebarView (0.0, 600.0, 720.0, 0.0) layer=NSViewBackingLayer
+      NSView (0.0, 600.0, 720.0, 0.0) layer=CABackdropLayer
+    _NSTitlebarDecorationView (0.0, 600.0, 720.0, 0.0) layer=NSViewBackingLayer

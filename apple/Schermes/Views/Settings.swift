@@ -4,6 +4,9 @@ import SwiftUI
 /// settings object and saves only the fields it owns: `PUT /api/settings` keeps every field a
 /// body leaves out.
 enum SettingsCategory: String, CaseIterable, Identifiable {
+    /// The Mac settings sheet's last tab.
+    static let storageKey = "schermes.settingsTab"
+
     case model
     case web
     case notifications
@@ -15,7 +18,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .model: "Model"
+        case .model: "Models"
         case .web: "Web search"
         case .notifications: "Notifications"
         case .plugins: "Plugins"
@@ -34,10 +37,22 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         case .about: "info.circle"
         }
     }
+
+    /// The tile behind the symbol on the iOS list, as the Settings app colours its rows.
+    var tint: BloubColorId {
+        switch self {
+        case .model: BloubColorId.violet
+        case .web: BloubColorId.blue
+        case .notifications: BloubColorId.red
+        case .plugins: BloubColorId.orange
+        case .daemon: BloubColorId.grey
+        case .about: BloubColorId.teal
+        }
+    }
 }
 
 /// A page carries no navigation of its own: on iOS it is pushed onto the sheet's stack, on the Mac
-/// it sits bare inside a toolbar tab.
+/// it sits bare under the sheet's tab strip.
 @ViewBuilder func settingsPage(_ category: SettingsCategory, session: Session) -> some View {
     switch category {
     case .model: ModelPage(session: session)
@@ -49,47 +64,166 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
     }
 }
 
-#if os(iOS)
-/// iOS has no `Settings` scene: the sidebar's gear opens this sheet and each row pushes its page.
-struct SettingsSheet: View {
-    let session: Session
+struct SettingsRequest: Identifiable {
+    let id = UUID()
+    var start: SettingsCategory?
 
-    @Environment(\.dismiss) private var dismiss
+    #if os(macOS)
+    /// Set by ⌘, until a console takes it: with the console window closed nobody hears the
+    /// notification, so the console that opens next presents the sheet.
+    static var pending = false
+
+    /// ⌘,: the sheet belongs to the console window, so that window is brought back or opened first.
+    static func ask(consoleWindow: NSWindow?, openConsole: () -> Void) {
+        pending = true
+        if let consoleWindow {
+            consoleWindow.makeKeyAndOrderFront(nil)
+        } else {
+            openConsole()
+        }
+        NotificationCenter.default.post(name: .showSettings, object: nil)
+    }
+    #endif
+}
+
+#if os(macOS)
+/// A hidden or minimised console counts: `openWindow` on a `WindowGroup` always makes another one.
+var consoleWindow: NSWindow? {
+    NSApp.windows.first {
+        $0.identifier?.rawValue.hasPrefix(consoleWindowID) == true && ($0.isVisible || $0.isMiniaturized)
+    }
+}
+
+struct SettingsCommand: View {
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        NavigationStack {
+        Button("Settings…") {
+            SettingsRequest.ask(consoleWindow: consoleWindow) { openWindow(id: consoleWindowID) }
+        }
+        .keyboardShortcut(",")
+    }
+}
+#endif
+
+extension View {
+    /// The app settings sheet. On the Mac the app menu's Settings… (⌘,) opens it too, through
+    /// `.showSettings` or, for a console that was closed, `SettingsRequest.pending`.
+    func settingsSheet<Content: View>(
+        _ request: Binding<SettingsRequest?>, @ViewBuilder content: @escaping (SettingsRequest) -> Content
+    ) -> some View {
+        sheet(item: request, content: content)
+            #if os(macOS)
+            .onReceive(NotificationCenter.default.publisher(for: .showSettings)) { _ in
+                SettingsRequest.pending = false
+                if request.wrappedValue == nil { request.wrappedValue = SettingsRequest() }
+            }
+            .onAppear {
+                guard SettingsRequest.pending else { return }
+                SettingsRequest.pending = false
+                if request.wrappedValue == nil { request.wrappedValue = SettingsRequest() }
+            }
+            #endif
+    }
+}
+
+#if os(iOS)
+/// The sidebar's gear opens this sheet and each row pushes its page.
+struct SettingsSheet: View {
+    let session: Session
+    /// The page to open on, for a Needs you item that is fixed there.
+    var start: SettingsCategory? = nil
+
+    @State private var path: [SettingsCategory] = []
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        NavigationStack(path: $path) {
             List(SettingsCategory.allCases) { category in
-                NavigationLink {
-                    settingsPage(category, session: session)
-                } label: {
-                    Label(category.title, systemImage: category.symbol)
+                NavigationLink(value: category) {
+                    Label {
+                        Text(category.title)
+                    } icon: {
+                        Image(systemName: category.symbol)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(AgentPalette(category.tint, dark: scheme == .dark).softText.color)
+                            .frame(width: 30, height: 30)
+                            .background(AgentPalette(category.tint, dark: scheme == .dark).soft.color, in: .rect(cornerRadius: 9))
+                    }
                 }
+                .listRowBackground(Rectangle().fill(Theme.card))
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(Theme.ground)
+            .navigationDestination(for: SettingsCategory.self) { category in
+                settingsPage(category, session: session)
             }
             .navigationTitle("Settings")
+            .presentationBackground(Theme.ground)
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear { if let start, path.isEmpty { path = [start] } }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                    Button("Done", role: .confirm) { dismiss() }
                 }
             }
         }
     }
 }
 #else
-/// The body of the Mac's `Settings` scene, which is what gives the app ⌘, and the app menu's
-/// Settings… item. Its own minimum size: a scene has no sheet to take one from.
-struct SettingsWindow: View {
+/// The sidebar's gear and ⌘, open this over the console window: a tab strip, the page, Done.
+struct SettingsSheet: View {
     let session: Session
+    /// The page to open on, for a Needs you item that is fixed there.
+    var start: SettingsCategory? = nil
+
+    @AppStorage(SettingsCategory.storageKey) private var tab: SettingsCategory = .model
+
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        TabView {
+        VStack(spacing: 0) {
+            SheetHeader("Settings") {
+                Button("Done") { dismiss() }
+                    .buttonStyle(.pill(.primary))
+                    .controlSize(.small)
+                    .keyboardShortcut(.cancelAction)
+            }
+            tabs
+                .padding(.horizontal, 20)
+                .padding(.bottom, 4)
+            settingsPage(tab, session: session)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Theme.ground)
+        .frame(minWidth: 700, minHeight: 480, idealHeight: 580)
+        .onAppear { if let start { tab = start } }
+    }
+
+    /// The Rules page's quiet track, the picked tab filled in ink.
+    private var tabs: some View {
+        HStack(spacing: 4) {
             ForEach(SettingsCategory.allCases) { category in
-                Tab(category.title, systemImage: category.symbol) {
-                    settingsPage(category, session: session)
+                let picked = tab == category
+                Button { tab = category } label: {
+                    Label(category.title, systemImage: category.symbol)
+                        .font(.system(size: 12, weight: .semibold))
+                        .fixedSize()
+                        .padding(.horizontal, 10)
+                        .frame(maxWidth: .infinity, minHeight: 30)
+                        .foregroundStyle(picked ? AnyShapeStyle(Theme.onInk) : AnyShapeStyle(Theme.secondary))
+                        .background(picked ? AnyShapeStyle(Theme.ink) : AnyShapeStyle(.clear), in: .rect(cornerRadius: 10))
+                        .contentShape(.rect(cornerRadius: 10))
                 }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(picked ? .isSelected : [])
             }
         }
-        .frame(minWidth: 540, minHeight: 600)
+        .padding(4)
+        .background(Theme.ink.opacity(0.05), in: .rect(cornerRadius: 14))
     }
 }
 #endif
@@ -114,26 +248,26 @@ private struct FieldPage<Fields: View>: View {
         Group {
             if let stored, let form = Binding($form) {
                 let unchanged = form.wrappedValue == SettingsForm(stored)
-                Form {
+                ThemedForm {
                     fields(form, stored, unchanged)
 
                     Section {
                         Button(saving ? "Saving…" : "Save", action: save)
+                            .buttonStyle(.pill(.primary))
                             .disabled(saving || unchanged)
                         if let trouble {
                             Text(trouble)
                                 .font(.footnote)
-                                .foregroundStyle(.red)
+                                .foregroundStyle(Theme.failed)
                         } else if saved && unchanged {
                             Text("Saved.")
                                 .font(.footnote)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(Theme.muted)
                         }
                     } footer: {
                         Text(footer)
                     }
                 }
-                .formStyle(.grouped)
                 .autocorrectionDisabled()
                 #if os(iOS)
                 .textInputAutocapitalization(.never)
@@ -187,64 +321,306 @@ private struct FieldPage<Fields: View>: View {
     }
 }
 
-/// The provider the agents think with. The key is write-only: a stored one shows as stored, never
-/// as itself.
+/// What the models sheet edits. The key starts blank and goes out only when something is typed:
+/// an empty key would remove the stored one.
+struct ModelDraft: Equatable {
+    var name = ""
+    var baseUrl = ""
+    var model = ""
+    var apiKey = ""
+    var extraBody = ""
+
+    init() {}
+
+    init(_ entry: ModelEntry) {
+        name = entry.name
+        baseUrl = entry.baseUrl
+        model = entry.model
+        extraBody = entry.extraBody
+    }
+
+    /// Everything for a new entry, only what changed for an existing one.
+    func update(from existing: ModelEntry?) -> ModelUpdate {
+        let name = name.trimmingCharacters(in: .whitespaces)
+        let baseUrl = baseUrl.trimmingCharacters(in: .whitespaces)
+        let model = model.trimmingCharacters(in: .whitespaces)
+        let extraBody = typedJSON(extraBody)
+        return ModelUpdate(
+            name: name == existing?.name ? nil : name,
+            baseUrl: baseUrl == existing?.baseUrl ? nil : baseUrl,
+            model: model == existing?.model ? nil : model,
+            apiKey: apiKey.isEmpty ? nil : apiKey,
+            extraBody: extraBody == (existing?.extraBody ?? "") ? nil : extraBody
+        )
+    }
+}
+
+/// What the models sheet is open on: an entry, or nothing for Add.
+private struct ModelEdit: Identifiable {
+    let id = UUID()
+    var entry: ModelEntry? = nil
+}
+
+/// The model registry: any number of endpoints, one default for agents with none of their own and
+/// an optional backup. The list is fetched again after every change, because the daemon moves the
+/// badges itself (the first entry becomes the default, deleting the backup clears it).
 private struct ModelPage: View {
     let session: Session
 
-    @State private var testing = false
-    @State private var tested: ProviderTestResult?
+    @State private var models: [ModelEntry]?
+    @State private var results: [Int: ProviderTestResult] = [:]
+    @State private var testing: Set<Int> = []
+    @State private var editing: ModelEdit?
+    @State private var removing: ModelEntry?
+    @State private var trouble: String?
 
     var body: some View {
-        FieldPage(
-            session: session,
-            title: SettingsCategory.model.title,
-            update: \.modelUpdate,
-            footer: "The key is encrypted on the daemon and never comes back out. Leave it blank to keep the one stored.",
-            afterSave: { tested = nil }
-        ) { form, stored, unchanged in
+        ThemedForm {
             Section {
+                if let models {
+                    if models.isEmpty {
+                        Text("No models yet. Agents cannot think until one is added.").foregroundStyle(Theme.muted)
+                    }
+                    ForEach(models) { entry in
+                        ModelRow(
+                            entry: entry,
+                            result: results[entry.id],
+                            testing: testing.contains(entry.id),
+                            onTest: { test(entry) },
+                            onEdit: { editing = ModelEdit(entry: entry) },
+                            onDefault: { change { try await $0.setDefaultModel(id: entry.id) } },
+                            onBackup: { pick in change { try await $0.setBackupModel(id: pick) } },
+                            onDelete: { removing = entry }
+                        )
+                        #if os(iOS)
+                        .swipeActions {
+                            Button("Delete", systemImage: "trash", role: .destructive) { removing = entry }
+                        }
+                        #endif
+                    }
+                } else if trouble == nil {
+                    ProgressView().frame(maxWidth: .infinity)
+                }
+
+                Button("Add model", systemImage: "plus") { editing = ModelEdit() }
+                    .buttonStyle(.pill(.secondary))
+                    .disabled(models == nil)
+
+                if let trouble {
+                    Text(trouble)
+                        .font(.footnote)
+                        .foregroundStyle(Theme.failed)
+                        .textSelection(.enabled)
+                }
+            } footer: {
+                Text("OpenAI-compatible endpoints with tool calling and vision. An agent runs on its own model when it has one, else on the default. The backup stands in when the default is rate-limited or down.")
+            }
+        }
+        .navigationTitle(SettingsCategory.model.title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .task { await load() }
+        .sheet(item: $editing) { edit in
+            ModelSheet(session: session, existing: edit.entry) {
+                results = [:]
+                Task { await load() }
+            }
+        }
+        .confirmationDialog(
+            removing.map { "Delete \($0.name)?" } ?? "",
+            isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
+            titleVisibility: .visible,
+            presenting: removing
+        ) { entry in
+            Button("Delete", role: .destructive) {
+                results[entry.id] = nil
+                change { try await $0.deleteModel(id: entry.id) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("Its endpoint and key are deleted with it.")
+        }
+    }
+
+    private func load() async {
+        do {
+            models = try await session.run { try await $0.models() }
+        } catch {
+            if !error.isCancellation { trouble = error.localizedDescription }
+        }
+    }
+
+    /// The daemon's refusal (a model still assigned, a default with others left) is shown as it
+    /// came, under the list.
+    private func change<T: Sendable>(_ call: @escaping @Sendable (SchermesClient) async throws -> T) {
+        trouble = nil
+        Task {
+            do {
+                _ = try await session.run(call)
+                await load()
+            } catch {
+                if !error.isCancellation { trouble = error.localizedDescription }
+            }
+        }
+    }
+
+    private func test(_ entry: ModelEntry) {
+        testing.insert(entry.id)
+        results[entry.id] = nil
+        Task {
+            do {
+                results[entry.id] = try await session.run { try await $0.testModel(id: entry.id) }
+            } catch {
+                if !error.isCancellation {
+                    results[entry.id] = ProviderTestResult(ok: false, reply: nil, error: error.localizedDescription)
+                }
+            }
+            testing.remove(entry.id)
+        }
+    }
+}
+
+private struct ModelRow: View {
+    /// The Mac draws it in a round pill beside Test, so the circle would be drawn twice.
+    #if os(macOS)
+    private let moreSymbol = "ellipsis"
+    #else
+    private let moreSymbol = "ellipsis.circle"
+    #endif
+
+    let entry: ModelEntry
+    let result: ProviderTestResult?
+    let testing: Bool
+    let onTest: () -> Void
+    let onEdit: () -> Void
+    let onDefault: () -> Void
+    let onBackup: (Int?) -> Void
+    let onDelete: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(entry.name).font(.headline).lineLimit(1)
+                if entry.isDefault { ModelBadge(word: "Default", symbol: "star.fill") }
+                if entry.isBackup { ModelBadge(word: "Backup", symbol: "arrow.triangle.2.circlepath") }
+                Spacer(minLength: 8)
+                // A style on every one of them: two plain buttons in one iOS Form row fire together.
+                Button(testing ? "Testing…" : "Test", action: onTest)
+                    .buttonStyle(.pill(.secondary))
+                    .disabled(testing || !entry.apiKeySet)
+                Menu("More", systemImage: moreSymbol) {
+                    Button("Edit…", systemImage: "pencil", action: onEdit)
+                    if !entry.isDefault {
+                        Button("Make default", systemImage: "star", action: onDefault)
+                    }
+                    if entry.isBackup {
+                        Button("No backup", systemImage: "xmark.circle") { onBackup(nil) }
+                    } else if !entry.isDefault {
+                        Button("Use as backup", systemImage: "arrow.triangle.2.circlepath") { onBackup(entry.id) }
+                    }
+                    Divider()
+                    Button("Delete…", systemImage: "trash", role: .destructive, action: onDelete)
+                }
+                .labelStyle(.iconOnly)
+                .menuIndicator(.hidden)
+                #if os(macOS)
+                .menuStyle(.button)
+                .buttonStyle(.pill(.secondary, round: true))
+                #endif
+                .fixedSize()
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+
+            Text(entry.model)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+            Text(entry.baseUrl + (entry.apiKeySet ? "" : " · no key"))
+                .font(.caption.monospaced())
+                .foregroundStyle(Theme.muted)
+                .lineLimit(1)
+            if let result {
+                Label(
+                    result.ok
+                        ? ((result.reply ?? "").isEmpty ? "Answered" : "Answered: \(result.reply ?? "")")
+                        : (result.error ?? "Could not be reached"),
+                    systemImage: result.ok ? "checkmark.circle" : "xmark.octagon"
+                )
+                .font(.footnote)
+                .foregroundStyle(result.ok ? AnyShapeStyle(Theme.muted) : AnyShapeStyle(Theme.failed))
+                .textSelection(.enabled)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct ModelBadge: View {
+    let word: String
+    let symbol: String
+
+    var body: some View {
+        Label(word, systemImage: symbol)
+            .font(.caption2.weight(.semibold))
+            .labelStyle(.titleAndIcon)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(.quaternary, in: .capsule)
+    }
+}
+
+/// Adding or changing one model. The key is write-only: a stored one shows as set, never as
+/// itself, and a blank field keeps it.
+private struct ModelSheet: View {
+    let session: Session
+    let existing: ModelEntry?
+    let onSaved: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var draft: ModelDraft
+    @State private var trouble: String?
+    @State private var saving = false
+
+    init(session: Session, existing: ModelEntry?, onSaved: @escaping () -> Void) {
+        self.session = session
+        self.existing = existing
+        self.onSaved = onSaved
+        _draft = State(initialValue: existing.map(ModelDraft.init) ?? ModelDraft())
+    }
+
+    var body: some View {
+        ThemedForm {
+            Section {
+                LabeledContent("Name") {
+                    TextField("Name", text: $draft.name, prompt: Text("Fast, Smart, Local…"))
+                        .rowField()
+                }
                 LabeledContent("Base URL") {
-                    TextField("Base URL", text: form.baseUrl, prompt: Text(verbatim: "https://api.example.com/v1"))
+                    TextField("Base URL", text: $draft.baseUrl, prompt: Text(verbatim: "https://api.example.com/v1"))
                         #if os(iOS)
                         .keyboardType(.URL)
                         #endif
                         .rowField()
                 }
                 LabeledContent("Model") {
-                    TextField("Model", text: form.model)
+                    TextField("Model", text: $draft.model, prompt: Text(verbatim: "gpt-5"))
+                        .font(.body.monospaced())
                         .rowField()
                 }
                 LabeledContent("API key") {
-                    SecureField("API key", text: form.apiKey, prompt: Text(stored.provider.apiKeySet ? "Stored" : "Not set"))
+                    SecureField("API key", text: $draft.apiKey, prompt: Text(existing?.apiKeySet == true ? "Set" : "Not set"))
                         .rowField()
                 }
-                // Tests what is stored, so it waits for a save: a test of the form as typed would
-                // be a second path that sends the key.
-                Button(testing ? "Testing…" : "Test connection", action: test)
-                    .buttonStyle(.borderless)
-                    .disabled(testing || !unchanged || !stored.provider.apiKeySet)
-                if let tested {
-                    Label(
-                        tested.ok
-                            ? ((tested.reply ?? "").isEmpty ? "Answered" : "Answered: \(tested.reply ?? "")")
-                            : (tested.error ?? "Could not be reached"),
-                        systemImage: tested.ok ? "checkmark.circle" : "xmark.octagon"
-                    )
-                    .font(.footnote)
-                    .foregroundStyle(tested.ok ? Color.secondary : Color.red)
-                    .textSelection(.enabled)
-                }
-            } header: {
-                Text("Provider")
             } footer: {
-                Text("One OpenAI-compatible endpoint with tool calling and vision. Save, then test: one short model call, no tools.")
+                Text("The key is encrypted on the daemon and never comes back out. Leave it blank to keep the one stored.")
             }
 
             Section {
                 TextField(
                     "Extra request fields",
-                    text: form.extraBody,
+                    text: $draft.extraBody,
                     prompt: Text(verbatim: #"{"reasoning":{"effort":"high"}}"#),
                     axis: .vertical
                 )
@@ -252,26 +628,61 @@ private struct ModelPage: View {
                 .lineLimit(1...6)
                 .rowField()
             } header: {
-                Text("Extra request fields")
+                Text("Extra request fields").formHeader()
             } footer: {
-                Text("A JSON object merged into every model request: routing, reasoning effort, token caps. Empty for none.")
+                Text("A JSON object merged into every request to this model: routing, reasoning effort, token caps. Empty for none.")
             }
-        }
-    }
 
-    private func test() {
-        guard !testing else { return }
-        testing = true
-        tested = nil
-        Task {
-            do {
-                tested = try await session.run { try await $0.testProvider() }
-            } catch {
-                if !error.isCancellation {
-                    tested = ProviderTestResult(ok: false, reply: nil, error: error.localizedDescription)
+            if let trouble {
+                Section {
+                    Text(trouble)
+                        .font(.footnote)
+                        .foregroundStyle(Theme.failed)
+                        .textSelection(.enabled)
                 }
             }
-            testing = false
+        }
+        .autocorrectionDisabled()
+        #if os(iOS)
+        .textInputAutocapitalization(.never)
+        #endif
+        .sheetChrome(
+            existing?.name ?? "Add model",
+            confirm: saving ? "Saving…" : "Save",
+            confirmDisabled: saving,
+            cancel: { dismiss() },
+            onConfirm: save
+        )
+        .presentationBackground(Theme.ground)
+        #if os(macOS)
+        .frame(minWidth: 480, minHeight: 440)
+        #endif
+    }
+
+    /// Checking the fields is the daemon's: its refusal is shown as it came and the sheet keeps
+    /// what was typed.
+    private func save() {
+        guard !saving else { return }
+        let update = draft.update(from: existing)
+        guard existing == nil || update != ModelUpdate() else {
+            dismiss()
+            return
+        }
+        saving = true
+        trouble = nil
+        Task {
+            do {
+                if let existing {
+                    _ = try await session.run { try await $0.updateModel(id: existing.id, update) }
+                } else {
+                    _ = try await session.run { try await $0.createModel(update) }
+                }
+                onSaved()
+                dismiss()
+            } catch {
+                if !error.isCancellation { trouble = error.localizedDescription }
+            }
+            saving = false
         }
     }
 }
@@ -331,7 +742,7 @@ private struct NotificationsPage: View {
                 LabeledContent("Gateway", value: stored.push.bundleId.isEmpty ? "Not yet registered" : stored.push.sandbox ? "Sandbox (development build)" : "Production")
                 LabeledContent("Devices", value: deviceLine)
                 Button(pushing ? "Sending…" : "Send test push", action: testPush)
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.pill(.secondary))
                     .disabled(pushing || !unchanged || !stored.push.keySet || devices.isEmpty)
                 if let pushed {
                     Label(
@@ -339,7 +750,7 @@ private struct NotificationsPage: View {
                         systemImage: pushed.ok ? "checkmark.circle" : "xmark.octagon"
                     )
                     .font(.footnote)
-                    .foregroundStyle(pushed.ok ? Color.secondary : Color.red)
+                    .foregroundStyle(pushed.ok ? AnyShapeStyle(Theme.muted) : AnyShapeStyle(Theme.failed))
                     .textSelection(.enabled)
                 }
             } footer: {
@@ -361,7 +772,7 @@ private struct NotificationsPage: View {
                 .lineLimit(1...4)
                 .rowField()
             } header: {
-                Text(stored.push.keySet ? "Key" : "Key (not set)")
+                Text(stored.push.keySet ? "Key" : "Key (not set)").formHeader()
             } footer: {
                 Text("Mount the AuthKey_<KEYID>.p8 from the Apple Developer portal into the container and point SCHERMES_APNS_KEY_FILE at it; then nothing here needs filling in. Paste it only when you cannot: blank keeps the stored one.")
             }
@@ -401,7 +812,7 @@ private struct DaemonPage: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        Form {
+        ThemedForm {
             Section {
                 LabeledContent("Address", value: session.client?.baseURL.absoluteString ?? "none")
                     .textSelection(.enabled)
@@ -411,7 +822,7 @@ private struct DaemonPage: View {
                     dismiss()
                     session.forgetServer()
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.pill(.secondary))
             }
 
             Section {
@@ -419,12 +830,11 @@ private struct DaemonPage: View {
                     dismiss()
                     Task { await session.logOut() }
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.pill(.destructive))
             } footer: {
                 Text("Logging out keeps the address and the stored password; using a different daemon keeps neither.")
             }
         }
-        .formStyle(.grouped)
         .navigationTitle(SettingsCategory.daemon.title)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -464,11 +874,11 @@ struct PluginsPage: View {
     private var testAs: String? { chosen ?? agents.first?.name }
 
     var body: some View {
-        Form {
+        ThemedForm {
             Section {
                 if let servers {
                     if servers.isEmpty {
-                        Text("No servers configured.").foregroundStyle(.secondary)
+                        Text("No servers configured.").foregroundStyle(Theme.muted)
                     }
                     ForEach(servers, id: \.name) { server in
                         ServerRow(
@@ -487,7 +897,7 @@ struct PluginsPage: View {
                         #endif
                     }
                 } else if let trouble {
-                    Text(trouble).foregroundStyle(.red)
+                    Text(trouble).foregroundStyle(Theme.failed)
                 } else {
                     ProgressView().frame(maxWidth: .infinity)
                 }
@@ -495,25 +905,25 @@ struct PluginsPage: View {
                 // A row rather than a toolbar item: on the Mac this page sits in a `Settings`
                 // scene whose toolbar is already the category tabs.
                 Button("Add server", systemImage: "plus") { editing = ServerEdit() }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.pill(.secondary))
                     .disabled(servers == nil)
 
                 if let trouble, servers != nil {
                     Text(trouble)
                         .font(.footnote)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(Theme.failed)
                 }
             } header: {
-                Text("Configured")
+                Text("Configured").formHeader()
             } footer: {
                 Text("Owner-wide. Every server is connected at the start of an agent's turn and its tools are offered as `mcp__<server>__<tool>`.")
             }
 
             Section {
                 if agents.isEmpty {
-                    Text("Create an agent to test a server as.").foregroundStyle(.secondary)
+                    Text("Create an agent to test a server as.").foregroundStyle(Theme.muted)
                 } else {
-                    Picker("Test as", selection: Binding(get: { testAs }, set: { chosen = $0; results = [:] })) {
+                    ValueMenu("Test as", value: agents.first { $0.name == testAs }?.title ?? "", selection: Binding(get: { testAs }, set: { chosen = $0; results = [:] })) {
                         ForEach(agents) { Text($0.title).tag(Optional($0.name)) }
                     }
                 }
@@ -521,7 +931,6 @@ struct PluginsPage: View {
                 Text("A stdio server is started as that agent's Linux user, so a test says what that agent would get.")
             }
         }
-        .formStyle(.grouped)
         .autocorrectionDisabled()
         #if os(iOS)
         .textInputAutocapitalization(.never)
@@ -669,128 +1078,120 @@ private struct ServerSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    LabeledContent("Name") {
-                        TextField("Name", text: $draft.name, prompt: Text(verbatim: "files"))
-                            .rowField()
-                            .disabled(existing != nil)
-                    }
-                    // Which block the daemon fills from what it holds follows the *stored*
-                    // transport, so secrets do not travel across a switch; coming back to it
-                    // finds them again. Cleared here rather than on a change of the transport
-                    // itself, which a filled-in snippet also changes and whose rows must stay.
-                    Picker("Transport", selection: Binding(get: { draft.transport }, set: { picked in
-                        draft.transport = picked
-                        secrets = picked == existing?.transport ? storedRows(of: existing) : []
-                    })) {
-                        Text(verbatim: "stdio").tag(McpServerSummary.Transport.stdio)
-                        Text(verbatim: "http").tag(McpServerSummary.Transport.http)
-                    }
-                    .pickerStyle(.menu)
-
-                    if draft.transport == .stdio {
-                        LabeledContent("Command") {
-                            TextField("Command", text: $draft.command, prompt: Text(verbatim: "npx"))
-                                .rowField()
-                        }
-                        TextField("Arguments", text: $args, prompt: Text("One per line"), axis: .vertical)
-                            .font(.callout.monospaced())
-                            .lineLimit(1...6)
-                    } else {
-                        LabeledContent("URL") {
-                            TextField("URL", text: $draft.url, prompt: Text(verbatim: "https://mcp.example.com/mcp"))
-                                #if os(iOS)
-                                .keyboardType(.URL)
-                                #endif
-                                .rowField()
-                        }
-                    }
-                } footer: {
-                    Text(existing == nil
-                        ? "The name is how the daemon addresses the server and how its tools are spelled, and it cannot be changed afterwards."
-                        : "A server is renamed by adding it again under the new name and deleting this one.")
-                }
-
-                Section {
-                    ForEach($secrets) { $row in
-                        HStack {
-                            TextField("Name", text: $row.key, prompt: Text("Name"))
-                                .font(.callout.monospaced())
-                                .rowField()
-                            SecureField(
-                                "Value",
-                                text: $row.value,
-                                prompt: Text(row.stored ? "Stored" : "Value")
-                            )
-                            .rowField()
-                            Button("Remove", systemImage: "minus.circle", role: .destructive) {
-                                secrets.removeAll { $0.id == row.id }
-                            }
-                            .buttonStyle(.borderless)
-                            .labelStyle(.iconOnly)
-                        }
-                    }
-                    Button("Add \(one)", systemImage: "plus") {
-                        secrets.append(SecretRow())
-                    }
-                    .buttonStyle(.borderless)
-                } header: {
-                    Text(block)
-                } footer: {
-                    Text("Never read back. One shown as Stored keeps its value unless something is typed over it; removing the row removes it from the server.")
-                }
-
-                if existing == nil {
-                    Section {
-                        TextField(
-                            "Snippet",
-                            text: $pasted,
-                            prompt: Text(verbatim: #"{"mcpServers": {"files": {…}}}"#),
-                            axis: .vertical
-                        )
-                        .font(.callout.monospaced())
-                        .lineLimit(2...8)
+        ThemedForm {
+            Section {
+                LabeledContent("Name") {
+                    TextField("Name", text: $draft.name, prompt: Text(verbatim: "files"))
                         .rowField()
-                        Button("Fill from snippet", action: fill)
-                            .buttonStyle(.borderless)
-                            .disabled(pasted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    } header: {
-                        Text("Paste")
-                    } footer: {
-                        Text("A block out of an MCP README, or one entry of the daemon's own array. It fills the form above; nothing is written until Save.")
-                    }
+                        .disabled(existing != nil)
+                }
+                // Which block the daemon fills from what it holds follows the *stored*
+                // transport, so secrets do not travel across a switch; coming back to it
+                // finds them again. Cleared here rather than on a change of the transport
+                // itself, which a filled-in snippet also changes and whose rows must stay.
+                ValueMenu("Transport", value: draft.transport.rawValue, selection: Binding(get: { draft.transport }, set: { picked in
+                    draft.transport = picked
+                    secrets = picked == existing?.transport ? storedRows(of: existing) : []
+                })) {
+                    Text(verbatim: "stdio").tag(McpServerSummary.Transport.stdio)
+                    Text(verbatim: "http").tag(McpServerSummary.Transport.http)
                 }
 
-                if let trouble {
-                    Section {
-                        Text(trouble)
-                            .font(.footnote)
-                            .foregroundStyle(.red)
-                            .textSelection(.enabled)
+                if draft.transport == .stdio {
+                    LabeledContent("Command") {
+                        TextField("Command", text: $draft.command, prompt: Text(verbatim: "npx"))
+                            .rowField()
                     }
+                    TextField("Arguments", text: $args, prompt: Text("One per line"), axis: .vertical)
+                        .font(.callout.monospaced())
+                        .lineLimit(1...6)
+                        .formLabel("Arguments")
+                } else {
+                    LabeledContent("URL") {
+                        TextField("URL", text: $draft.url, prompt: Text(verbatim: "https://mcp.example.com/mcp"))
+                            #if os(iOS)
+                            .keyboardType(.URL)
+                            #endif
+                            .rowField()
+                    }
+                }
+            } footer: {
+                Text(existing == nil
+                    ? "The name is how the daemon addresses the server and how its tools are spelled, and it cannot be changed afterwards."
+                    : "A server is renamed by adding it again under the new name and deleting this one.")
+            }
+
+            Section {
+                ForEach($secrets) { $row in
+                    HStack {
+                        TextField("Name", text: $row.key, prompt: Text("Name"))
+                            .font(.callout.monospaced())
+                            .rowField()
+                        SecureField(
+                            "Value",
+                            text: $row.value,
+                            prompt: Text(row.stored ? "Stored" : "Value")
+                        )
+                        .rowField()
+                        Button("Remove", systemImage: "minus.circle", role: .destructive) {
+                            secrets.removeAll { $0.id == row.id }
+                        }
+                        .buttonStyle(.borderless)
+                        .labelStyle(.iconOnly)
+                    }
+                }
+                Button("Add \(one)", systemImage: "plus") {
+                    secrets.append(SecretRow())
+                }
+                .buttonStyle(.pill(.secondary))
+            } header: {
+                Text(block).formHeader()
+            } footer: {
+                Text("Never read back. One shown as Stored keeps its value unless something is typed over it; removing the row removes it from the server.")
+            }
+
+            if existing == nil {
+                Section {
+                    TextField(
+                        "Snippet",
+                        text: $pasted,
+                        prompt: Text(verbatim: #"{"mcpServers": {"files": {…}}}"#),
+                        axis: .vertical
+                    )
+                    .font(.callout.monospaced())
+                    .lineLimit(2...8)
+                    .rowField()
+                    Button("Fill from snippet", action: fill)
+                        .buttonStyle(.pill(.secondary))
+                        .disabled(pasted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                } header: {
+                    Text("Paste").formHeader()
+                } footer: {
+                    Text("A block out of an MCP README, or one entry of the daemon's own array. It fills the form above; nothing is written until Save.")
                 }
             }
-            .formStyle(.grouped)
-            .autocorrectionDisabled()
-            #if os(iOS)
-            .textInputAutocapitalization(.never)
-            #endif
-            .navigationTitle(existing?.name ?? "Add server")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(saving ? "Saving…" : "Save", action: save)
-                        .disabled(saving)
+
+            if let trouble {
+                Section {
+                    Text(trouble)
+                        .font(.footnote)
+                        .foregroundStyle(Theme.failed)
+                        .textSelection(.enabled)
                 }
             }
         }
+        .autocorrectionDisabled()
+        #if os(iOS)
+        .textInputAutocapitalization(.never)
+        #endif
+        .sheetChrome(
+            existing?.name ?? "Add server",
+            confirm: saving ? "Saving…" : "Save",
+            confirmDisabled: saving,
+            cancel: { dismiss() },
+            onConfirm: save
+        )
+        .presentationBackground(Theme.ground)
         #if os(macOS)
         .frame(minWidth: 520, minHeight: 560)
         #endif
@@ -848,31 +1249,33 @@ private struct ServerRow: View {
                 Text(server.name).font(.headline).lineLimit(1)
                 Text(server.transport.rawValue)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Theme.muted)
                 Spacer(minLength: 8)
-                // Borderless on every one of them: two plain buttons in one iOS Form row fire
-                // together.
+                // A style on every one of them: two plain buttons in one iOS Form row fire together.
                 Button(testing ? "Testing…" : "Test", action: onTest)
+                    .buttonStyle(.pill(.secondary))
                     .disabled(testing || !canTest)
                 Button("Edit", action: onEdit)
+                    .buttonStyle(.pill(.secondary))
                 Button("Delete", role: .destructive, action: onDelete)
+                    .buttonStyle(.pill(.destructive))
             }
             .buttonStyle(.borderless)
             .controlSize(.small)
 
             Text(server.detail)
                 .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.muted)
                 .lineLimit(2)
             if !server.secretKeys.isEmpty {
                 Text("Carries " + server.secretKeys.joined(separator: ", "))
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Theme.muted)
             }
             if let result {
                 Label(result.report, systemImage: result.ok ? "checkmark.circle" : "xmark.octagon")
                     .font(.footnote)
-                    .foregroundStyle(result.ok ? Color.secondary : Color.red)
+                    .foregroundStyle(result.ok ? AnyShapeStyle(Theme.muted) : AnyShapeStyle(Theme.failed))
                     .textSelection(.enabled)
             }
         }

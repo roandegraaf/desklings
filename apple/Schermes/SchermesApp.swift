@@ -8,6 +8,9 @@ import UserNotifications
 /// anyway.
 extension Notification.Name {
     static let showAbout = Notification.Name("dev.schermes.showAbout")
+    /// Posted with the window whose sidebar to toggle.
+    static let toggleSidebar = Notification.Name("dev.schermes.toggleSidebar")
+    static let showSettings = Notification.Name("dev.schermes.showSettings")
 }
 
 #if os(iOS)
@@ -19,6 +22,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = relay
+        PushCategory.register()
+        LiveActivityTokens.observe()
+        #if DEBUG
+        DebugActivity.startIfAsked()
+        #endif
         return true
     }
 
@@ -33,9 +41,18 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 #else
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let relay = NotificationRelay()
+    private let shareService = ShareService()
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        if hostingTests { NSApp.setActivationPolicy(.prohibited) }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !hostingTests else { return }
         UNUserNotificationCenter.current().delegate = relay
+        PushCategory.register()
+        PanelHotKey.register()
+        NSApp.servicesProvider = shareService
     }
 
     func application(_ application: NSApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
@@ -48,6 +65,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 #endif
 
+/// `xcodebuild test` launches the app as the test host on the owner's Mac: it must not come to the
+/// front, take a global hot key or sign in (a Keychain read can raise an authorisation panel).
+#if DEBUG
+let hostingTests = ProcessInfo.processInfo.environment.keys.contains { $0.hasPrefix("XCTest") }
+#else
+let hostingTests = false
+#endif
+
 @main
 struct SchermesApp: App {
     #if os(iOS)
@@ -56,30 +81,46 @@ struct SchermesApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     #endif
 
-    /// Lifted out of `RootView` because the Mac's `Settings` scene is a second scene and needs the
-    /// same one. `pushRegistration` is already a singleton, so only this had to move.
+    /// Lifted out of `RootView` because the Mac's desktop windows and menu bar panel are scenes of
+    /// their own and need the same one.
     @State private var session = Session()
     /// Up here for the same reason: the Mac's desktop windows are a scene of their own.
     @State private var looks = AgentLooks()
     @State private var desktops = Desktops()
+    #if os(macOS)
+    @State private var feed = MenuBarFeed()
+    #endif
 
     var body: some Scene {
-        WindowGroup {
-            RootView(session: session)
-                .environment(looks)
-                .environment(desktops)
+        WindowGroup(id: consoleWindowID) {
+            if !hostingTests {
+                RootView(session: session)
+                    .environment(looks)
+                    .environment(desktops)
+                    .tint(Theme.ink)
+            }
         }
         #if os(macOS)
+        .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1000, height: 680)
         // No New Window: it took ⌘N from New agent, and a second console could open a second
         // viewer on the desktop the first one's inspector is already showing.
         .commands {
             CommandGroup(replacing: .newItem) {}
+            // The split is our own `MacSplit`; the window answers toggleSidebar: itself and finds no
+            // sidebar-behaviour item in it.
+            CommandGroup(replacing: .sidebar) {
+                Button("Toggle Sidebar") {
+                    NotificationCenter.default.post(name: .toggleSidebar, object: NSApp.keyWindow)
+                }
+                .keyboardShortcut("s", modifiers: [.control, .command])
+            }
             CommandGroup(replacing: .appInfo) {
                 Button("About Schermes") {
                     NotificationCenter.default.post(name: .showAbout, object: nil)
                 }
             }
+            CommandGroup(replacing: .appSettings) { SettingsCommand() }
         }
         #endif
 
@@ -91,6 +132,7 @@ struct SchermesApp: App {
                 DesktopWindow(session: session, name: name)
                     .environment(looks)
                     .environment(desktops)
+                    .tint(Theme.ink)
             }
         }
         // As large a 16:10 picture as the display takes, the shape of the default 1920x1200 desktop.
@@ -104,13 +146,15 @@ struct SchermesApp: App {
         .restorationBehavior(.disabled)
         #endif
 
-        // Gives the app ⌘, and the app menu's Settings… item; the sidebar's gear opens it with a
-        // `SettingsLink`.
         #if os(macOS)
-        Settings {
-            SettingsWindow(session: session)
-                .environment(pushRegistration)
+        MenuBarExtra {
+            MenuBarPanel(session: session, looks: looks, feed: feed)
+                .environment(looks)
+                .tint(Theme.ink)
+        } label: {
+            MenuBarLabel(session: session, looks: looks, feed: feed)
         }
+        .menuBarExtraStyle(.window)
         #endif
     }
 }
@@ -136,6 +180,10 @@ struct RootView: View {
                 ConsoleView(session: session)
             }
         }
+        #if os(macOS)
+        .containerBackground(Theme.window, for: .window)
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        #endif
         .environment(unread)
         .environment(pushRegistration)
         .sheet(isPresented: $about) { AboutView() }

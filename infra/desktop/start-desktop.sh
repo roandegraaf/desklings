@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Spawn (or adopt) an agent's Xvnc display with its window manager, wallpaper and dock. Runs as
-# schermes or root.
+# schermes or root. A third argument names a helper's extra display on the same user, which keeps
+# its own log and pidfile.
 set -euo pipefail
 
-name=${1:?usage: start-desktop.sh <name> <display>}
-display=${2:?usage: start-desktop.sh <name> <display>}
+name=${1:?usage: start-desktop.sh <name> <display> [tag]}
+display=${2:?usage: start-desktop.sh <name> <display> [tag]}
+tag=${3:-$name}
 [[ $name =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || { echo "invalid agent name: $name" >&2; exit 2; }
+[[ $tag =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || { echo "invalid tag: $tag" >&2; exit 2; }
 [[ $display =~ ^[0-9]{1,3}$ ]] || { echo "invalid display: $display" >&2; exit 2; }
 
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -14,8 +17,8 @@ home=$(getent passwd "$user" | cut -d: -f6) || { echo "no such user: $user" >&2;
 geometry=${SCHERMES_GEOMETRY:-1920x1200}
 rfbport=$((5900 + display))
 state_dir=${SCHERMES_STATE_DIR:-/var/lib/schermes}
-log="$state_dir/logs/$name.log"
-pidfile="$state_dir/desktops/$name.pid"
+log="$state_dir/logs/$tag.log"
+pidfile="$state_dir/desktops/$tag.pid"
 
 as_agent() {
   sudo -n -u "$user" env --chdir="$home" \
@@ -51,7 +54,7 @@ as_agent sh -c 'touch "$XAUTHORITY" && xauth -q -f "$XAUTHORITY" add "$DISPLAY" 
 as_agent setsid --fork Xvnc ":$display" \
   -geometry "$geometry" -depth 24 \
   -SecurityTypes None -localhost -rfbport "$rfbport" -nolisten tcp \
-  -auth "$home/.Xauthority" -desktop "schermes-$name" >>"$log" 2>&1
+  -auth "$home/.Xauthority" -desktop "schermes-$tag" >>"$log" 2>&1
 
 for _ in $(seq 30); do
   as_agent xdpyinfo >/dev/null 2>&1 && break

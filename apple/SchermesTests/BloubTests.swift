@@ -369,12 +369,12 @@ private func eyeMatrix(_ eye: BloubRenderedEye) -> [Double] {
     }
 }
 
-@Test func theCatalogueIsTheFourteenStatesOfTheVideoPlusOneInterfaceTransition() {
+@Test func theCatalogueIsTheFourteenStatesOfTheVideoPlusTheAppsOwnTwo() {
     #expect(BloubStates.sequence.count == 14)
     #expect(Set(BloubStates.sequence).count == 14)
-    #expect(BloubStateId.allCases.count == 15)
-    #expect(BloubStateId.allCases.filter { !BloubStates.sequence.contains($0) } == [.swirl])
-    #expect(BloubStates.all.count == 15)
+    #expect(BloubStateId.allCases.count == 16)
+    #expect(BloubStateId.allCases.filter { !BloubStates.sequence.contains($0) } == [.swirl, .failed])
+    #expect(BloubStates.all.count == 16)
 }
 
 @Test func everyAgentStateHasAFace() {
@@ -388,7 +388,7 @@ private func eyeMatrix(_ eye: BloubRenderedEye) -> [Double] {
     #expect(AgentState.waiting_for_user.bloub == .idle)
     #expect(AgentState.waiting_for_agent.bloub == .wide)
     #expect(AgentState.waiting_for_task_worker.bloub == .wide)
-    #expect(AgentState.failed.bloub == .exclaim)
+    #expect(AgentState.failed.bloub == .failed)
     #expect(AgentState.completed.bloub == .sleep)
     #expect(AgentState.idle.bloub == .idle)
 }

@@ -26,7 +26,7 @@ struct FileSource {
 struct FileKind: Equatable {
     var label: String
     var symbol: String
-    var tint: Color = .gray
+    var tint = BloubColorId.grey
 }
 
 /// What a file is, in the words a person uses, from the system's own type table.
@@ -34,17 +34,17 @@ func fileKind(_ path: String) -> FileKind {
     let ext = (path as NSString).pathExtension
     guard let type = UTType(filenameExtension: ext) else { return FileKind(label: "File", symbol: "doc") }
     let kinds: [(UTType, FileKind)] = [
-        (.spreadsheet, FileKind(label: "Spreadsheet", symbol: "tablecells", tint: .green)),
-        (.delimitedText, FileKind(label: "Spreadsheet", symbol: "tablecells", tint: .green)),
-        (.pdf, FileKind(label: "PDF", symbol: "doc.richtext", tint: .red)),
-        (.presentation, FileKind(label: "Presentation", symbol: "rectangle.on.rectangle", tint: .orange)),
-        (.image, FileKind(label: "Image", symbol: "photo", tint: .purple)),
-        (.movie, FileKind(label: "Video", symbol: "film", tint: .pink)),
-        (.audio, FileKind(label: "Audio", symbol: "waveform", tint: .pink)),
-        (.archive, FileKind(label: "Archive", symbol: "doc.zipper", tint: .brown)),
-        (.sourceCode, FileKind(label: "Code", symbol: "chevron.left.forwardslash.chevron.right", tint: .indigo)),
-        (.json, FileKind(label: "Code", symbol: "chevron.left.forwardslash.chevron.right", tint: .indigo)),
-        (.text, FileKind(label: "Document", symbol: "doc.text", tint: .blue)),
+        (.spreadsheet, FileKind(label: "Spreadsheet", symbol: "tablecells", tint: BloubColorId.green)),
+        (.delimitedText, FileKind(label: "Spreadsheet", symbol: "tablecells", tint: BloubColorId.green)),
+        (.pdf, FileKind(label: "PDF", symbol: "doc.richtext", tint: BloubColorId.red)),
+        (.presentation, FileKind(label: "Presentation", symbol: "rectangle.on.rectangle", tint: BloubColorId.orange)),
+        (.image, FileKind(label: "Image", symbol: "photo", tint: BloubColorId.violet)),
+        (.movie, FileKind(label: "Video", symbol: "film", tint: BloubColorId.pink)),
+        (.audio, FileKind(label: "Audio", symbol: "waveform", tint: BloubColorId.pink)),
+        (.archive, FileKind(label: "Archive", symbol: "doc.zipper", tint: BloubColorId.brown)),
+        (.sourceCode, FileKind(label: "Code", symbol: "chevron.left.forwardslash.chevron.right", tint: BloubColorId.teal)),
+        (.json, FileKind(label: "Code", symbol: "chevron.left.forwardslash.chevron.right", tint: BloubColorId.teal)),
+        (.text, FileKind(label: "Document", symbol: "doc.text", tint: BloubColorId.blue)),
     ]
     return kinds.first { type.conforms(to: $0.0) }?.1 ?? FileKind(label: "File", symbol: "doc")
 }
@@ -63,6 +63,9 @@ struct FileCard: View {
     @State private var saving: URL?
     #endif
     @Environment(Artifacts.self) private var artifacts: Artifacts?
+    @Environment(Forwarder.self) private var forwarder: Forwarder?
+    @Environment(\.forwardedMessage) private var messageId
+    @Environment(\.colorScheme) private var scheme
 
     private var name: String { (path as NSString).lastPathComponent }
     private var kind: FileKind { fileKind(path) }
@@ -75,7 +78,7 @@ struct FileCard: View {
                 card
             }
             if let trouble {
-                Text(trouble).font(.caption).foregroundStyle(.red)
+                Text(trouble).font(.caption).foregroundStyle(Theme.failed)
             }
         }
         .quickLookPreview($previewing)
@@ -93,17 +96,17 @@ struct FileCard: View {
                 HStack(spacing: 10) {
                     Image(systemName: kind.symbol)
                         .font(.body.weight(.medium))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(AgentPalette(kind.tint, dark: scheme == .dark).softText.color)
                         .frame(width: 36, height: 36)
-                        .background(kind.tint.gradient, in: .rect(cornerRadius: 8))
+                        .background(AgentPalette(kind.tint, dark: scheme == .dark).soft.color, in: .rect(cornerRadius: 9))
                     VStack(alignment: .leading, spacing: 2) {
                         Text(name)
-                            .font(.callout.weight(.semibold))
+                            .font(.callout.weight(.semibold).monospaced())
                             .lineLimit(2)
                             .truncationMode(.middle)
                         Text("\(kind.label) · \((path as NSString).pathExtension.uppercased())")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Theme.muted)
                     }
                     Spacer(minLength: 0)
                 }
@@ -111,6 +114,7 @@ struct FileCard: View {
             }
             .buttonStyle(.plain)
             .help(path)
+            .contextMenu { sendTo }
             .accessibilityLabel("\(name), \(kind.label)")
             .accessibilityHint("Opens a preview")
 
@@ -142,6 +146,7 @@ struct FileCard: View {
                     Button("Quick Look", systemImage: "eye") { previewing = picture }
                     Button("Copy Image", systemImage: "doc.on.doc") { copyImageToPasteboard(at: picture) }
                     Button(SAVE_LABEL, systemImage: "square.and.arrow.down") { Task { await keep() } }
+                    sendTo
                 }
 
                 download
@@ -150,6 +155,14 @@ struct FileCard: View {
             }
         } else {
             card.task { picture = await fetch() }
+        }
+    }
+
+    @ViewBuilder private var sendTo: some View {
+        if let forwarder {
+            Button("Send to…", systemImage: "arrowshape.turn.up.right") {
+                forwarder.pending = Forwarding(messageId: messageId, file: ForwardFile(agent: source.agent, path: path))
+            }
         }
     }
 

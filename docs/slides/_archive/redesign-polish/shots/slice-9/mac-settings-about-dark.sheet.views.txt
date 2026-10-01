@@ -1,0 +1,50 @@
+NSThemeFrame (0.0, 0.0, 700.0, 580.0) layer=NSViewBackingLayer
+  NSVisualEffectView (0.0, 0.0, 700.0, 580.0) layer=NSViewBackingLayer
+  BackdropView (0.0, 0.0, 0.0, 0.0) layer=CABackdropLayer
+  SheetHostingView<SheetContent> (0.0, 0.0, 700.0, 580.0) layer=NSViewBackingLayer
+    _FocusRingView (623.0, 534.0, 57.0, 30.0) layer=NSViewBackingLayer
+    _FocusRingView (24.0, 488.0, 101.0, 30.0) layer=NSViewBackingLayer
+    _FocusRingView (128.0, 488.0, 113.0, 30.0) layer=NSViewBackingLayer
+    _FocusRingView (244.0, 488.0, 118.0, 30.0) layer=NSViewBackingLayer
+    _FocusRingView (366.0, 488.0, 101.0, 30.0) layer=NSViewBackingLayer
+    _FocusRingView (471.0, 488.0, 101.0, 30.0) layer=NSViewBackingLayer
+    _FocusRingView (575.0, 488.0, 101.0, 30.0) layer=NSViewBackingLayer
+    PlatformContainer (0.0, 0.0, 700.0, 480.0) layer=NSViewBackingLayer
+      HostingScrollView (0.0, 0.0, 700.0, 480.0) layer=NSViewBackingLayer
+        HostingClipView (0.0, 0.0, 700.0, 480.0) layer=NSViewBackingLayer
+          DocumentView (0.0, -125.0, 700.0, 605.0) layer=NSViewBackingLayer
+            PlatformGroupContainer (0.0, -125.0, 700.0, 605.0) layer=NSViewBackingLayer
+              AppKitPlatformViewHost<PlatformViewRepresentableAdaptor<PointerAnchorView>> (304.0, 348.0, 92.0, 92.0) layer=NSViewBackingLayer
+                ClickThroughView (304.0, 348.0, 92.0, 92.0) layer=NSViewBackingLayer
+              AppKitTextInteractionView (36.0, -72.0, 628.0, 235.0) layer=NSViewBackingLayer
+        NSScroller (683.0, 7.0, 17.0, 473.0) layer=NSViewBackingLayer
+    KeyViewProxy (623.0, 534.0, 57.0, 30.0) layer=NSViewBackingLayer
+    KeyViewProxy (24.0, 488.0, 101.0, 30.0) layer=NSViewBackingLayer
+    KeyViewProxy (128.0, 488.0, 113.0, 30.0) layer=NSViewBackingLayer
+    KeyViewProxy (244.0, 488.0, 118.0, 30.0) layer=NSViewBackingLayer
+    KeyViewProxy (366.0, 488.0, 101.0, 30.0) layer=NSViewBackingLayer
+    KeyViewProxy (471.0, 488.0, 101.0, 30.0) layer=NSViewBackingLayer
+    KeyViewProxy (575.0, 488.0, 101.0, 30.0) layer=NSViewBackingLayer
+  NSTitlebarContainerView (0.0, 580.0, 700.0, 0.0) layer=NSViewBackingLayer
+    NSTitlebarBackgroundView (0.0, 580.0, 700.0, 0.0) layer=NSViewBackingLayer
+      NSScrollPocket (0.0, 580.0, 700.0, 0.0) layer=NSViewBackingLayer
+        PocketMask (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer hidden
+          NSView (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer
+            NSView (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer bg=<CGColor 0x74ff05ca20> [<CGColorSpace 0x74f9480d20> (kCGColorSpaceICCBased; kCGColorSpaceModelMonochrome; Generic Gray Gamma 2.2 Profile)] ( 0 1 ) hidden
+        PocketBlur (0.0, 580.0, 0.0, 0.0) layer=CABackdropLayer hidden
+          PortalView (0.0, 580.0, 0.0, 0.0) layer=CAPortalLayer
+        NSHardPocketView (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer hidden
+          _NSLayerBasedFillColorView (0.0, 580.0, 0.0, 1.0) layer=NSViewBackingLayer bg=<CGColor 0x74f3fee610> [<CGColorSpace 0x107ac2100> (kCGColorSpaceICCBased; kCGColorSpaceModelRGB; sRGB IEC61966-2.1)] headroom = 1.000000 ( 1 1 1 0.05 )
+        LuminanceAdjustment (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer hidden
+          NSView (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer
+            NSView (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer
+              BackdropView (0.0, 580.0, 0.0, 0.0) layer=CABackdropLayer hidden
+              _NSScrollViewContentBackgroundView (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer
+                NSVisualEffectView (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer
+            NSView (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer
+              NSView (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer bg=<CGColor 0x74ff05f480> [<CGColorSpace 0x74f9480d20> (kCGColorSpaceICCBased; kCGColorSpaceModelMonochrome; Generic Gray Gamma 2.2 Profile)] ( 0 1 )
+              NSView (0.0, 580.0, 0.0, 0.0) layer=NSViewBackingLayer bg=<CGColor 0x74ff05fa80> [<CGColorSpace 0x74f9480d20> (kCGColorSpaceICCBased; kCGColorSpaceModelMonochrome; Generic Gray Gamma 2.2 Profile)] ( 1 1 )
+          PortalView (0.0, 580.0, 0.0, 0.0) layer=CAPortalLayer
+    NSTitlebarView (0.0, 580.0, 700.0, 0.0) layer=NSViewBackingLayer
+      NSView (0.0, 580.0, 700.0, 0.0) layer=CABackdropLayer
+    _NSTitlebarDecorationView (0.0, 580.0, 700.0, 0.0) layer=NSViewBackingLayer

@@ -79,7 +79,7 @@ struct ArtifactPane: View {
     private var header: some View {
         HStack(spacing: 8) {
             Text(artifact.name)
-                .font(.headline)
+                .font(.headline.monospaced())
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .help(artifact.path)

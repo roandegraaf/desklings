@@ -1,4 +1,19 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, max, ne, or, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  getTableColumns,
+  gt,
+  gte,
+  inArray,
+  isNull,
+  lt,
+  max,
+  ne,
+  or,
+  sql,
+} from 'drizzle-orm';
 import type {
   Agent,
   Conversation,
@@ -6,7 +21,6 @@ import type {
   ExecutionEvent,
   Message,
   MessageRole,
-  SearchHit,
   ToolCall,
 } from '@schermes/shared';
 import { AGENT_NAME, findAgent, listAgents } from './agents.ts';
@@ -17,6 +31,7 @@ import {
   conversationParticipants,
   conversations,
   events,
+  forms,
   messages,
   summaries,
 } from './schema.ts';
@@ -53,6 +68,19 @@ function participantRows(db: Db): { conversationId: number; agentId: number }[] 
  * route both land in the same row rather than growing a new thread per message.
  */
 export function conversationWith(db: Db, agentIds: readonly number[]): number {
+  const found = existingConversation(db, agentIds);
+  if (found !== undefined) return found;
+
+  const wanted = [...new Set(agentIds)].sort((a, b) => a - b);
+  const created = db.insert(conversations).values({ createdAt: Date.now() }).returning().get();
+  for (const agentId of wanted) {
+    db.insert(conversationParticipants).values({ conversationId: created.id, agentId }).run();
+  }
+  return created.id;
+}
+
+/** `conversationWith` without the create, for a reader that must not make threads appear. */
+export function existingConversation(db: Db, agentIds: readonly number[]): number | undefined {
   const wanted = [...new Set(agentIds)].sort((a, b) => a - b);
   const grouped = new Map<number, number[]>();
   for (const row of participantRows(db)) {
@@ -64,12 +92,7 @@ export function conversationWith(db: Db, agentIds: readonly number[]): number {
       return conversationId;
     }
   }
-
-  const created = db.insert(conversations).values({ createdAt: Date.now() }).returning().get();
-  for (const agentId of wanted) {
-    db.insert(conversationParticipants).values({ conversationId: created.id, agentId }).run();
-  }
-  return created.id;
+  return undefined;
 }
 
 /** The thread an agent shares with nobody but the owner. */
@@ -84,6 +107,7 @@ export function conversationFor(db: Db, agentId: number): number {
  */
 export function deleteConversation(db: Db, conversationId: number): void {
   db.delete(approvals).where(eq(approvals.conversationId, conversationId)).run();
+  db.delete(forms).where(eq(forms.conversationId, conversationId)).run();
   db.delete(messages).where(eq(messages.conversationId, conversationId)).run();
   db.delete(summaries).where(eq(summaries.conversationId, conversationId)).run();
   db
@@ -98,14 +122,15 @@ export function deleteConversation(db: Db, conversationId: number): void {
  * stays: a message to a busy agent can land between a call and its answer, and a strict endpoint
  * rejects a call left unanswered. Summaries reaching past the cut would replay rows that are gone.
  */
-export function rewindConversation(db: Db, conversationId: number, fromId: number): void {
-  const stored = listMessages(db, conversationId);
+export function rewoundRows(stored: readonly Message[], fromId: number): Message[] {
   const asked = new Set(
     stored.filter((m) => m.id < fromId).flatMap((m) => (m.toolCalls ?? []).map((call) => call.id)),
   );
-  const gone = stored.filter(
-    (m) => m.id >= fromId && !(m.role === 'tool' && asked.has(m.toolCallId ?? '')),
-  );
+  return stored.filter((m) => m.id >= fromId && !(m.role === 'tool' && asked.has(m.toolCallId ?? '')));
+}
+
+export function rewindConversation(db: Db, conversationId: number, fromId: number): void {
+  const gone = rewoundRows(listMessages(db, conversationId), fromId);
   if (gone.length === 0) return;
   db.delete(messages).where(inArray(messages.id, gone.map((m) => m.id))).run();
   db.delete(summaries)
@@ -162,6 +187,9 @@ function toMessage(row: typeof messages.$inferSelect): Message {
   };
 }
 
+/** Who the daemon's own lines are from: not the owner, so they answer nothing that waits on the owner. */
+export const SYSTEM_SENDER = 'System';
+
 export function appendMessage(db: Db, conversationId: number, message: NewMessage): Message {
   const row = db
     .insert(messages)
@@ -180,9 +208,31 @@ export function appendMessage(db: Db, conversationId: number, message: NewMessag
   return toMessage(row);
 }
 
+export function findMessage(db: Db, id: number): Message | undefined {
+  const row = db.select().from(messages).where(eq(messages.id, id)).get();
+  return row === undefined ? undefined : toMessage(row);
+}
+
 export function listMessages(db: Db, conversationId: number, after = 0): Message[] {
   return db
     .select()
+    .from(messages)
+    .where(and(eq(messages.conversationId, conversationId), gt(messages.id, after)))
+    .orderBy(asc(messages.id))
+    .all()
+    .map(toMessage);
+}
+
+/**
+ * `listMessages` for a measurement polled with the agent list: an image keeps its presence, which
+ * changes the text a transcript carries, but not its bytes, which nothing measured counts.
+ */
+export function listMessagesWithoutImages(db: Db, conversationId: number, after = 0): Message[] {
+  return db
+    .select({
+      ...getTableColumns(messages),
+      image: sql<string | null>`CASE WHEN ${messages.image} IS NULL THEN NULL ELSE '{}' END`,
+    })
     .from(messages)
     .where(and(eq(messages.conversationId, conversationId), gt(messages.id, after)))
     .orderBy(asc(messages.id))
@@ -365,6 +415,8 @@ export function agentChain(db: Db, conversationId: number): number {
     .filter(
       (message) =>
         message.sender !== null &&
+        // Only agents: a trigger firing or an idle note is not one agent answering another.
+        AGENT_NAME.test(message.sender) &&
         (message.role === 'user' ||
           (shared && message.role === 'assistant' && message.toolCalls === null)),
     ).length;
@@ -453,56 +505,6 @@ export function recordEvent(
   db.insert(events)
     .values({ agentId, type, data: JSON.stringify(data), createdAt: Date.now() })
     .run();
-}
-
-export const MAX_SEARCH_HITS = 50;
-const SNIPPET_CHARS = 240;
-
-/** A case-insensitive substring search over every thread, newest hits first. `LIKE` rather than
- * an index: a personal machine's threads are small enough, and a search is a human's request. */
-export function searchMessages(db: Db, needle: string): SearchHit[] {
-  const pattern = `%${needle.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
-  const rows = db
-    .select({
-      id: messages.id,
-      conversationId: messages.conversationId,
-      role: messages.role,
-      content: messages.content,
-      sender: messages.sender,
-      createdAt: messages.createdAt,
-    })
-    .from(messages)
-    .where(sql`${messages.content} LIKE ${pattern} ESCAPE '\\'`)
-    .orderBy(desc(messages.id))
-    .limit(MAX_SEARCH_HITS)
-    .all();
-  const participants = new Map<number, string[]>();
-  return rows.map((row) => {
-    let names = participants.get(row.conversationId);
-    if (names === undefined) {
-      names = participantAgents(db, row.conversationId).map((agent) => agent.name);
-      participants.set(row.conversationId, names);
-    }
-    return {
-      conversationId: row.conversationId,
-      participants: names,
-      message: {
-        id: row.id,
-        role: row.role as MessageRole,
-        content: snippet(row.content, needle),
-        ...(row.sender === null ? {} : { sender: row.sender }),
-        createdAt: row.createdAt,
-      },
-    };
-  });
-}
-
-function snippet(content: string, needle: string): string {
-  if (content.length <= SNIPPET_CHARS) return content;
-  const at = Math.max(0, content.toLowerCase().indexOf(needle.toLowerCase()));
-  const start = Math.max(0, at - SNIPPET_CHARS / 4);
-  const piece = content.slice(start, start + SNIPPET_CHARS);
-  return `${start > 0 ? '…' : ''}${piece}${start + SNIPPET_CHARS < content.length ? '…' : ''}`;
 }
 
 /** Oldest first. With a limit, the newest that many, still oldest first: a reader that shows

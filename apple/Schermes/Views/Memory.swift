@@ -15,33 +15,34 @@ struct MemoryView: View {
     private var changed: Bool { stored.map { $0.lasting != lasting } ?? false }
 
     var body: some View {
-        Form {
+        ThemedForm {
             Section {
                 if stored != nil {
                     TextEditor(text: $lasting)
                         .font(.callout.monospaced())
                         .frame(minHeight: 160)
-                    // Borderless, or a Form row with two buttons fires both on one tap.
-                    HStack(spacing: 16) {
+                    // A style of their own, or a Form row with two buttons fires both on one tap.
+                    HStack(spacing: 8) {
                         Button(saving ? "Saving…" : "Save", action: save)
+                            .buttonStyle(.pill(.primary))
                             .disabled(saving || !changed)
                         if changed {
                             Button("Revert") { lasting = stored?.lasting ?? "" }
+                                .buttonStyle(.pill(.secondary))
                         }
                     }
-                    .buttonStyle(.borderless)
                     if let trouble {
                         Text(trouble)
                             .font(.footnote)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(Theme.failed)
                     }
                 } else if let trouble {
-                    Text(trouble).foregroundStyle(.red)
+                    Text(trouble).foregroundStyle(Theme.failed)
                 } else {
                     ProgressView().frame(maxWidth: .infinity)
                 }
             } header: {
-                Text("Lasting memory")
+                Text("Lasting memory").formHeader()
             } footer: {
                 Text("~/memory/MEMORY.md, shown to \(agent.title) at the start of every turn. One fact per line. The agent adds to it with `remember`; you can correct it here.")
             }
@@ -49,7 +50,7 @@ struct MemoryView: View {
             Section {
                 if let stored {
                     if stored.today.isEmpty {
-                        Text("Nothing noted today.").foregroundStyle(.secondary)
+                        Text("Nothing noted today.").foregroundStyle(Theme.muted)
                     } else {
                         Text(stored.today)
                             .font(.callout.monospaced())
@@ -57,12 +58,11 @@ struct MemoryView: View {
                     }
                 }
             } header: {
-                Text("Today's note")
+                Text("Today's note").formHeader()
             } footer: {
                 Text("What it jotted down today. Not loaded into its prompt, but on disk for it to search.")
             }
         }
-        .formStyle(.grouped)
         .autocorrectionDisabled()
         .task(id: agent.name) { await load() }
         .refreshable { await load() }

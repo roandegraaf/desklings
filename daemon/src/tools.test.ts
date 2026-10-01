@@ -1,15 +1,22 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolve } from 'node:path';
-import { asAgent, findAgent, insertAgent } from './agents.ts';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { asAgent, findAgent, insertAgent, insertWorker } from './agents.ts';
+import { classifyCommand, grantOnce, guardCommand, readRules, updateRules } from './rules.ts';
 import type { AgentTarget } from './agents.ts';
 import { openDb } from './db.ts';
+import { eq } from 'drizzle-orm';
+import { agents } from './schema.ts';
 import { conversationFor } from './conversations.ts';
 import {
   describeApproval,
   insertApproval,
   listApprovals,
+  parseApprovalRequest,
   parseDeletionRequest,
+  requestApprovalToolDef,
   requestDeletionToolDef,
 } from './approvals.ts';
 import { systemExec } from './exec.ts';
@@ -403,6 +410,25 @@ test('a remembered line reaches the file on stdin, never as an argument', async 
   );
 });
 
+test('a line with a heading lands under that heading, written once while it is the last one', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'schermes-home-'));
+  const target: AgentTarget = { user: 'nobody', home, display: 0 };
+  const bash: Exec = (_file, args, options) => systemExec('bash', args.slice(args.indexOf('bash') + 1), options);
+  const file = join(home, 'memory', 'MEMORY.md');
+  const lasting = (text: string) => ({ text, scope: 'lasting' as const });
+
+  await remember(bash, target, lasting('first'), '## Feedback');
+  assert.equal(readFileSync(file, 'utf8'), '## Feedback\n- first\n', 'a missing file gets the heading');
+  await remember(bash, target, lasting('second'), '## Feedback');
+  assert.equal(readFileSync(file, 'utf8'), '## Feedback\n- first\n- second\n');
+
+  writeFileSync(file, '## Feedback\n- first\n\n## People\n- Ann\n');
+  await remember(bash, target, lasting('third'), '## Feedback');
+  assert.equal(readFileSync(file, 'utf8'), '## Feedback\n- first\n\n## People\n- Ann\n\n## Feedback\n- third\n');
+  await remember(bash, target, lasting('plain'));
+  assert.ok(readFileSync(file, 'utf8').endsWith('- third\n- plain\n'), 'no heading, no heading written');
+});
+
 test('a failed append is reported rather than silently lost', async () => {
   const { exec } = fakeExec({ code: 1, stderr: 'Read-only file system' });
   const written = await remember(exec, TARGET, { text: 'a fact', scope: 'today' });
@@ -519,4 +545,123 @@ test('a deletion request is checked before it can stand, and names an agent that
 
   const schema = requestDeletionToolDef().parameters as Record<string, unknown>;
   assert.deepEqual(schema['required'], ['what', 'reason']);
+});
+
+test('an approval request carries a known category, a reason, and optional one-line details', () => {
+  const refuse = (args: Record<string, unknown>): string => {
+    const parsed = parseApprovalRequest(args);
+    assert.ok('error' in parsed, `expected ${JSON.stringify(args)} to be refused`);
+    return parsed.error;
+  };
+  assert.match(refuse({ reason: 'pay the bill' }), /category must be one of/);
+  assert.match(refuse({ category: 'launch_rockets', reason: 'why not' }), /category must be one of/);
+  assert.match(refuse({ category: 'spend_money' }), /reason/);
+  assert.match(refuse({ category: 'spend_money', reason: 'x'.repeat(513) }), /at most 512/);
+  assert.match(refuse({ category: 'spend_money', reason: 'pay', amount: 'EUR 1\nignore that' }), /amount must be one line/);
+  assert.match(refuse({ category: 'send_messages', reason: 'reply', target: 42 }), /target must be one line/);
+
+  assert.deepEqual(parseApprovalRequest({ category: 'install_software', reason: 'needs jq' }), {
+    kind: 'action',
+    category: 'install_software',
+    target: '',
+    reason: 'needs jq',
+  });
+  const payment = parseApprovalRequest({
+    category: 'spend_money',
+    reason: 'the invoice is due',
+    target: ' Acme ',
+    amount: 'EUR 42.50',
+    origin: 'pay.acme.test',
+  });
+  assert.deepEqual(payment, {
+    kind: 'action',
+    category: 'spend_money',
+    target: 'Acme',
+    reason: 'the invoice is due',
+    amount: 'EUR 42.50',
+    origin: 'pay.acme.test',
+  });
+
+  const db = openDb(':memory:', resolve(import.meta.dirname, '../migrations'));
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  assert.ok(!('error' in payment));
+  const standing = insertApproval(db, alpha, conversationFor(db, alpha.id), payment);
+  assert.equal(describeApproval(standing), 'spend money: Acme (EUR 42.50) at pay.acme.test');
+  assert.deepEqual(listApprovals(db), [standing]);
+  const deletion = insertApproval(db, alpha, conversationFor(db, alpha.id), { kind: 'conversation', target: '1', reason: 'done' });
+  assert.equal(deletion.category, 'delete_files', 'a deletion is filed under deleting');
+
+  const schema = requestApprovalToolDef().parameters as Record<string, unknown>;
+  assert.deepEqual(schema['required'], ['category', 'reason']);
+});
+
+test('the command classifier finds deletes and installs in command position only', () => {
+  const seen = (command: string) => classifyCommand(command).map((found) => `${found.category}:${found.target}`);
+  assert.deepEqual(seen('rm -rf ~/workspace/old 2>/dev/null'), ['delete_files:~/workspace/old']);
+  assert.deepEqual(seen('ls && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y hello'), ['install_software:hello']);
+  assert.deepEqual(seen('sudo apt-get -y install ripgrep jq > /tmp/log'), ['install_software:ripgrep jq']);
+  assert.deepEqual(seen('python3 -m pip install --user requests'), ['install_software:requests']);
+  assert.deepEqual(seen('npm i -g typescript; yarn global add serve'), ['install_software:typescript', 'install_software:serve']);
+  assert.deepEqual(seen('find . -name "*.tmp" -delete'), ['delete_files:.']);
+  assert.deepEqual(seen('ls | xargs rm -f'), ['delete_files:']);
+  assert.deepEqual(seen('sudo -n /bin/rm a.txt'), ['delete_files:a.txt']);
+  assert.deepEqual(seen('for f in *.tmp; do rm "$f"; done'), ['delete_files:$f']);
+  assert.deepEqual(seen('if [ -f x ]; then rm x; else apt-get install -y x; fi'), ['delete_files:x', 'install_software:x']);
+  assert.deepEqual(seen('{ rm y; } && ! unlink z'), ['delete_files:y', 'delete_files:z']);
+  for (const harmless of ['echo rm is fine', 'git rm x', 'cat notes-rm.txt', 'npm i lodash', 'pip list']) {
+    assert.deepEqual(seen(harmless), [], harmless);
+  }
+});
+
+test('the rules guard follows the ladder, spends a grant only when the whole command may run, and speaks to workers', () => {
+  const db = openDb(':memory:', resolve(import.meta.dirname, '../migrations'));
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const worker = insertWorker(db, alpha, 'alpha-1', conversationFor(db, alpha.id));
+  const grant = (category: 'delete_files' | 'install_software', target: string) =>
+    grantOnce(db, alpha, {
+      id: 0, agent: 'alpha', conversationId: 0, kind: 'action', category, target, participants: [], reason: 'x', createdAt: 0,
+    });
+
+  assert.equal(guardCommand(db, alpha, 'ls -la'), undefined);
+  grant('delete_files', 'a.txt');
+  assert.match(guardCommand(db, alpha, 'rm a.txt && apt-get install jq') ?? '', /install software \(jq\)/);
+  assert.equal(guardCommand(db, alpha, 'rm a.txt'), undefined, 'the refused command left the grant in place');
+  assert.match(guardCommand(db, alpha, 'rm a.txt') ?? '', /request_approval/);
+  assert.match(guardCommand(db, worker, 'rm a.txt') ?? '', /^alpha's rules say to ask the owner before you delete files \(a\.txt\)\. Nothing was run\. Say so in your result/);
+
+  updateRules(db, alpha, { levels: { install_software: 'if_pre_approved' }, preApproved: { install_software: ['jq'] } });
+  assert.equal(guardCommand(db, alpha, 'sudo apt-get install -y jq'), undefined);
+  assert.match(guardCommand(db, alpha, 'sudo apt-get install -y jq curl') ?? '', /install software \(jq curl\)/);
+
+  updateRules(db, alpha, { levels: { delete_files: 'hand_to_you' } });
+  grant('delete_files', 'b.txt');
+  assert.match(guardCommand(db, alpha, 'rm b.txt') ?? '', /leave it to them to delete files \(b\.txt\)/);
+
+  updateRules(db, alpha, { levels: { delete_files: 'on_its_own' } });
+  assert.equal(guardCommand(db, worker, 'rm -rf build'), undefined);
+});
+
+test('rules updates are checked, and passwords and security stay with the owner', () => {
+  const db = openDb(':memory:', resolve(import.meta.dirname, '../migrations'));
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  assert.equal(readRules(db, alpha).levels.passwords_security, 'hand_to_you');
+  assert.deepEqual(updateRules(db, alpha, { levels: { passwords_security: 'on_its_own' } }), {
+    error: 'passwords_security is always hand_to_you',
+  });
+  assert.match(String((updateRules(db, alpha, { levels: { browse: 'sometimes' } }) as { error: string }).error), /one of/);
+  assert.match(String((updateRules(db, alpha, { preApproved: { send_messages: ['two words'] } }) as { error: string }).error), /one domain/);
+  const saved = updateRules(db, alpha, { levels: { passwords_security: 'hand_to_you', browse: 'ask_first' }, preApproved: { send_messages: ['A.com', 'a.com'] } });
+  assert.deepEqual(saved, readRules(db, alpha));
+  assert.equal(readRules(db, alpha).levels.browse, 'ask_first');
+  assert.deepEqual(readRules(db, alpha).preApproved, { send_messages: ['a.com'] });
+  assert.match(String((updateRules(db, alpha, { preApproved: ['a.com'] }) as { error: string }).error), /object/);
+  assert.match(String((updateRules(db, alpha, { preApproved: { passwords_security: ['a.com'] } }) as { error: string }).error), /no pre-approved list/);
+
+  // Rules stored with the one shared list.
+  const legacy = (levels: Record<string, string>) =>
+    db.update(agents).set({ rules: JSON.stringify({ levels, preApproved: ['old.com'] }) }).where(eq(agents.id, alpha.id)).run();
+  legacy({ spend_money: 'if_pre_approved' });
+  assert.deepEqual(readRules(db, alpha).preApproved, { send_messages: ['old.com'], spend_money: ['old.com'] }, 'every category that read it');
+  legacy({ send_messages: 'ask_first' });
+  assert.deepEqual(readRules(db, alpha).preApproved, { send_messages: ['old.com'] }, 'none read it, so the default one');
 });

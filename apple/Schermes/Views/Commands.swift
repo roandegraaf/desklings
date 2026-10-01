@@ -20,7 +20,7 @@ enum SlashCommand: String, CaseIterable, Identifiable {
         case .interview: "Have the agent interview you about its role"
         case .screen: "Open the agent's screen"
         case .profile: "Open the profile"
-        case .routines: "Open the routines"
+        case .routines: "Open the routines and triggers"
         case .activity: "Open the activity log"
         case .memory: "Open the memory files"
         }

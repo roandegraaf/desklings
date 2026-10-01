@@ -1,29 +1,6 @@
 import QuickLook
 import SwiftUI
 
-extension AgentState {
-    var tint: Color {
-        switch self {
-        case .failed: .red
-        case .thinking, .using_computer, .using_terminal: .orange
-        case .waiting_for_agent, .waiting_for_task_worker: .blue
-        case .completed: .secondary
-        case .idle, .waiting_for_user: .green
-        }
-    }
-}
-
-struct StateDot: View {
-    let state: AgentState
-
-    var body: some View {
-        Circle()
-            .fill(state.tint)
-            .frame(width: 7, height: 7)
-            .accessibilityLabel(state.label)
-    }
-}
-
 /// Something arrived in this thread that the owner has not looked at.
 struct UnreadDot: View {
     var body: some View {
@@ -40,18 +17,27 @@ struct ScreenshotView: View {
     var fit = CGSize(width: 240, height: 180)
 
     @State private var previewing: URL?
+    @State private var decoded: Decoded?
+    @State private var unreadable = false
     @Environment(\.displayScale) private var displayScale
     #if os(iOS)
     @State private var saving: URL?
     #endif
 
+    private var maxPixels: Int { Int((max(fit.width, fit.height) * displayScale).rounded(.up)) }
+
+    private func frame(_ size: CGSize) -> CGSize {
+        let scale = min(fit.width / size.width, fit.height / size.height, 1)
+        return CGSize(width: size.width * scale, height: size.height * scale)
+    }
+
     var body: some View {
-        if let (decoded, size) = Self.load(image, maxPixels: Int((max(fit.width, fit.height) * displayScale).rounded(.up))) {
-            let scale = min(fit.width / size.width, fit.height / size.height, 1)
+        if let hit = decoded ?? Self.cached(image, maxPixels: maxPixels) {
+            let frame = frame(hit.size)
             Button { previewing = try? imageFile(image) } label: {
-                decoded
+                Image(decorative: hit.image, scale: 1)
                     .resizable()
-                    .frame(width: size.width * scale, height: size.height * scale)
+                    .frame(width: frame.width, height: frame.height)
                     .clipShape(.rect(cornerRadius: 12))
             }
             .buttonStyle(.plain)
@@ -71,6 +57,25 @@ struct ScreenshotView: View {
                 file: saving
             ) { _ in }
             #endif
+        } else if unreadable {
+            Label("screenshot could not be read", systemImage: "photo")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else if let size = imageSize(image) {
+            // The picture's own frame from the header, so the row does not change height under
+            // the reader when the pixels land; decoding them is what would stall the scroll.
+            let frame = frame(size)
+            RoundedRectangle(cornerRadius: 12)
+                .fill(.fill.tertiary)
+                .frame(width: frame.width, height: frame.height)
+                .task {
+                    let image = image, maxPixels = maxPixels
+                    let fresh = await Task.detached(priority: .userInitiated) {
+                        imageThumbnail(image, maxPixels: maxPixels)
+                    }.value
+                    guard let fresh else { unreadable = true; return }
+                    decoded = Self.remember(image, Decoded(image: fresh.image, size: fresh.size))
+                }
         } else {
             Label("screenshot could not be read", systemImage: "photo")
                 .font(.caption)
@@ -98,14 +103,15 @@ struct ScreenshotView: View {
         }
     }
 
-    private static func load(_ image: Base64Image, maxPixels: Int) -> (Image, CGSize)? {
-        let key = image.base64 as NSString
-        if let hit = decoded.object(forKey: key),
-           max(hit.image.width, hit.image.height) >= min(maxPixels, Int(max(hit.size.width, hit.size.height))) {
-            return (Image(decorative: hit.image, scale: 1), hit.size)
-        }
-        guard let fresh = imageThumbnail(image, maxPixels: maxPixels) else { return nil }
-        decoded.setObject(Decoded(image: fresh.image, size: fresh.size), forKey: key)
-        return (Image(decorative: fresh.image, scale: 1), fresh.size)
+    private static func cached(_ image: Base64Image, maxPixels: Int) -> Decoded? {
+        guard let hit = decoded.object(forKey: image.base64 as NSString),
+              max(hit.image.width, hit.image.height) >= min(maxPixels, Int(max(hit.size.width, hit.size.height)))
+        else { return nil }
+        return hit
+    }
+
+    private static func remember(_ image: Base64Image, _ fresh: Decoded) -> Decoded {
+        decoded.setObject(fresh, forKey: image.base64 as NSString)
+        return fresh
     }
 }

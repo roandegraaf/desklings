@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { LiveReply } from '@schermes/shared';
-import { openAiProvider } from './provider.ts';
+import { MAX_ATTEMPTS, ProviderError, openAiProvider, parseRetryAfter, withRetries } from './provider.ts';
+import type { Provider } from './provider.ts';
 
 function sse(lines: readonly string[]): Response {
   const encoder = new TextEncoder();
@@ -46,6 +47,10 @@ const plainOk = () =>
   });
 
 const provider = openAiProvider({ baseUrl: 'http://stub/v1/', model: 'm', apiKey: 'secret-key' });
+
+const instant = () => Promise.resolve();
+const retried = (inner: Provider) =>
+  withRetries({ primary: { provider: inner, modelId: 1, name: 'Main' }, sleep: instant }).provider;
 
 test('a streamed reply is assembled from deltas and heard while it arrives', async () => {
   const heard: LiveReply[] = [];
@@ -103,7 +108,7 @@ test('a 5xx is asked once more, and the extra body rides under every request', a
   });
   const { result, sent, calls } = await withFetch(
     () => replies.shift() ?? plainOk(),
-    () => routed([{ role: 'user', text: 'hi' }], []),
+    () => retried(routed)([{ role: 'user', text: 'hi' }], []),
   );
   assert.equal(calls, 2);
   assert.deepEqual(result, { text: 'ok', toolCalls: [] });
@@ -119,7 +124,7 @@ test('an upstream timeout reported inside the stream is asked once more', async 
   ];
   const { result, calls } = await withFetch(
     () => replies.shift() ?? plainOk(),
-    () => provider([{ role: 'user', text: 'hi' }], []),
+    () => retried(provider)([{ role: 'user', text: 'hi' }], []),
   );
   assert.equal(calls, 2);
   assert.deepEqual(result, { text: 'ok', toolCalls: [] });
@@ -180,4 +185,149 @@ test('a stopped call ends at once and is not retried', async () => {
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test('a 429 is tried 5 times in all, waiting longer each time, and the last error names the attempts', async () => {
+  const waited: number[] = [];
+  const seen: (number | undefined)[] = [];
+  const { provider: calling } = withRetries({
+    primary: { provider, modelId: 1, name: 'Main' },
+    baseMs: 10,
+    sleep: (ms) => {
+      waited.push(ms);
+      return Promise.resolve();
+    },
+    onWait: (state) => seen.push(state?.attempt),
+  });
+  const { calls } = await withFetch(
+    () => new Response('slow down', { status: 429 }),
+    async () => {
+      await assert.rejects(calling([{ role: 'user', text: 'hi' }], []), (error: ProviderError) => {
+        assert.match(error.message, /^after 5 attempts, provider returned HTTP 429/);
+        assert.equal(error.status, 429);
+        return true;
+      });
+    },
+  );
+  assert.equal(calls, MAX_ATTEMPTS);
+  assert.deepEqual(waited, [10, 20, 40, 80]);
+  assert.deepEqual(seen, [2, 3, 4, 5, undefined], 'each wait is shown, and cleared at the end');
+});
+
+test('Retry-After decides the wait, in seconds or as a date', async () => {
+  assert.equal(parseRetryAfter('3'), 3000);
+  assert.equal(parseRetryAfter('Wed, 30 Sep 2026 12:00:10 GMT', Date.parse('Wed, 30 Sep 2026 12:00:00 GMT')), 10_000);
+  assert.equal(parseRetryAfter('soon'), undefined);
+  assert.equal(parseRetryAfter(null), undefined);
+
+  const waited: number[] = [];
+  const replies = [new Response('busy', { status: 503, headers: { 'retry-after': '7' } }), plainOk()];
+  const { provider: calling } = withRetries({
+    primary: { provider, modelId: 1, name: 'Main' },
+    sleep: (ms) => {
+      waited.push(ms);
+      return Promise.resolve();
+    },
+  });
+  await withFetch(() => replies.shift() ?? plainOk(), () => calling([{ role: 'user', text: 'hi' }], []));
+  assert.deepEqual(waited, [7000]);
+});
+
+test('a refused key is not asked again and is reported against its model', async () => {
+  const refused: (number | undefined)[] = [];
+  const { provider: calling } = withRetries({
+    primary: { provider, modelId: 4, name: 'Main' },
+    sleep: instant,
+    onAuthFailure: (call) => refused.push(call.modelId),
+  });
+  const { calls } = await withFetch(
+    () => new Response('bad key', { status: 401 }),
+    async () => {
+      await assert.rejects(calling([{ role: 'user', text: 'hi' }], []), /HTTP 401/);
+    },
+  );
+  assert.equal(calls, 1);
+  assert.deepEqual(refused, [4]);
+});
+
+test('a plain error from outside the endpoint is not retried', async () => {
+  let calls = 0;
+  const failing: Provider = () => {
+    calls += 1;
+    return Promise.reject(new Error('the script ran out of replies'));
+  };
+  await assert.rejects(retried(failing)([{ role: 'user', text: 'hi' }], []), /ran out/);
+  assert.equal(calls, 1);
+});
+
+const busy = (): Promise<never> => Promise.reject(new ProviderError('provider returned HTTP 503: busy', true, 503));
+const ok: Provider = () => Promise.resolve({ text: 'ok', toolCalls: [] });
+
+test('Retry now cuts the wait short', async () => {
+  let calls = 0;
+  const flaky: Provider = (...args) => (++calls === 1 ? busy() : ok(...args));
+  const { provider: calling, control } = withRetries({
+    primary: { provider: flaky, modelId: 1, name: 'Main' },
+    baseMs: 60_000,
+    onWait: (state) => {
+      if (state !== undefined) setImmediate(() => assert.equal(control.now(), true));
+    },
+  });
+  const started = Date.now();
+  assert.equal((await calling([{ role: 'user', text: 'hi' }], [])).text, 'ok');
+  assert.ok(Date.now() - started < 5_000);
+  assert.equal(control.now(), false, 'nothing is waiting any more');
+});
+
+test('Use backup model sends the rest of the turn to the backup, and is offered only while it can', async () => {
+  const used: string[] = [];
+  const offered: (string | undefined)[] = [];
+  const primary: Provider = () => {
+    used.push('main');
+    return busy();
+  };
+  const backup: Provider = (...args) => {
+    used.push('backup');
+    return ok(...args);
+  };
+  const { provider: calling, control } = withRetries({
+    primary: { provider: primary, modelId: 1, name: 'Main' },
+    backup: { provider: backup, modelId: 2, name: 'Spare' },
+    baseMs: 60_000,
+    onWait: (state) => {
+      if (state === undefined) return;
+      offered.push(state.backup);
+      setImmediate(() => assert.equal(control.useBackup(), true));
+    },
+  });
+  await calling([{ role: 'user', text: 'hi' }], []);
+  await calling([{ role: 'user', text: 'again' }], []);
+  assert.deepEqual(used, ['main', 'backup', 'backup']);
+  assert.deepEqual(offered, ['Spare']);
+
+  const { control: alone } = withRetries({ primary: { provider: primary, modelId: 1, name: 'Main' } });
+  assert.equal(alone.useBackup(), false);
+});
+
+test('a stop during the wait ends the call at once', async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  const { provider: calling } = withRetries({
+    primary: {
+      provider: () => {
+        calls += 1;
+        return busy();
+      },
+      modelId: 1,
+      name: 'Main',
+    },
+    baseMs: 60_000,
+    onWait: (state) => {
+      if (state !== undefined) setImmediate(() => controller.abort(new Error('stopped by the owner')));
+    },
+  });
+  const started = Date.now();
+  await assert.rejects(calling([{ role: 'user', text: 'hi' }], [], undefined, controller.signal), /stopped by the owner/);
+  assert.ok(Date.now() - started < 5_000);
+  assert.equal(calls, 1);
 });

@@ -1,0 +1,1 @@
+ALTER TABLE `triggers` ADD `last_error` text;

@@ -51,6 +51,23 @@ nonisolated func imageThumbnail(_ image: Base64Image, maxPixels: Int) -> (image:
     return (thumbnail, CGSize(width: CGFloat(thumbnail.width) * longest, height: CGFloat(thumbnail.height) * longest))
 }
 
+/// The size from the header alone, with no pixels decoded, so a row can take the picture's exact
+/// frame while the pixels are decoded off the main thread. Read from the first 96 KB: a PNG says
+/// its size in its first chunk, a JPEG in a frame header past whatever metadata precedes it.
+nonisolated func imageSize(_ image: Base64Image) -> CGSize? {
+    let head = Data(image.base64.utf8.prefix(131_072))
+    guard let data = Data(base64Encoded: head) else { return nil }
+    let source = CGImageSourceCreateIncremental(nil)
+    CGImageSourceUpdateData(source, data as CFData, head.count == image.base64.utf8.count)
+    guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = properties[kCGImagePropertyPixelWidth] as? Int,
+          let height = properties[kCGImagePropertyPixelHeight] as? Int,
+          width > 0, height > 0
+    else { return nil }
+    let rotated = (properties[kCGImagePropertyOrientation] as? UInt32).map { $0 >= 5 } ?? false
+    return rotated ? CGSize(width: height, height: width) : CGSize(width: width, height: height)
+}
+
 /// On disk, because Quick Look, the pasteboard and a save all take a file. A folder per image keeps
 /// the name plain for a save and makes opening it again overwrite rather than pile up.
 nonisolated func imageFile(_ image: Base64Image) throws -> URL {

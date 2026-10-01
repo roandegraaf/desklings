@@ -8,7 +8,7 @@ daemon really sent tool definitions, a bearer token, a base64 PNG and named send
 
 Binds 127.0.0.1 only: check.sh asserts nothing but the web port listens off loopback.
 
-    STUB_SCRIPT=tools|busy|talk|worker|memory|web STUB_SENDER=agent STUB_TO=agent \
+    STUB_SCRIPT=tools|busy|talk|worker|memory|web|interview|guarded STUB_SENDER=agent STUB_TO=agent \
     STUB_CMD_TIMEOUT_MS=30000 provider-stub.py PORT NONCE COMMAND
 
   tools  screenshot, run COMMAND, then report. The original script.
@@ -27,6 +27,13 @@ Binds 127.0.0.1 only: check.sh asserts nothing but the web port listens off loop
          STUB_SENDER's first call puts two questions to the owner with ask_owner, its second
          writes a profile carrying the nonce with set_profile, and it reports from the third on.
          Everyone else reports straight away.
+  guarded
+         STUB_SENDER runs COMMAND (a delete its rules refuse), then asks the owner about it with
+         request_approval, then proposes a webhook trigger, then reports. Everyone else reports
+         straight away.
+
+A key of the form `status-NNN` (a model in the registry with that api key) makes every call
+answer HTTP NNN instead, with `Retry-After: 20` on a 429: the recovery path's 429, 5xx and 401.
 """
 
 import json
@@ -78,7 +85,8 @@ def heard(messages):
     for message in messages:
         if message.get("role") != "user":
             continue
-        found = re.match(r"Message from (.+?):", text_of(message))
+        text = text_of(message)
+        found = re.match(r"Message from (.+?):", text) or re.match(r"(\S+) said here, to the owner:", text)
         name = found.group(1).replace(" ", "_") if found else None
         if name and name not in names:
             names.append(name)
@@ -156,6 +164,16 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         body = json.loads(self.rfile.read(int(self.headers["content-length"] or 0)))
+        failing = re.fullmatch(r"Bearer status-(\d{3})", self.headers.get("authorization") or "")
+        if failing:
+            status = int(failing.group(1))
+            self.send_response(status)
+            if status == 429:
+                self.send_header("retry-after", "20")
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": {"message": f"stub answered {status}"}}).encode())
+            return
         # Only that a bearer token arrived; the key itself must not be echoed anywhere.
         authorized = (self.headers.get("authorization") or "").startswith("Bearer ")
         who = agent_of(body.get("messages", []))
@@ -190,6 +208,20 @@ class Handler(BaseHTTPRequestHandler):
         elif SCRIPT == "talk" and SENDER and who == SENDER and nth == 1:
             asked = tool_call(
                 f"msg-{nth}", "send_message", {"to": TO, "text": f"{NONCE} what is your hostname?"}
+            )
+        elif SCRIPT == "guarded" and SENDER and who == SENDER and nth == 1:
+            asked = run
+        elif SCRIPT == "guarded" and SENDER and who == SENDER and nth == 2:
+            asked = tool_call(
+                f"ask-{nth}",
+                "request_approval",
+                {"category": "delete_files", "target": NONCE, "reason": f"{NONCE} clear out the scratch file"},
+            )
+        elif SCRIPT == "guarded" and SENDER and who == SENDER and nth == 3:
+            asked = tool_call(
+                f"hook-{nth}",
+                "propose_trigger",
+                {"kind": "webhook", "reason": f"{NONCE} wake me when the smoke run posts"},
             )
         elif SCRIPT == "interview" and SENDER and who == SENDER and nth == 1:
             said = "Hi, a couple of questions first."

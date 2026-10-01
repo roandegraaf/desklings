@@ -2,7 +2,7 @@ import { Cron } from 'croner';
 import { and, asc, eq, lte } from 'drizzle-orm';
 import type { Agent, Schedule } from '@schermes/shared';
 import { findAgentById } from './agents.ts';
-import { appendMessage, conversationFor, recordEvent } from './conversations.ts';
+import { SYSTEM_SENDER, appendMessage, conversationFor, recordEvent } from './conversations.ts';
 import { log } from './log.ts';
 import { schedules } from './schema.ts';
 import type { Db } from './db.ts';
@@ -179,7 +179,7 @@ export function runDue(db: Db, runner: Runner, now: number = Date.now()): number
     db.update(schedules).set({ nextRunAt: due, lastRunAt: now }).where(eq(schedules.id, row.id)).run();
 
     const conversationId = conversationFor(db, agent.id);
-    appendMessage(db, conversationId, { role: 'user', content: delivery(schedule) });
+    appendMessage(db, conversationId, { role: 'user', content: delivery(schedule), sender: SYSTEM_SENDER });
     runner.start(agent, conversationId);
     fired += 1;
     log.info('schedule fired', { schedule: schedule.id, agent: agent.name, nextRunAt: due });

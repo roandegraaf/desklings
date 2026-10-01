@@ -49,17 +49,15 @@ enum ThreadSource: Hashable, Sendable {
     }
 }
 
-/// `GET` and `PUT /api/settings` carry the provider half and the web half in one object, which is
-/// `Settings` in `ui/src/api.ts`.
+/// `GET` and `PUT /api/settings` carry the web and push halves in one object. The provider fields
+/// it still carries are the default model's, which the app edits through `/api/models` instead.
 struct DaemonSettings: Decodable, Sendable {
-    var provider: ProviderSettings
     var web: WebSettings
     var push: PushSettings
 
     private enum Keys: String, CodingKey { case push }
 
     init(from decoder: any Decoder) throws {
-        provider = try ProviderSettings(from: decoder)
         web = try WebSettings(from: decoder)
         // Absent on a daemon from before push existed, which is not a reason to refuse the
         // settings screen.
@@ -70,12 +68,10 @@ struct DaemonSettings: Decodable, Sendable {
 }
 
 struct DaemonSettingsUpdate: Encodable, Sendable {
-    var provider: ProviderSettingsUpdate
     var web: WebSettingsUpdate
     var push: PushSettingsUpdate
 
     func encode(to encoder: any Encoder) throws {
-        try provider.encode(to: encoder)
         try web.encode(to: encoder)
         try push.encode(to: encoder)
     }
@@ -84,45 +80,28 @@ struct DaemonSettingsUpdate: Encodable, Sendable {
 /// What the settings pages edit. Only made from what the daemon answered, because a page's save
 /// sends every field it owns and one made from an empty form would blank them. The keys are
 /// write-only and start blank.
+/// The body of every route that picks a model. `nil` goes out as `null`, never left out: the
+/// daemon reads a missing id as no such model.
+func modelPick(_ id: Int?) -> [String: Int?] { ["id": id] }
+
 struct SettingsForm: Equatable {
-    var baseUrl: String
-    var model: String
-    var extraBody: String
     var searchUrl: String
     var pushKeyId: String
-    var apiKey = ""
     var searchKey = ""
     var pushKey = ""
 
     init(_ settings: DaemonSettings) {
-        baseUrl = settings.provider.baseUrl
-        model = settings.provider.model
-        extraBody = settings.provider.extraBody
         searchUrl = settings.web.searchUrl
         pushKeyId = settings.push.keyId
     }
 
     /// One page at a time: `PUT /api/settings` keeps every field a body leaves out, so a page
-    /// sends its own fields and the other two halves encode to nothing.
+    /// sends its own fields and the other half encodes to nothing.
     ///
     /// The daemon writes whatever string it is given, so a blank key is left out rather than sent
     /// as `""`, which would erase it. Every other field always goes: empty is how one is cleared.
-    var modelUpdate: DaemonSettingsUpdate {
-        DaemonSettingsUpdate(
-            provider: ProviderSettingsUpdate(
-                baseUrl: baseUrl,
-                model: model,
-                apiKey: apiKey.isEmpty ? nil : apiKey,
-                extraBody: typedJSON(extraBody)
-            ),
-            web: WebSettingsUpdate(),
-            push: PushSettingsUpdate()
-        )
-    }
-
     var webUpdate: DaemonSettingsUpdate {
         DaemonSettingsUpdate(
-            provider: ProviderSettingsUpdate(),
             web: WebSettingsUpdate(searchUrl: searchUrl, searchKey: searchKey.isEmpty ? nil : searchKey),
             push: PushSettingsUpdate()
         )
@@ -130,7 +109,6 @@ struct SettingsForm: Equatable {
 
     var pushUpdate: DaemonSettingsUpdate {
         DaemonSettingsUpdate(
-            provider: ProviderSettingsUpdate(),
             web: WebSettingsUpdate(),
             push: PushSettingsUpdate(pushKeyId: pushKeyId, pushKey: pushKey.isEmpty ? nil : pushKey)
         )
@@ -383,8 +361,13 @@ struct SchermesClient: Sendable {
         try await send("GET", url("/api/agents"))
     }
 
-    func createAgent(name: String, label: String, look: String) async throws -> Agent {
-        try await send("POST", url("/api/agents"), body: ["name": name, "label": label, "look": look])
+    func createAgent(_ request: AgentCreate) async throws -> Agent {
+        try await send("POST", url("/api/agents"), body: request)
+    }
+
+    /// One model call: a name, label, look, rules and routine for what the owner described.
+    func suggestAgent(description: String) async throws -> AgentSuggestion {
+        try await send("POST", url("/api/agents/suggest"), body: ["description": description])
     }
 
     /// Changes what the owner sees and what the agent is told it is: the label, the avatar, the
@@ -416,6 +399,11 @@ struct SchermesClient: Sendable {
         )
     }
 
+    /// Passes a message or a file on to `agent`, which answers it in its own thread.
+    func forward(to agent: String, _ request: ForwardRequest) async throws -> ForwardResult {
+        try await send("POST", url("/api/agents/\(Self.escape(agent))/forward"), body: request)
+    }
+
     /// A file from inside the agent's home, as the agent named it: `~/…` or the full path.
     func file(agent: String, path: String) async throws -> AgentFile {
         guard var parts = URLComponents(url: try url("/api/agents/\(Self.escape(agent))/files"), resolvingAgainstBaseURL: false)
@@ -433,19 +421,44 @@ struct SchermesClient: Sendable {
         try await send("PUT", url("/api/agents/\(Self.escape(agent))/memory"), body: ["lasting": lasting])
     }
 
-    /// Every thread at once. The daemon clips each hit to a snippet around the match.
-    func search(_ needle: String) async throws -> [SearchHit] {
-        guard var parts = URLComponents(url: try url("/api/search"), resolvingAgainstBaseURL: false)
-        else { throw SchermesError.badURL }
-        parts.queryItems = [URLQueryItem(name: "q", value: needle)]
-        guard let built = parts.url else { throw SchermesError.badURL }
-        return try await send("GET", built)
+    /// A question over every thread, every agent's files and the text in their screenshots.
+    func ask(_ question: String) async throws -> SearchAnswer {
+        try await send("POST", url("/api/search"), body: ["q": question])
     }
 
-    /// One model call against the stored provider settings, on the settings screen rather than
-    /// a turn later in an agent's thread.
-    func testProvider() async throws -> ProviderTestResult {
-        try await send("POST", url("/api/settings/test"), body: Empty())
+    func models() async throws -> [ModelEntry] {
+        try await send("GET", url("/api/models"))
+    }
+
+    func createModel(_ update: ModelUpdate) async throws -> ModelEntry {
+        try await send("POST", url("/api/models"), body: update)
+    }
+
+    func updateModel(id: Int, _ update: ModelUpdate) async throws -> ModelEntry {
+        try await send("PUT", url("/api/models/\(id)"), body: update)
+    }
+
+    func deleteModel(id: Int) async throws {
+        let _: Empty = try await send("DELETE", url("/api/models/\(id)"))
+    }
+
+    func setDefaultModel(id: Int) async throws -> [ModelEntry] {
+        try await send("PUT", url("/api/models/default"), body: modelPick(id))
+    }
+
+    /// `nil` leaves no backup.
+    func setBackupModel(id: Int?) async throws -> [ModelEntry] {
+        try await send("PUT", url("/api/models/backup"), body: modelPick(id))
+    }
+
+    /// One model call against what is stored for that entry, no tools.
+    func testModel(id: Int) async throws -> ProviderTestResult {
+        try await send("POST", url("/api/models/\(id)/test"), body: Empty())
+    }
+
+    /// `nil` puts the agent back on the default. Answers the agent as it now is.
+    func assignModel(agent: String, id: Int?) async throws -> Agent {
+        try await send("PUT", url("/api/agents/\(Self.escape(agent))/model"), body: modelPick(id))
     }
 
     /// A conversation id is a number the daemon handed out, so only the agent half is escaped.
@@ -465,10 +478,19 @@ struct SchermesClient: Sendable {
     }
 
     /// Removes everything from `from` on. With `retry`, the agents answer the message left last again.
-    func rewind(_ source: ThreadSource, from: Int, retry: Bool) async throws {
+    /// With `files`, every agent in the thread also gets its home back as it was at that point.
+    func rewind(_ source: ThreadSource, from: Int, retry: Bool, files: Bool = false) async throws {
         struct Done: Decodable { let ok: Bool }
-        struct Body: Encodable { var from: Int; var retry: Bool }
-        let _: Done = try await send("POST", url(Self.path(source) + "/rewind"), body: Body(from: from, retry: retry))
+        struct Body: Encodable { var from: Int; var retry: Bool; var files: Bool }
+        let _: Done = try await send(
+            "POST",
+            url(Self.path(source) + "/rewind"),
+            body: Body(from: from, retry: retry, files: files)
+        )
+    }
+
+    func rewindPreview(_ source: ThreadSource, from: Int) async throws -> RewindPreview {
+        try await send("GET", url(Self.path(source) + "/rewind").appending(queryItems: [URLQueryItem(name: "from", value: String(from))]))
     }
 
     /// Folds everything since the last summary into a new one, for every agent in the thread, the
@@ -494,12 +516,21 @@ struct SchermesClient: Sendable {
         try await send("GET", url("/api/devices"))
     }
 
+    #if !SCHERMES_EXTENSION
     /// This device, so the daemon can reach it when the app is not running. Upserted by token.
     /// The build says who it is alongside, which is what the daemon's push settings are made of.
     func registerDevice(_ registration: PushRegistration, token: String) async throws {
         var body = ["token": token, "platform": registration.platform, "bundleId": registration.bundleId, "environment": registration.environment]
         if let teamId = registration.teamId { body["teamId"] = teamId }
         let _: Empty = try await send("POST", url("/api/devices"), body: body)
+    }
+    #endif
+
+    /// A Live Activity token: the phone's push-to-start one, or a running activity's with its agent.
+    func registerLiveActivity(token: String, kind: String, agent: String?) async throws {
+        var body = ["token": token, "kind": kind]
+        if let agent { body["agent"] = agent }
+        let _: Empty = try await send("POST", url("/api/live-activities"), body: body)
     }
 
     func unregisterDevice(token: String) async throws {
@@ -519,14 +550,24 @@ struct SchermesClient: Sendable {
         let _: Empty = try await send("DELETE", url("/api/conversations/\(id)"))
     }
 
-    func approvals() async throws -> [Approval] {
-        try await send("GET", url("/api/approvals"))
+    func needsYou() async throws -> [NeedsYouItem] {
+        try await send("GET", url("/api/needs-you"))
     }
 
     /// The owner's answer. Either way the request is gone afterwards and the agent that asked is
     /// told, in the thread it asked in.
-    func decide(approval: Int, approve: Bool) async throws {
-        let _: Empty = try await send("POST", url("/api/approvals/\(approval)"), body: ["approve": approve])
+    /// `always` also puts the approval's origin or recipient on the agent's pre-approved list.
+    func decide(approval: Int, approve: Bool, always: Bool = false) async throws {
+        let _: Empty = try await send(
+            "POST", url("/api/approvals/\(approval)"), body: ["approve": approve, "always": always]
+        )
+    }
+
+    /// A notification button's answer to a Needs you item, found by id alone.
+    func act(onNeedsYou id: String, _ action: NeedsYouAction) async throws {
+        let _: Empty = try await send(
+            "POST", url("/api/needs-you/\(Self.escape(id))/action"), body: ["action": action]
+        )
     }
 
     func conversations(agent: String) async throws -> [Conversation] {
@@ -535,6 +576,24 @@ struct SchermesClient: Sendable {
 
     func live(agent: String) async throws -> LiveReply {
         try await send("GET", url("/api/agents/\(Self.escape(agent))/live"))
+    }
+
+    /// "Retry now" skips the wait of a model call; "Use backup model" moves this turn to the backup.
+    func retryModel(agent: String, useBackup: Bool) async throws {
+        let _: Empty = try await send(
+            "POST", url("/api/agents/\(Self.escape(agent))/retry"), body: ["action": useBackup ? "backup" : "now"]
+        )
+    }
+
+    /// Kills the agent's hung browser, or restarts its whole desktop, and tells it to try again.
+    func fillForm(agent: String, id: Int, fill: FormFill) async throws {
+        let _: Empty = try await send("POST", url("/api/agents/\(Self.escape(agent))/forms/\(id)"), body: fill)
+    }
+
+    func restartBrowser(agent: String, desktop: Bool) async throws {
+        let _: Empty = try await send(
+            "POST", url("/api/agents/\(Self.escape(agent))/browser/restart"), body: ["what": desktop ? "desktop" : "browser"]
+        )
     }
 
     /// The newest `limit` events, oldest first. The log grows for the life of the install, so a
@@ -561,6 +620,78 @@ struct SchermesClient: Sendable {
 
     func deleteSchedule(agent: String, id: Int) async throws {
         let _: Empty = try await send("DELETE", url("/api/agents/\(Self.escape(agent))/schedules/\(id)"))
+    }
+
+    func rules(agent: String) async throws -> AgentRules {
+        try await send("GET", url("/api/agents/\(Self.escape(agent))/rules"))
+    }
+
+    func setRules(agent: String, _ update: AgentRulesUpdate) async throws -> AgentRules {
+        try await send("PUT", url("/api/agents/\(Self.escape(agent))/rules"), body: update)
+    }
+
+    func goals() async throws -> [Goal] {
+        try await send("GET", url("/api/goals"))
+    }
+
+    func goal(id: Int) async throws -> Goal {
+        try await send("GET", url("/api/goals/\(id)"))
+    }
+
+    /// Removes the helpers nobody kept. Refused (409) while one of them is mid-turn.
+    func finishGoal(id: Int) async throws -> Goal {
+        try await send("POST", url("/api/goals/\(id)/finish"), body: Empty())
+    }
+
+    func deleteGoal(id: Int) async throws {
+        let _: Empty = try await send("DELETE", url("/api/goals/\(id)"))
+    }
+
+    /// Promotes a temporary helper to an agent of its own. Refused for a worker, which has no account.
+    func keepHelper(goal: Int, name: String) async throws -> Goal {
+        try await send("POST", url("/api/goals/\(goal)/helpers/\(Self.escape(name))/keep"), body: Empty())
+    }
+
+    func triggers(agent: String) async throws -> [Trigger] {
+        try await send("GET", url("/api/agents/\(Self.escape(agent))/triggers"))
+    }
+
+    /// The trigger as it now stands; nil once deleted.
+    func actOnTrigger(id: Int, action: TriggerAction) async throws -> Trigger? {
+        if action == .delete {
+            let _: Empty = try await send("POST", url("/api/triggers/\(id)"), body: ["action": action])
+            return nil
+        }
+        return try await send("POST", url("/api/triggers/\(id)"), body: ["action": action])
+    }
+
+    /// Where an outside service posts a webhook trigger: the daemon's own address plus the path.
+    func hookURL(_ webhook: TriggerWebhook) -> URL? {
+        try? url(webhook.path)
+    }
+
+    func idle(agent: String) async throws -> IdleSettings {
+        try await send("GET", url("/api/agents/\(Self.escape(agent))/idle"))
+    }
+
+    func setIdle(agent: String, _ update: IdleSettingsUpdate) async throws -> IdleSettings {
+        try await send("PUT", url("/api/agents/\(Self.escape(agent))/idle"), body: update)
+    }
+
+    /// Every agent's idle passes that started at or after `since` (ms), with their outputs.
+    func idlePasses(since: Int) async throws -> [IdlePass] {
+        try await send("GET", url("/api/idle/passes").appending(queryItems: [URLQueryItem(name: "since", value: String(since))]))
+    }
+
+    /// Answers the output as it now stands, resolved.
+    func resolveIdleOutput(id: Int, _ action: IdleOutputAction) async throws -> IdleOutput {
+        try await send("POST", url("/api/idle/outputs/\(id)"), body: ["action": action])
+    }
+
+    /// Answers the feedback as the daemon stored it, `nil` once cleared.
+    func setFeedback(message id: Int, _ update: FeedbackUpdate) async throws -> MessageFeedback? {
+        let answer: FeedbackAnswer = try await send("PUT", url("/api/messages/\(id)/feedback"), body: update)
+        return answer.feedback
     }
 
     func settings() async throws -> DaemonSettings {
@@ -593,8 +724,32 @@ struct SchermesClient: Sendable {
         )
     }
 
-    /// Who holds a desktop's mouse and keyboard. All three routes answer `{held}`.
-    struct ControlState: Decodable, Sendable { let held: Bool }
+    /// Who holds a desktop's mouse and keyboard. All three routes answer `{held}`; `handOver` says
+    /// the agent asked for hands and giving the screen back will tell it.
+    struct ControlState: Decodable, Sendable {
+        let held: Bool
+        var handOver: Bool?
+        /// Present only while "Show the agent how" records.
+        var recording: RecordingState?
+    }
+
+    struct RecordingState: Decodable, Sendable, Equatable {
+        let startedAt: Int
+        let steps: Int
+        let shots: Int
+        let secret: Bool
+        var truncated: Bool?
+    }
+
+    /// Takes the screen and records the owner's hands; giving the screen back hands it to the agent.
+    func startRecording(agent: String) async throws -> ControlState {
+        try await send("POST", url("/api/agents/\(Self.escape(agent))/recording"))
+    }
+
+    func setRecordingSecret(agent: String, secret: Bool) async throws -> ControlState {
+        struct Body: Encodable { let secret: Bool }
+        return try await send("PUT", url("/api/agents/\(Self.escape(agent))/recording"), body: Body(secret: secret))
+    }
 
     func control(agent: String) async throws -> ControlState {
         try await send("GET", url("/api/agents/\(Self.escape(agent))/control"))

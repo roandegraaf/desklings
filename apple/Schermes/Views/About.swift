@@ -12,7 +12,7 @@ struct AboutPage: View {
     }
 
     var body: some View {
-        Form {
+        ThemedForm {
             Section {
                 VStack(spacing: 12) {
                     // Its own look rather than the store's: the About sheet the Mac's app menu
@@ -21,7 +21,7 @@ struct AboutPage: View {
                     Text("schermes").font(.title2.weight(.semibold))
                     Text("Version \(version)")
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Theme.muted)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 8)
@@ -34,12 +34,11 @@ struct AboutPage: View {
                     .font(.caption2.monospaced())
                     .textSelection(.enabled)
             } header: {
-                Text("The avatar")
+                Text("The avatar").formHeader()
             } footer: {
                 Text("Everything else here is URLSession, SwiftUI and Swift Testing: no packages.")
             }
         }
-        .formStyle(.grouped)
         .navigationTitle(SettingsCategory.about.title)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -53,14 +52,8 @@ struct AboutView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
-            AboutPage()
-                .toolbar {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Done") { dismiss() }
-                    }
-                }
-        }
+        AboutPage()
+            .sheetChrome(SettingsCategory.about.title) { dismiss() }
         #if os(macOS)
         .frame(minWidth: 520, minHeight: 560)
         #endif

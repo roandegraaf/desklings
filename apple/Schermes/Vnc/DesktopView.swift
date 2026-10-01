@@ -148,6 +148,10 @@ struct DesktopView: View {
 
     @State private var trouble: String?
     @State private var held: Bool?
+    /// The agent asked for hands, so returning control is "Give it back" and tells it.
+    @State private var handOver = false
+    /// "Show the agent how" is recording: returning control ends it and hands it over.
+    @State private var recording: SchermesClient.RecordingState?
     @State private var typing = false
     @State private var box = CGSize.zero
 
@@ -176,6 +180,7 @@ struct DesktopView: View {
         .toolbar(removing: .title)
         .toolbar {
             ToolbarItem(placement: .principal) { identity.padding(.horizontal, 8) }
+            ToolbarItem { teach.labelStyle(.titleAndIcon) }
             ToolbarItem { control.labelStyle(.titleAndIcon) }
         }
         #else
@@ -233,20 +238,48 @@ struct DesktopView: View {
     private var identity: some View {
         HStack(spacing: 7) {
             BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 22)
-            Text(agent.title).font(.headline)
-            StateDot(state: agent.state)
+            Text(agent.title).font(.headline).fontDesign(.rounded)
+                .lineLimit(1)
+                .fixedSize()
+            if let recording {
+                Label("\(recording.steps) \(recording.steps == 1 ? "step" : "steps")", systemImage: "record.circle.fill")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Theme.failed)
+                    .lineLimit(1)
+            } else {
+                StateLine(state: agent.state, identity: looks[agent.name])
+            }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(agent.title), \(agent.state.label)")
+        .accessibilityLabel(recording.map { "\(agent.title), recording, \($0.steps) steps" } ?? "\(agent.title), \(agent.state.label)")
+    }
+
+    /// Only an agent with a home of its own learns a skill; a goal's screen worker does not.
+    @ViewBuilder private var teach: some View {
+        if let recording {
+            Button(recording.secret ? "Secret on" : "Secret", systemImage: recording.secret ? "lock.fill" : "lock.open") {
+                setSecret(!recording.secret)
+            }
+            .help("Turn on before typing a password or a code: it is not recorded, and screenshots stop.")
+        } else if !holding && agent.parentId == nil {
+            Button("Show how", systemImage: "record.circle") { record() }
+                .help("Take the screen and record what you do, so \(agent.title) can turn it into a skill.")
+                .disabled(held == nil)
+        }
+    }
+
+    private var controlTitle: String {
+        if recording != nil { return handOverTitle }
+        return holding ? (handOver ? "Give it back" : returnTitle) : "Take control"
     }
 
     private var control: some View {
         Button(
-            holding ? returnTitle : "Take control",
-            systemImage: holding ? "hand.raised.fill" : "hand.raised"
+            controlTitle,
+            systemImage: recording != nil ? "stop.circle.fill" : holding ? "hand.raised.fill" : "hand.raised"
         ) { take(!holding) }
             .lineLimit(1)
-            .accessibilityLabel(holding ? "Return control" : "Take control")
+            .accessibilityLabel(recording != nil ? "Stop and hand over" : holding ? (handOver ? "Give it back" : "Return control") : "Take control")
             // Unknown ownership is not a no: until the daemon has answered there is nothing
             // to take or return, exactly as the web UI has it.
             .disabled(held == nil)
@@ -254,10 +287,12 @@ struct DesktopView: View {
 
     #if os(macOS)
     private let returnTitle = "Return control"
+    private let handOverTitle = "Stop and hand over"
     #else
     // The full phrase plus the keyboard button is wider than an iPhone, and the label wrapped
     // onto two lines.
     private let returnTitle = "Return"
+    private let handOverTitle = "Hand over"
 
     private var bar: some View {
         HStack(spacing: 10) {
@@ -288,7 +323,17 @@ struct DesktopView: View {
                     .buttonBorderShape(.circle)
             }
 
-            control.buttonStyle(.glass)
+            teach
+                .labelStyle(.iconOnly)
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+
+            // Beside the keyboard and Secret there is no room for its words on an iPhone.
+            if recording != nil {
+                control.labelStyle(.iconOnly).buttonStyle(.glass).buttonBorderShape(.circle)
+            } else {
+                control.buttonStyle(.glass)
+            }
         }
         .padding(16)
     }
@@ -316,6 +361,8 @@ struct DesktopView: View {
             // stands rather than being replaced by a guess. The web UI makes the same call.
             if let state = try? await session.run({ try await $0.control(agent: agent.name) }) {
                 held = state.held
+                handOver = state.handOver ?? false
+                recording = state.recording
             }
             try? await Task.sleep(for: .seconds(4))
         }
@@ -328,6 +375,34 @@ struct DesktopView: View {
                     try await $0.setControl(agent: agent.name, held: next)
                 }
                 held = state.held
+                if let asked = state.handOver { handOver = asked }
+                recording = state.recording
+                trouble = nil
+            } catch {
+                if !error.isCancellation { trouble = error.localizedDescription }
+            }
+        }
+    }
+
+    private func record() {
+        Task {
+            do {
+                let state = try await session.run { try await $0.startRecording(agent: agent.name) }
+                held = state.held
+                if let asked = state.handOver { handOver = asked }
+                recording = state.recording
+                trouble = nil
+            } catch {
+                if !error.isCancellation { trouble = error.localizedDescription }
+            }
+        }
+    }
+
+    private func setSecret(_ on: Bool) {
+        Task {
+            do {
+                let state = try await session.run { try await $0.setRecordingSecret(agent: agent.name, secret: on) }
+                recording = state.recording
                 trouble = nil
             } catch {
                 if !error.isCancellation { trouble = error.localizedDescription }
@@ -369,5 +444,30 @@ struct DesktopView: View {
             view: box,
             screen: CGSize(width: screen.width, height: screen.height)
         )
+    }
+}
+
+/// The daemon's hand-off of a recording to the agent, stored as the owner's line: quiet, with the
+/// whole brief behind it.
+struct ShownLine: View {
+    let message: Message
+
+    private var summary: String {
+        let rest = message.content.dropFirst(shownLinePrefix.count)
+        return String(rest.prefix { $0 != "." })
+    }
+
+    var body: some View {
+        Label {
+            Text("Showed how · \(summary) · \(Date(timeIntervalSince1970: Double(message.createdAt) / 1000).formatted(date: .omitted, time: .shortened))")
+        } icon: {
+            Image(systemName: "record.circle")
+        }
+        .font(.caption2.weight(.medium))
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+        .help(message.content)
+        .accessibilityElement(children: .combine)
     }
 }

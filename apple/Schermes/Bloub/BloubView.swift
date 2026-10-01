@@ -86,11 +86,12 @@ struct BloubView: View {
         let ink = identity.color.rgb(dark: colorScheme == .dark)
         let paper = ground
         let scale = player.engine.scale
+        let crossed = player.engine.state == .failed
         return Canvas(rendersAsynchronously: false) { context, canvasSize in
             let k = min(canvasSize.width, canvasSize.height) / (Bloub.halfViewBox * 2)
             context.translateBy(x: canvasSize.width / 2, y: canvasSize.height / 2)
             context.scaleBy(x: k, y: k)
-            Self.draw(frame, ink: ink, paper: paper, scale: scale, into: &context)
+            Self.draw(frame, ink: ink, paper: paper, scale: scale, crossed: crossed, into: &context)
         }
     }
 
@@ -99,6 +100,7 @@ struct BloubView: View {
         ink: BloubRGB,
         paper: BloubRGB,
         scale: Double,
+        crossed: Bool,
         into context: inout GraphicsContext
     ) {
         // the back half of the orbits, drawn before the body so the body hides it
@@ -109,11 +111,11 @@ struct BloubView: View {
         // A layer per frame per avatar is the expensive part of drawing one, and at full opacity
         // compositing it is the same as drawing straight in.
         if frame.bodyAlpha >= 1 {
-            drawBody(frame, ink: ink, paper: paper, into: &context)
+            drawBody(frame, ink: ink, paper: paper, crossed: crossed, into: &context)
         } else {
             context.drawLayer { layer in
                 layer.opacity = frame.bodyAlpha
-                drawBody(frame, ink: ink, paper: paper, into: &layer)
+                drawBody(frame, ink: ink, paper: paper, crossed: crossed, into: &layer)
             }
         }
 
@@ -130,6 +132,7 @@ struct BloubView: View {
         _ frame: BloubFrame,
         ink: BloubRGB,
         paper: BloubRGB,
+        crossed: Bool,
         into context: inout GraphicsContext
     ) {
         let body = closedPath(frame.body)
@@ -139,7 +142,18 @@ struct BloubView: View {
         context.drawLayer { inner in
             inner.fill(body, with: .color(ink.color))
             inner.blendMode = .destinationOut
-            for eye in frame.eyes {
+            for eye in frame.eyes where crossed {
+                // The canvas's failed face: each eye an X, its arms as long as the eye is tall.
+                let w = max(eye.w, 0.01) * 0.6, h = max(eye.h, 0.01) * 0.87
+                let arm = Path(roundedRect: CGRect(x: -w / 2, y: -h / 2, width: w, height: h), cornerRadius: w / 2)
+                for angle in [Double.pi / 4, -Double.pi / 4] {
+                    inner.fill(
+                        arm.applying(CGAffineTransform(rotationAngle: angle).concatenating(eye.transform)),
+                        with: .color(.black.opacity(eye.alpha))
+                    )
+                }
+            }
+            for eye in frame.eyes where !crossed {
                 let capsule = Path(
                     roundedRect: CGRect(
                         x: -max(eye.w, 0.01) / 2,

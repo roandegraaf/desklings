@@ -216,7 +216,7 @@ struct MarkdownText: View {
                 }
             }
             if let trouble {
-                Text(trouble).font(.caption).foregroundStyle(.red)
+                Text(trouble).font(.caption).foregroundStyle(Theme.failed)
             }
         }
         .textSelection(.enabled)
@@ -234,6 +234,15 @@ struct MarkdownText: View {
             return .handled
         })
         .quickLookPreview($previewing)
+    }
+}
+
+/// Parsing is the whole cost of a reply row, so a redraw of the chat must not reach it unless
+/// the words changed. The source is the same daemon for every row, so the agent is the file
+/// source's whole identity.
+extension MarkdownText: Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.content == rhs.content && lhs.files?.agent == rhs.files?.agent
     }
 }
 

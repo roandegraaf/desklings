@@ -3,7 +3,21 @@ import Observation
 
 /// `@Observable` rewrites stored properties, and its expansion cannot see `Self` in an
 /// initializer, so the key lives out here.
-private let addressKey = "schermes.serverAddress"
+let addressKey = "schermes.serverAddress"
+
+/// A test launch passes `-schermes.serverAddress`; storing it would repoint the owner's own copy,
+/// which shares this bundle id and so this defaults domain.
+private var addressFromLaunch: Bool {
+    UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)[addressKey] != nil
+}
+
+#if DEBUG
+/// `-schermes.debugPassword` logs a test launch in without typing and without the Keychain, whose
+/// read raises an authorisation panel for an app re-signed by every build.
+private let launchPassword = UserDefaults.standard.string(forKey: "schermes.debugPassword")
+#else
+private let launchPassword: String? = nil
+#endif
 
 /// The one daemon this app talks to, and whether the owner is through the door yet. Owns the
 /// server address, the stored password, and the single place a 401 is answered.
@@ -64,7 +78,7 @@ final class Session {
         do {
             let health = try await client.health()
             self.client = client
-            UserDefaults.standard.set(address, forKey: addressKey)
+            storeAddress(url)
 
             if health.setupRequired {
                 phase = .setup
@@ -75,7 +89,7 @@ final class Session {
             phase = .ready
         } catch SchermesError.unauthorized {
             self.client = client
-            UserDefaults.standard.set(address, forKey: addressKey)
+            storeAddress(url)
             phase = await reLogin() ? .ready : .login
         } catch {
             trouble = error.localizedDescription
@@ -109,8 +123,20 @@ final class Session {
         phase = .login
     }
 
+    /// The iPhone's share extension has no `Session`: it reads the address and a copy of the
+    /// password from the app group. Refreshed on every connect, so an upgraded install catches up.
+    private func storeAddress(_ daemon: URL) {
+        guard !addressFromLaunch else { return }
+        UserDefaults.standard.set(address, forKey: addressKey)
+        #if os(iOS)
+        StoredDaemon.sharedDefaults.set(address, forKey: addressKey)
+        Task.detached { Keychain.shareWithExtension(for: daemon) }
+        #endif
+    }
+
     func forgetServer() {
         UserDefaults.standard.removeObject(forKey: addressKey)
+        StoredDaemon.sharedDefaults.removeObject(forKey: addressKey)
         client = nil
         phase = .needsServer
     }
@@ -133,6 +159,7 @@ final class Session {
 
     private func reLogin() async -> Bool {
         guard let client else { return false }
+        if let launchPassword { return await Self.reLogin(client) { _ in launchPassword } }
         // `SecItemCopyMatching` can block for as long as it likes — on a Mac the system may put
         // an authorisation panel in front of it, which an ad-hoc signed app re-signed by every
         // build will meet — so it never runs on the actor that draws the screen.
@@ -183,7 +210,25 @@ nonisolated enum Keychain {
         item[kSecValueData as String] = Data(password.utf8)
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         SecItemAdd(item as CFDictionary, nil)
+        #if os(iOS)
+        item[kSecAttrAccessGroup as String] = appGroup
+        SecItemAdd(item as CFDictionary, nil)
+        #endif
     }
+
+    #if os(iOS)
+    /// A second copy in the app group for the share extension, added beside the app's own and never
+    /// in its place, so a re-login running meanwhile always finds one. `clear` takes both. Without
+    /// the group entitlement (simulator builds) the add fails and nothing changes.
+    static func shareWithExtension(for daemon: URL) {
+        guard let password = read(for: daemon) else { return }
+        var item = query(for: daemon)
+        item[kSecAttrAccessGroup as String] = appGroup
+        item[kSecValueData as String] = Data(password.utf8)
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        SecItemAdd(item as CFDictionary, nil)
+    }
+    #endif
 
     static func read(for daemon: URL) -> String? {
         var item = query(for: daemon)

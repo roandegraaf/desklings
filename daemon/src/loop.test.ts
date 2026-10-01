@@ -5,6 +5,9 @@ import { sql } from 'drizzle-orm';
 import { AGENT_STATES } from '@schermes/shared';
 import type { Agent, Message } from '@schermes/shared';
 import { openDb } from './db.ts';
+import { insertApproval, listApprovals } from './approvals.ts';
+import { grantOnce, readRules, updateRules } from './rules.ts';
+import { listGoals } from './goals.ts';
 import { findAgent, insertAgent, insertWorker, listAgents, setAgentState } from './agents.ts';
 import {
   MAX_AGENT_CHAIN,
@@ -17,6 +20,7 @@ import {
   listConversations,
   listEvents,
   listMessages,
+  SYSTEM_SENDER,
 } from './conversations.ts';
 import type { Db } from './db.ts';
 import {
@@ -35,7 +39,7 @@ import {
   runAgent,
   transcript,
 } from './loop.ts';
-import type { LoopDeps } from './loop.ts';
+import type { LoopDeps, RunnerDeps } from './loop.ts';
 import type { McpSession } from './mcp.ts';
 import { CONTROL_HELD, createControl } from './control.ts';
 import {
@@ -46,11 +50,15 @@ import {
   setPaused,
 } from './schedules.ts';
 import { HOME_APPEND, HOME_LOAD, homePrompt, parseHome } from './home.ts';
+import { SNAPSHOTS } from './snapshots.ts';
 import { withoutKey } from './provider.ts';
 import { STOPPED, WORKER_FAILED } from './loop.ts';
 import { workerPrompt } from './workers.ts';
 import type { ChatReply, Provider, ProviderMessage } from './provider.ts';
 import type { Exec } from './exec.ts';
+import { BROWSER_HUNG } from './browser.ts';
+import type { Session } from './browser.ts';
+import { listNeedsYou } from './needs.ts';
 
 const MIGRATIONS = resolve(import.meta.dirname, '../migrations');
 const SCREEN = { width: 1280, height: 800, display: { width: 1280, height: 800 } };
@@ -111,12 +119,12 @@ function fakeExec(ran: string[][]): Exec {
 }
 
 /**
- * What a turn ran beyond reading the agent's home. Every turn opens with a `getent` and one
- * `sudo` that reads memory and the skills index, which is not what any assertion about tools is
- * looking at.
+ * What a turn ran beyond reading the agent's home. Every turn opens with a `getent`, a workspace
+ * snapshot and one `sudo` that reads memory and the skills index, which is not what any
+ * assertion about tools is looking at.
  */
 function tooling(ran: readonly string[][]): string[][] {
-  return ran.filter((argv) => argv[0] !== 'getent' && !argv.includes(HOME_LOAD));
+  return ran.filter((argv) => argv[0] !== 'getent' && !argv.includes(HOME_LOAD) && !argv.includes(SNAPSHOTS));
 }
 
 const tick = () => new Promise((done) => setTimeout(done, 5));
@@ -617,7 +625,7 @@ test('the boot reconcile moves every interrupted agent and no settled one', () =
   }
 });
 
-function pair(script: Record<string, readonly Partial<ChatReply>[]>, caps = CAPS) {
+function pair(script: Record<string, readonly Partial<ChatReply>[]>, caps: typeof CAPS & Pick<RunnerDeps, 'desktop'> = CAPS) {
   const db = openDb(':memory:', MIGRATIONS);
   const alpha = insertAgent(db, 'alpha') as Agent;
   const bravo = insertAgent(db, 'bravo') as Agent;
@@ -1329,6 +1337,51 @@ test('a question to the owner ends the turn, and the profile written after the a
   assert.doesNotMatch(later, /no profile yet/);
 });
 
+test('request_approval and request_deletion both leave a standing request and change nothing else', async () => {
+  const f = fixture([
+    {
+      toolCalls: [
+        {
+          id: 'a1',
+          name: 'request_approval',
+          arguments: JSON.stringify({ category: 'install_software', reason: 'needs jq', target: 'jq' }),
+        },
+        { id: 'd1', name: 'request_deletion', arguments: JSON.stringify({ what: 'conversation', reason: 'done here' }) },
+        { id: 'a2', name: 'request_approval', arguments: JSON.stringify({ category: 'nonsense', reason: 'x' }) },
+      ],
+    },
+    { text: 'Waiting on the owner.' },
+  ]);
+  const delivered: string[] = [];
+  f.ask('tidy up');
+  await runAgent(
+    { ...f.deps, deliver: (_agent, _conversation, text, kind) => delivered.push(`${kind}: ${text}`) },
+    f.agent,
+    f.conversationId,
+  );
+
+  assert.ok(f.offered[0]?.includes('request_approval') && f.offered[0]?.includes('request_deletion'));
+  assert.deepEqual(
+    listApprovals(f.db).map((a) => [a.kind, a.category, a.target]),
+    [
+      ['action', 'install_software', 'jq'],
+      ['conversation', 'delete_files', String(f.conversationId)],
+    ],
+  );
+  const result = (id: string) => String(f.messages().find((m) => m.toolCallId === id)?.content);
+  assert.match(result('a1'), /Asked the owner to install software: jq\. Do not do it yet\./);
+  assert.match(result('d1'), /Nothing has been deleted/);
+  assert.match(result('a2'), /^error: category must be one of/);
+  assert.deepEqual(delivered.slice(0, 2), [
+    'approval: Asks to install software: jq: needs jq',
+    'approval: Asks to delete the thread it asked in: done here',
+  ]);
+  assert.equal(
+    f.events().filter((e) => e.type === 'approval').map((e) => e.data['category']).join(),
+    'install_software,delete_files',
+  );
+});
+
 test('the home is read once per turn, however many steps the turn takes', async () => {
   const db = openDb(':memory:', MIGRATIONS);
   const alpha = insertAgent(db, 'alpha') as Agent;
@@ -1757,7 +1810,7 @@ test('a cron expression creates a row, and a due row starts a turn in the owner 
 
   const delivered = f.messages().find((m: Message) => m.content.includes('check the overnight logs'));
   assert.equal(delivered?.role, 'user');
-  assert.equal(delivered?.sender, undefined, 'written as the owner, or nothing would wake on it');
+  assert.equal(delivered?.sender, SYSTEM_SENDER, 'not the owner, so a waiting question stays');
   assert.equal(f.messages().at(-1)?.content, 'The logs are clean.', 'the answer lands in the thread');
   assert.equal(f.state(), 'waiting_for_user');
 
@@ -2258,4 +2311,222 @@ test('set_name moves the agent only once its turn is over, and only to a free va
   await runAgent({ ...g.deps, rename }, g.agent, g.conversationId);
   assert.match(String(g.messages().find((m) => m.toolCallId === 'n4')?.content), /taken is taken/);
   assert.equal(renames.length, 1);
+});
+
+test('the rules are in the system prompt, naming request_approval and the pre-approved list', async () => {
+  const f = fixture([{ text: 'Noted.' }, { text: 'Noted again.' }]);
+  f.ask('hello');
+  await runAgent(f.deps, f.agent, f.conversationId);
+  const before = systemOf(f.seen.at(-1));
+  assert.match(before, /Ask first with request_approval[^\n]*: delete files; spend money; install software/);
+  assert.match(before, /Go ahead when the domain or recipient is on the pre-approved list for that kind of action[^\n]*: send a message\./);
+  assert.match(before, /Never do these yourself[^\n]*: change a password or security setting\./);
+  assert.match(before, /Pre-approved to send a message: nothing yet\./);
+
+  updateRules(f.db, f.agent, { levels: { spend_money: 'if_pre_approved' }, preApproved: { spend_money: ['FlyTap.com'] } });
+  f.ask('and now?');
+  await runAgent(f.deps, f.agent, f.conversationId);
+  const after = systemOf(f.seen.at(-1));
+  assert.match(after, /pre-approved list[^\n]*: send a message; spend money\./);
+  assert.match(after, /Pre-approved to spend money: flytap\.com\./);
+  assert.match(after, /Pre-approved to send a message: nothing yet\./);
+});
+
+test('under Ask first a delete or install through run_command is refused, and runs once after approval', async () => {
+  const rm = (id: string) => ({ id, name: 'run_command', arguments: JSON.stringify({ command: 'rm -f ~/workspace/old.txt' }) });
+  const install = { id: 'i1', name: 'run_command', arguments: JSON.stringify({ command: 'sudo apt-get install -y jq' }) };
+  const f = fixture([
+    { toolCalls: [rm('r1'), install] },
+    { text: 'I will ask.' },
+    { toolCalls: [rm('r2')] },
+    { toolCalls: [rm('r3')] },
+    { text: 'Deleted once.' },
+  ]);
+  const ranRm = () => tooling(f.ran).filter((argv) => argv.some((arg) => arg.includes('rm -f ~/workspace/old.txt'))).length;
+  const result = (id: string) => String(f.messages().find((m) => m.toolCallId === id)?.content);
+
+  f.ask('clean up and install jq');
+  await runAgent(f.deps, f.agent, f.conversationId);
+  assert.equal(ranRm(), 0);
+  assert.ok(!tooling(f.ran).some((argv) => argv.some((arg) => arg.includes('apt-get'))));
+  assert.match(result('r1'), /^error: your rules say to ask the owner before you delete files \(~\/workspace\/old\.txt\)\. Nothing was run\. Ask with request_approval, category delete_files, target "~\/workspace\/old\.txt"/);
+  assert.match(result('i1'), /install software \(jq\)/);
+
+  const asked = insertApproval(f.db, f.agent, f.conversationId, {
+    kind: 'action',
+    category: 'delete_files',
+    target: '~/workspace/old.txt',
+    reason: 'stale',
+  });
+  grantOnce(f.db, f.agent, asked);
+  f.ask('approved');
+  await runAgent(f.deps, f.agent, f.conversationId);
+  assert.equal(ranRm(), 1, 'the approval lets exactly one matching call through');
+  assert.match(result('r3'), /^error: your rules say to ask/);
+});
+
+test('a browser that stays hung after its restart ends the turn waiting on the owner, with a Needs you item', async () => {
+  const browserCall = { id: 'b1', name: 'browser', arguments: '{"action":"read"}' };
+  const f = fixture([{ text: 'Reading the page.', toolCalls: [browserCall] }, { text: 'should never be asked' }]);
+  const hung: Session = { send: () => new Promise(() => undefined), once: () => new Promise(() => undefined), close: () => undefined };
+  f.ask('what does the page say?');
+  await runAgent(
+    { ...f.deps, connect: () => Promise.resolve(hung), browserTimings: { probeMs: 10, startMs: 40, pollMs: 5 } },
+    f.agent,
+    f.conversationId,
+  );
+  assert.equal(f.state(), 'waiting_for_user');
+  assert.equal(f.seen.length, 1, 'no model call after the hang');
+  const row = f.messages().find((m) => m.toolCallId === 'b1');
+  assert.ok(row?.content.startsWith(`error: ${BROWSER_HUNG}`), row?.content);
+  const result = f.events().find((e) => e.type === 'tool_result' && e.data['callId'] === 'b1');
+  assert.equal(result?.data['hung'], true);
+  assert.equal(result?.data['restarted'], true, 'the automatic restart is on the record');
+  assert.equal(tooling(f.ran).filter((argv) => /pkill -KILL/.test(argv.at(-1) ?? '')).length, 1);
+  const item = listNeedsYou(f.db).find((entry) => entry.kind === 'browser_hung');
+  assert.equal(item?.id, `browser:${row?.id}`);
+  assert.deepEqual(item?.actions, ['screen', 'restart_desktop', 'restart_browser']);
+
+  f.ask('I restarted your browser. Try again.');
+  assert.equal(listNeedsYou(f.db).filter((entry) => entry.kind === 'browser_hung').length, 0, 'the owner line clears it');
+});
+
+test('asking for hands ends the turn waiting on the owner, with a hand-over in Needs you', async () => {
+  const hands = { id: 'h1', name: 'ask_for_hands', arguments: JSON.stringify({ reason: 'Solve the CAPTCHA on the login page.' }) };
+  const empty = { id: 'h0', name: 'ask_for_hands', arguments: JSON.stringify({ reason: ' ' }) };
+  const f = fixture([
+    { toolCalls: [empty] },
+    { text: 'I need you on the screen.', toolCalls: [hands, commandCall] },
+    { text: 'should never be asked' },
+  ]);
+  f.ask('log in for me');
+  await runAgent(f.deps, f.agent, f.conversationId);
+  assert.equal(f.state(), 'waiting_for_user');
+  assert.ok(f.offered[0]?.includes('ask_for_hands'));
+  assert.equal(f.seen.length, 2, 'a refused call goes on; an accepted one is the last model call');
+  assert.match(String(f.messages().find((m) => m.toolCallId === 'h0')?.content), /^error: reason is required/);
+  const [item] = listNeedsYou(f.db).filter((entry) => entry.kind === 'hand_over');
+  const asking = f.messages().find((m) => m.toolCalls?.some((c) => c.id === 'h1'));
+  assert.deepEqual(
+    [item?.id, item?.detail, item?.actions],
+    [`hands:${asking?.id}`, 'Solve the CAPTCHA on the login page.', ['open', 'take_screen']],
+  );
+
+  f.ask('The owner gave the screen back.');
+  assert.equal(listNeedsYou(f.db).filter((entry) => entry.kind === 'hand_over').length, 0, 'the owner line clears it');
+});
+
+// ---------------------------------------------------------------- goals and helpers
+
+const call = (id: string, name: string, args: unknown) => ({ id, name, arguments: JSON.stringify(args) });
+
+test('a lead keeps a goal, brings in both kinds of helper, and finishing removes them', async () => {
+  const desktop: string[] = [];
+  const ops = {
+    ensure: (name: string, display: number, tag?: string) => {
+      desktop.push(`ensure ${name} :${display}${tag === undefined ? '' : ` ${tag}`}`);
+      return Promise.resolve('started' as const);
+    },
+    stop: (name: string) => (desktop.push(`stop ${name}`), Promise.resolve()),
+    stopDisplay: (name: string, display: number) => (desktop.push(`stopDisplay ${name} :${display}`), Promise.resolve()),
+    rename: () => Promise.resolve(),
+  };
+  const helper = 'alpha-g1-1';
+  const p = pair(
+    {
+      alpha: [
+        {
+          toolCalls: [
+            call('g0', 'update_goal', { title: 'Ship the site', steps: [{ text: 'Later', owner: 'helper-to-be', state: 'todo' }] }),
+            call('g1', 'update_goal', { title: 'Ship the site', steps: [{ text: 'Write the copy', state: 'doing' }] }),
+          ],
+        },
+        { text: 'Started.' },
+        { toolCalls: [call('h1', 'add_helper', { goal: 1, kind: 'worker', reason: 'Needs a browser of its own.', brief: 'Check the page.' })] },
+        { text: 'A worker is on it.' },
+        { text: 'The page is fine.' },
+        { toolCalls: [call('h2', 'add_helper', { goal: 1, kind: 'agent', reason: 'Long copy work.', brief: 'Draft the copy.' })] },
+        { text: 'A helper is on it.' },
+        { text: 'Got the draft.' },
+        {
+          toolCalls: [
+            call('u1', 'update_goal', { goal: 1, steps: [{ text: 'x', owner: 'nobody', state: 'todo' }] }),
+            call('u2', 'update_goal', {
+              goal: 1,
+              steps: [
+                { text: 'Write the copy', owner: helper, state: 'done' },
+                { text: 'Publish', state: 'todo' },
+              ],
+              addResults: ['Copy drafted'],
+              nextFromYou: ['Approve the copy'],
+            }),
+          ],
+        },
+        { text: 'Updated.' },
+        { toolCalls: [call('f1', 'update_goal', { goal: 1, finish: true })] },
+        { text: 'Done.' },
+      ],
+      'alpha-w1': [{ text: 'the page loads' }],
+      [helper]: [
+        { toolCalls: [call('x1', 'add_helper', { goal: 1, kind: 'agent', reason: 'r', brief: 'b' })] },
+        { text: 'drafted' },
+      ],
+    },
+    { ...CAPS, desktop: ops },
+  );
+  const owner = conversationFor(p.db, p.alpha.id);
+  const ask = async (text: string) => {
+    appendMessage(p.db, owner, { role: 'user', content: text });
+    p.runner.start(findAgent(p.db, 'alpha') as Agent, owner);
+    await quiet(p.db);
+  };
+
+  await ask('ship the site');
+  const created = listMessages(p.db, owner).find((m) => m.toolCallId === 'g1');
+  assert.match(String(created?.content), /^Goal 1: Ship the site \(open\), led by alpha\.\nPlan:\n- \[doing\] Write the copy \(alpha\)/);
+  assert.ok(p.offered[0]?.includes('update_goal') && p.offered[0].includes('add_helper'));
+  assert.match(String(listMessages(p.db, owner).find((m) => m.toolCallId === 'g0')?.content), /^error: helper-to-be is neither you/);
+  assert.deepEqual(listGoals(p.db).map((goal) => goal.id), [1], 'a refused create leaves no goal behind');
+
+  await ask('check the page');
+  const worker = findAgent(p.db, 'alpha-w1') as Agent;
+  assert.ok(worker.display <= 999, 'a screen helper holds a real display');
+  assert.ok(desktop.includes(`ensure alpha :${worker.display} alpha-w1`), 'on the lead\'s user, tagged with its own name');
+  const asWorker = p.seen.findIndex((messages) => askedAgent(messages) === 'alpha-w1');
+  assert.deepEqual(p.offered[asWorker], ['computer', 'run_command', 'web_search', 'web_fetch']);
+  assert.match(String(p.seen[asWorker]?.[0]?.text), /You are a helper on this goal:\nGoal 1: Ship the site/);
+
+  updateRules(p.db, p.alpha, { levels: { delete_files: 'hand_to_you' }, preApproved: { send_messages: ['example.com'] } });
+  await ask('draft the copy');
+  const temp = findAgent(p.db, helper) as Agent;
+  assert.deepEqual(readRules(p.db, temp), readRules(p.db, p.alpha), 'a helper is held to its lead\'s rules');
+  assert.equal(temp.parentId, undefined, 'a temporary agent is an agent of its own');
+  assert.match(String(temp.profile), /helper of alpha on the goal "Ship the site"/);
+  assert.ok(desktop.includes(`ensure ${helper} :${temp.display}`));
+  const shared = conversationWith(p.db, [p.alpha.id, temp.id]);
+  assert.deepEqual(
+    listMessages(p.db, shared).filter((m) => m.role !== 'tool' && m.toolCalls === undefined).map((m) => [m.sender, m.content]),
+    [['alpha', 'Draft the copy.'], [helper, 'drafted'], ['alpha', 'Got the draft.']],
+  );
+  assert.ok(listMessages(p.db, shared).some((m) => m.content === 'error: a helper does not bring in helpers of its own; ask your lead'));
+  const asHelper = p.seen.findIndex((messages) => askedAgent(messages) === helper);
+  assert.match(String(p.seen[asHelper]?.[0]?.text), /You are a helper on it\. Report to alpha/);
+
+  await ask('mark it');
+  assert.ok(listMessages(p.db, owner).some((m) => m.content === 'error: nobody is neither you nor a helper on this goal; add it with add_helper first'));
+  const [item] = listNeedsYou(p.db).filter((needs) => needs.kind === 'goal');
+  assert.deepEqual([item?.id, item?.goalId, item?.detail, item?.conversationId], ['goal:1', 1, 'Approve the copy', owner]);
+  const lastPrompt = p.seen.findLast((messages) => askedAgent(messages) === 'alpha');
+  assert.match(String(lastPrompt?.[0]?.text), new RegExp(`Helper ${helper}, temporary agent: Long copy work\\.`));
+
+  await ask('finish it');
+  assert.equal(findAgent(p.db, helper), undefined, 'the temporary agent is gone');
+  assert.ok(desktop.includes(`stop ${helper}`));
+  assert.ok(desktop.includes(`stopDisplay alpha :${worker.display}`), 'only the worker\'s own display is stopped');
+  assert.ok(!desktop.includes('stop alpha'));
+  const kept = findAgent(p.db, 'alpha-w1') as Agent;
+  assert.ok(kept.display > 999, 'the worker stays as a finished worker, its display handed back');
+  assert.ok(listMessages(p.db, owner).some((m) => m.sender === 'alpha-w1' && m.content === 'the page loads'), 'its report stays in the lead\'s thread');
+  assert.match(String(listMessages(p.db, owner).find((m) => m.toolCallId === 'f1')?.content), /^Goal 1: Ship the site \(done\)/);
+  assert.deepEqual(listNeedsYou(p.db).filter((needs) => needs.kind === 'goal'), [], 'a done goal needs nothing');
 });

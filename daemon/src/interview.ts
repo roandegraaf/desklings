@@ -19,6 +19,20 @@ export const KICKOFF =
   'what I want you for; then ask a few focused questions that follow from what I said, and ' +
   'when you know enough write your profile with set_profile.';
 
+/** The kickoff when the owner already said what the agent is for: the interview starts from it
+ * instead of asking it again. The tagline becomes the profile's first line, which is the one-line
+ * label every list shows. */
+export function describedKickoff(description: string, tagline: string | undefined): string {
+  const quoted = description.trim().split('\n').map((line) => `> ${line}`).join('\n');
+  return (
+    `I just created you. This is what I want you for:\n${quoted}\n\n` +
+    'Introduce yourself in a line, then ask me a few focused questions with ask_owner that follow ' +
+    'from what I said: how I want it done, what to deliver and how, what to leave alone. Do not ask ' +
+    'what I already told you. When you know enough, write your profile with set_profile' +
+    (tagline === undefined ? '.' : `, starting with this line on its own: ${tagline}`)
+  );
+}
+
 /** The system-prompt half: who the agent is, or what to do about not knowing yet. */
 export function profilePrompt(profile: string | undefined): string {
   if (profile === undefined) {

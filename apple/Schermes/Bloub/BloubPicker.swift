@@ -60,7 +60,7 @@ struct BloubPicker: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.muted)
             ScrollView(.horizontal) {
                 HStack(spacing: 4) { content() }
             }
@@ -77,10 +77,12 @@ struct AgentLookSheet: View {
 
     @Environment(AgentLooks.self) private var looks
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var scheme
     @State private var identity: BloubIdentity
     @State private var label: String
     @State private var slug: String
     @State private var trouble: String?
+    @State private var editingProfile = false
     /// What the daemon held when the sheet opened, so Done sends only what moved.
     private let opened: BloubIdentity
 
@@ -104,7 +106,7 @@ struct AgentLookSheet: View {
                 .textFieldStyle(.plain)
                 .autocorrectionDisabled()
                 .multilineTextAlignment(.center)
-                .font(.title3.weight(.semibold))
+                .font(.system(.title2, design: .rounded, weight: .bold))
                 .onSubmit(finish)
             HStack(spacing: 0) {
                 Text("Runs as agent-")
@@ -118,21 +120,32 @@ struct AgentLookSheet: View {
                     .onSubmit(finish)
             }
             .font(.footnote.monospaced())
-            .foregroundStyle(.secondary)
+            .foregroundStyle(Theme.muted)
             if let trouble {
                 Text(trouble)
                     .font(.footnote)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Theme.failed)
             }
 
             BloubPicker(identity: $identity)
 
+            #if os(macOS)
+            if agent.parentId == nil {
+                ProfileView(session: session, agent: agent, bare: true) { editingProfile = $0 }
+                    .padding(14)
+                    .background(Theme.card, in: .rect(cornerRadius: 16))
+            }
+            #endif
+
             HStack {
                 Button("Reset") { identity = .standard(for: agent.name) }
+                    .buttonStyle(.pill(.secondary))
                 Spacer()
                 Button("Done", action: finish)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.pill(.primary))
                     .keyboardShortcut(.defaultAction)
+                    .disabled(editingProfile)
+                    .help(editingProfile ? "Save or cancel the profile first" : "")
             }
         }
         .padding(24)
@@ -141,6 +154,8 @@ struct AgentLookSheet: View {
         #else
         .frame(minWidth: 360)
         #endif
+        .background(identity.palette(dark: scheme == .dark).tint.color)
+        .presentationBackground(identity.palette(dark: scheme == .dark).tint.color)
         .onChange(of: identity) { looks[agent.name] = identity }
     }
 

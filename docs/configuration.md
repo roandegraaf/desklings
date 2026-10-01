@@ -5,7 +5,8 @@ Everything schermes reads from its environment, and the limits it does not.
 ## Environment variables
 
 The daemon reads exactly seven, all in `daemon/src/config.ts`. Each is validated at startup and
-a bad value stops the daemon rather than being silently replaced by a default.
+a bad value stops the daemon rather than being silently replaced by a default. The one exception
+is an APNs key file that cannot be read or is not a `.p8`: that is a log line, and push stays off.
 
 | Variable               | Default             | Meaning                                                       |
 | ---------------------- | ------------------- | ------------------------------------------------------------- |
@@ -33,7 +34,7 @@ and for the `domain` profile `SCHERMES_DOMAIN`, `SCHERMES_HTTP_PORT` (80) and
 `SCHERMES_HTTPS_PORT` (443).
 
 Everything the daemon derives — the database path, the master key path, the migrations
-directory, the built UI, the desktop scripts — is resolved from `SCHERMES_DATA_DIR` or from
+directory, the desktop scripts — is resolved from `SCHERMES_DATA_DIR` or from
 `import.meta.dirname`, and none of it is separately configurable. `import.meta.dirname` rather
 than a relative path because the container's command has no working directory.
 
@@ -49,17 +50,48 @@ Only the runnable checks, and only to point themselves at a daemon that is alrea
 | `SCHERMES_SMOKE_STUB_PORT`   | `7790`                   | `infra/smoke.sh`, provider stub |
 | `SCHERMES_CHECK_PORT`        | `8899`                   | `infra/desktop/check.sh`       |
 
-## Provider settings
+## Models
 
-The model endpoint is not an environment variable. Base URL, model name, API key and an optional
-JSON object of extra request fields (`extraBody`, merged under every request: OpenRouter's
-`provider` routing block, `reasoning`, `max_tokens`) are rows in the `settings` table, written through the settings screen or `PUT /api/settings`, and the key is
-AES-GCM encrypted with the master key before it is stored. It is never returned by the API and
-never reaches a log: `GET /api/settings` answers with `apiKeySet` as a boolean instead.
+The model endpoint is not an environment variable. Models are a **registry**: rows in the
+`models` table, written through the app's Models page or `/api/models`, one per endpoint the
+owner wants to use.
+
+| Field       | What it is                                                                    |
+| ----------- | ----------------------------------------------------------------------------- |
+| `name`      | What the owner calls it. Required.                                             |
+| `baseUrl`   | The OpenAI-compatible endpoint, `http` or `https`. Required.                   |
+| `model`     | The model id the endpoint expects. Required.                                   |
+| `apiKey`    | AES-GCM encrypted with the master key, never returned and never logged — the listing answers `apiKeySet` as a boolean. |
+| `extraBody` | An optional JSON object merged under every request: OpenRouter's `provider` routing block, `reasoning`, `max_tokens`. Anything that is not an object is a 400. |
+
+Which entry runs is two settings and one column, none of them typed by hand; a fourth key is the
+daemon's own:
+
+| Setting / column          | Meaning                                                             |
+| ------------------------- | ------------------------------------------------------------------- |
+| `models.default`          | The id every agent without its own model uses. The first entry created becomes it. |
+| `models.backup`           | Optional. The id a retrying turn may switch to (`POST /api/agents/:name/retry` `{action: "backup"}`). Never the model already running. |
+| `agents.model_id`         | Per agent, set with `PUT /api/agents/:name/model` `{id}`; `null` means the default. A task worker always runs on its parent's. |
+| `models.authFailed.<id>`  | Written by the daemon, not the owner: the endpoint answered 401 or 403. One Needs you item per model, cleared by a new key, a delete, a passing test or any call that answers. |
+
+`POST /api/models/:id/test` makes one call against what is stored. A model is refused a delete
+(409) while an agent is assigned to it, and the default is refused while another model exists to
+take its place; deleting the backup just leaves none. An entry missing a base URL, a model or a
+key is stored but not usable: a message to an agent on it is a 400, and its test says what is missing.
+
+**Upgrading from the single provider.** Before the registry, the endpoint was four settings rows,
+`provider.baseUrl`, `provider.model`, `provider.apiKey` and `provider.extraBody`. On boot,
+`migrateProviderSettings` turns them into the first entry, makes it the default and deletes the
+rows. The key moves as ciphertext. It runs once, and never over a registry that already has
+entries (the old rows are then just dropped).
+
+**`PUT /api/settings` still takes `baseUrl`, `model`, `apiKey` and `extraBody`**, and `GET` still
+answers them with `apiKeySet`: they now read and write the default entry, creating one on the first
+write. The app no longer uses them.
 
 A consequence worth knowing: an empty string is a value. The daemon stores whatever it is
-handed, so a settings write that includes `apiKey: ""` erases the stored key. The UI omits the
-field entirely when it is untouched.
+handed, so a write that includes `apiKey: ""` — on `/api/settings` or `PUT /api/models/:id` —
+erases the stored key. The app omits the field entirely when it is untouched.
 
 ## Web search settings
 
@@ -69,13 +101,13 @@ Both live in the same `settings` table and are written through the same `PUT /ap
 | Field       | What it is                                                                    |
 | ----------- | ----------------------------------------------------------------------------- |
 | `searchUrl` | The search endpoint. Empty means the built-in `https://api.search.brave.com/res/v1/web/search`. It exists for a proxy or a mirror: the response parser is **Brave's shape** and a differently shaped API will not work. |
-| `searchKey` | The Brave Search subscription token. AES-GCM encrypted with the master key, never returned — `GET /api/settings` answers with `searchKeySet` as a boolean, exactly like the provider key. |
+| `searchKey` | The Brave Search subscription token. AES-GCM encrypted with the master key, never returned — `GET /api/settings` answers with `searchKeySet` as a boolean, exactly like a model's key. |
 
 Two consequences worth knowing.
 
 **No key is a normal state.** A fresh install has none, and `web_search` answers with an
 observation saying so rather than failing the turn. `web_fetch` needs no key and works either
-way. Both fields are on the settings screen, and the key follows the provider key's rule there:
+way. Both fields are on the settings screen, and the key follows the model key's rule there:
 blank means keep the stored one.
 
 **`web_fetch` will not reach this machine.** Loopback, link-local, private, CGNAT, multicast and
@@ -105,9 +137,42 @@ read off its embedded provisioning profile, which become `pushBundleId`, `pushTe
 `pushSandbox`. The last build to register decides the gateway. `GET /api/devices` lists them,
 `DELETE /api/devices/:token` forgets one, and a token APNs reports dead is dropped by the push
 that learnt it. `POST /api/settings/push/test` sends "Push works."
-to every device. What is pushed: what an agent says at the end of a turn in its own thread with
-the owner, why a turn failed, and a deletion request. The app needs a real Apple team and the
-`aps-environment` entitlement on a device build to be handed a token at all.
+to every device. What is pushed, for permanent agents only: the end of a turn in an agent's own
+thread with the owner (its reply, its questions, a hand-over, a form to fill, a browser that
+stopped answering), why a turn failed there, and every approval request, wherever it was made.
+The app needs a real Apple team and the `aps-environment` entitlement on a device build to be
+handed a token at all.
+
+**Actionable pushes need nothing extra.** When a push is about a Needs you item, it carries the
+item's id (`needsYou`) and an `aps.category` the app registers buttons for:
+
+| Category        | For                                        | Buttons                  |
+| --------------- | ------------------------------------------ | ------------------------ |
+| `needs.approval`| An action to approve                       | Approve / Don't          |
+| `needs.delete`  | A deletion request                         | Keep it / Delete it      |
+| `needs.yours`   | Something in Passwords and security        | I'll do it / Don't       |
+| `needs.watch`   | A hand-over (`ask_for_hands`)              | Watch (opens the app)    |
+| `needs.open`    | Anything else                              | Open (opens the app)     |
+
+A button press answers through `POST /api/needs-you/:id/action` with the app's own stored login,
+so it works without the app open — as long as the phone can reach the daemon's address at that
+moment. When the answer does not land (unreachable, or the item went stale and answers 404) the
+app posts a local notification saying so.
+
+### Live Activities
+
+The iPhone's per-agent Live Activity rides the same APNs key, team and bundle id; there is nothing
+more to configure: the pushes go to the same gateway with topic `<bundleId>.push-type.liveactivity`.
+The activity shows the agent's goal steps and how many things need the owner, so it is updated when
+`update_goal` changes the steps or an approval request arrives, and ended when the turn ends. The
+app registers two kinds of token with `POST /api/live-activities` `{token, kind, agent?}`:
+
+| `kind`   | What it is                                                                  |
+| -------- | --------------------------------------------------------------------------- |
+| `start`  | The phone's push-to-start token. A turn of a permanent agent starts an activity on every one, once until that activity reports its own token. |
+| `update` | A running activity's token, naming its `agent`. Updates go there, throttled to one per `ACTIVITY_THROTTLE_MS`, and the end push (dismissed 15 minutes later) drops the token. |
+
+Without a push config or a start token nothing is sent and nothing fails.
 
 ## MCP servers
 
@@ -150,7 +215,7 @@ Four consequences worth knowing.
 
 **Secrets are never read back, and a blank one keeps what is stored.** `GET /api/mcp/servers`
 returns each server's identity and the *names* of the variables or headers it carries, never their
-values — the provider key's rule. So on `PUT /api/mcp/servers/<name>` an `env` or `headers` entry
+values — the model key's rule. So on `PUT /api/mcp/servers/<name>` an `env` or `headers` entry
 whose value is `""` takes the stored value for that key, and a key the body leaves out is removed
 with it: an owner changes a server's command without ever having seen its token. The merge happens
 before the parse. The replace-all `PUT /api/mcp/servers` has no such merge — it is the whole list
@@ -204,7 +269,8 @@ stop", not because anything reads them from the environment. Changing one is a c
 | `DEFAULT_PAGE` / `MAX_PAGE` | 50 / 200         | `daemon/src/app.ts`       | Messages per page                                 |
 | `SESSION_TTL_MS`          | 30 days            | `daemon/src/auth.ts`      | How long a session cookie lasts                   |
 | `MIN_PASSWORD_LENGTH`     | 8                  | `shared/src/index.ts`     | The owner password                                |
-| `IDLE_TIMEOUT_MS`         | 120 s              | `daemon/src/provider.ts`  | Silence between bytes of one model call; retried once, like 429 and 5xx |
+| `IDLE_TIMEOUT_MS`         | 120 s              | `daemon/src/provider.ts`  | Silence between bytes of one model call; retried like 429, 5xx and network errors |
+| `MAX_ATTEMPTS`            | 5                  | `daemon/src/provider.ts`  | Calls for one model request, waiting 2 s·2ⁿ or the endpoint's `Retry-After` between them; 401/403 is never retried |
 | Terminal timeout          | 120 s, max 600 s   | `daemon/src/terminal.ts`  | One command, unless the caller asks for less      |
 | `MAX_TYPE_CHARS`          | 2 000              | `daemon/src/computer.ts`  | One `type` action                                 |
 | `MAX_CLIPBOARD_CHARS`     | 64 KiB             | `daemon/src/computer.ts`  | A clipboard write                                 |
@@ -214,12 +280,17 @@ stop", not because anything reads them from the environment. Changing one is a c
 | `MAX_QUESTIONS`           | 4                  | `daemon/src/interview.ts` | Questions one `ask_owner` call may put to the owner |
 | `MAX_FILE_BYTES`          | 25 000 000         | `daemon/src/home.ts`      | One file handed to an agent through `POST /api/agents/:name/uploads`, or taken out through `GET .../files` |
 | `MAX_EVENTS`              | 1 000              | `daemon/src/app.ts`       | The most `?limit=` may ask `GET .../events` for   |
-| `MAX_SEARCH_CHARS`        | 200                | `daemon/src/app.ts`       | One `GET /api/search?q=` needle                   |
 | `MAX_SEARCH_HITS`         | 50                 | `conversations.ts`        | Rows one search answers with, newest first, each cut to a 240-character snippet |
 | `MAX_MEMORY_FILE_CHARS`   | 64 000             | `daemon/src/home.ts`      | A memory file as the owner reads or writes it through `/api/agents/:name/memory` |
 | `APNS_TOKEN_TTL_MS`       | 50 min             | `daemon/src/push.ts`      | How long one provider JWT is reused; APNs refuses one older than an hour |
 | `MAX_PUSH_BODY_CHARS`     | 200                | `daemon/src/push.ts`      | The body of a push; the thread has the rest       |
 | `MAX_IMAGE_BYTES`         | 5 000 000          | `daemon/src/app.ts`       | A picture the owner sends with a message, decoded |
+| `ACTIVITY_THROTTLE_MS`    | 5 s                | `daemon/src/liveactivity.ts` | Between two updates of one Live Activity; the last change is sent when it runs out |
+| `MAX_TRIGGERS`            | 20                 | `daemon/src/triggers.ts`  | Triggers one agent may hold                       |
+| `MAX_HOOK_BYTES`          | 64 KiB             | `daemon/src/triggers.ts`  | One webhook body; more is a 413                   |
+| `MAX_HELPERS`             | 6                  | `daemon/src/goals.ts`     | Helpers one goal may add                          |
+| `MAX_QUESTION_CHARS`      | 300                | `daemon/src/search.ts`    | One `POST /api/search` question                   |
+| `INDEX_EVERY_MS`          | 10 min             | `daemon/src/search.ts`    | How often files and pictures are indexed           |
 
 Agent names match `^[a-z0-9][a-z0-9-]{0,30}$`. The name becomes the Linux user `agent-<name>`,
 so it is validated at every boundary that accepts one.
@@ -239,8 +310,10 @@ with.
 
 An agent's `profile` is what it is for, in Markdown, in its system prompt every turn. A new
 agent has none and interviews the owner with `ask_owner` to write one with `set_profile`;
-`POST /api/agents` starts that interview when a provider is configured, and a body carrying a
-`profile` skips it. A blank profile on `PATCH` clears it, which puts the agent back to asking.
+`POST /api/agents` starts that interview when the new agent has a usable model, and a body
+carrying a `profile` skips it. A body carrying a `description` instead (what the app's "New agent"
+sends, after `POST /api/agents/suggest` has proposed a name, rules and routine from it) starts a
+first turn that writes the profile from the description. A blank profile on `PATCH` clears it, which puts the agent back to asking.
 
 ## Memory and skills
 
@@ -310,9 +383,82 @@ Cron expressions are resolved in the **daemon's local time**, which in the conta
 `TZ` says and UTC by default. The daily note's `<date>` is UTC, so the two can disagree by a few
 hours on a host that sets `TZ`; neither is configurable and the schedule is the one that matters.
 
+## Search and OCR
+
+`POST /api/search` needs no setup of its own: it asks the **default model** to turn the question
+into filters, and without one (or when the call fails) it falls back to plain word search. The
+index is rebuilt by the daemon every 10 minutes: agents' home files by name and path, and the
+text in stored screenshots and pictures.
+
+That text comes from **`tesseract`**, which `infra/install.sh` installs as `tesseract-ocr` (with
+English data only, Debian's default). The indexer checks `command -v tesseract` on every pass; when
+it is missing, OCR is skipped entirely and nothing is marked as read, so installing it later picks
+up every old picture. A few pictures are read per pass, newest first.
+
+## Triggers and the webhook URL
+
+A trigger is a row an agent proposes with `propose_trigger` and the owner turns on in the app;
+nothing about it is a setting. Four kinds: `folder` and `command` are polled as the agent,
+`imap` logs in to a mailbox with a login the owner types into a Needs you form (stored encrypted,
+never shown to the agent), and `webhook` waits for another service to call the daemon.
+
+A webhook is minted when the owner first turns it on: a random token and secret (24 random bytes
+each; the secret stored encrypted), kept for the life of the trigger and shown in the app. The sender calls
+
+```
+POST /hooks/<token>
+X-Schermes-Secret: <secret>
+```
+
+with any body up to 64 KB, which reaches the agent as data, never as instructions. It is outside
+`/api`, so it needs no session. Answers: 202 fired, 401 wrong or missing secret, 404 unknown or not
+on, 413 too big, 429 over the trigger's hourly cap (counted as dropped).
+
+Three consequences worth knowing.
+
+**The sender has to reach the daemon.** The app shows the hook URL on the daemon address the app
+itself is connected to. A LAN address or `127.0.0.1` behind a tunnel works for a sender on the
+same network and for nothing else; a service on the internet needs a public address, which in
+practice is the `domain` profile's Caddy or another reverse proxy in front of the port. Caddy
+forwards every path, `/hooks/*` included.
+
+**The secret travels in a header, so use HTTPS for a real sender.** Over plain HTTP anyone on the
+path can read it and fire the trigger.
+
+**The rate cap is the agent's to propose**: `maxPerHour` defaults to 6 and may not exceed 60. A
+folder or command check runs every `everyMinutes` (default 5, at most 1 440), on the schedules'
+30-second tick.
+
+## Per-agent settings in the app
+
+A few things are configured per agent, from the agent's pages in the app, and live on the agent's
+row rather than in `settings`. What they do at runtime is in [architecture](architecture.md).
+
+| What                | Route                                | Default                                    |
+| ------------------- | ------------------------------------ | ------------------------------------------ |
+| Model               | `PUT /api/agents/:name/model`        | The registry's default                     |
+| Rules               | `GET`/`PUT /api/agents/:name/rules`  | Browse, run commands, write files: on its own. Send messages: if pre-approved. Delete, spend, install, share outside: ask first. Passwords and security: always "Hand to you", not changeable |
+| When idle           | `GET`/`PUT /api/agents/:name/idle`   | Off; 01:00–06:00 daemon local time, 200 000 tokens a day, 20 model calls a turn, the agent's own model |
+| Routines and triggers | `/api/agents/:name/schedules`, `/api/agents/:name/triggers`, `POST /api/triggers/:id` | None |
+
+Task workers have none of these: they run on their parent's model and under its rules. Idle work
+pauses itself after the owner dismisses its notes three times in a row; turning it back on clears
+the pause.
+
 ## TLS
 
 There is none in the daemon, on purpose. schermes speaks plain HTTP on one port; the compose
 file's `domain` profile puts Caddy in front of it — see
 [deployment](deployment.md#a-linked-domain). The session cookie is deliberately not `Secure`,
 because a `Secure` cookie is dropped over the plain HTTP the daemon actually speaks.
+
+Nothing in the daemon refuses plain HTTP, but some features carry secrets from the app to it, and
+past a trusted LAN they need TLS in front — Caddy from the `domain` profile, or the proxy of a
+platform such as Coolify:
+
+- **Form fields.** Filling an agent's `request_form` sends what the owner typed, passwords included,
+  in the request body; a mailbox login for an `imap` trigger goes the same way. (The daemon's own
+  HTTPS rule is about the *page* being filled: a secret field on a page that is neither HTTPS nor
+  loopback is never filled, whatever the daemon runs behind.)
+- **Webhook secrets**, in the `X-Schermes-Secret` header, from whatever service sends them.
+- **The owner password** at every login, and the session cookie on every request after it.

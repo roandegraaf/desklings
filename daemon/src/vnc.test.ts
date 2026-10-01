@@ -55,11 +55,17 @@ async function harness() {
   const vncPort = (xvnc.address() as AddressInfo).port;
 
   const dialled: number[] = [];
+  const tapped: string[] = [];
   const web = createServer();
-  attachVncProxy(web, db, (display) => {
-    dialled.push(display);
-    return connect(vncPort, '127.0.0.1');
-  });
+  attachVncProxy(
+    web,
+    db,
+    (display) => {
+      dialled.push(display);
+      return connect(vncPort, '127.0.0.1');
+    },
+    (display) => (chunk) => tapped.push(`${display}:${chunk.toString('latin1')}`),
+  );
   await new Promise<void>((done) => {
     web.listen(0, '127.0.0.1', () => done());
   });
@@ -69,6 +75,7 @@ async function harness() {
   return {
     alpha,
     dialled,
+    tapped,
     received,
     async upgrade(path: string, cookie?: string) {
       const socket = connect((web.address() as AddressInfo).port, '127.0.0.1');
@@ -138,6 +145,7 @@ test('an owner with a session gets the desktop bytes, in both directions', async
     viewer.socket.write(clientFrame(BANNER));
     await until(() => Buffer.concat(h.received).toString(), /RFB 003\.008/);
     assert.equal(Buffer.concat(h.received).toString(), BANNER, 'unmasked on the way through');
+    assert.deepEqual(h.tapped, [`${h.alpha.display}:${BANNER}`], "the viewer's bytes reach the tap too");
   } finally {
     h.close();
   }

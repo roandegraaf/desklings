@@ -47,8 +47,22 @@ struct ChatView: View {
     /// The inspector column, where there is room for one. It carries the agent's screen and
     /// routines, so the toolbar offers the column instead of those two buttons.
     let inspector: Binding<Bool>?
+    /// The agent's task workers still at it, pinned above the composer so the owner sees the work
+    /// move without unfolding them in the list. Tapping one opens its thread.
+    var workers: [Agent] = []
+    /// Needs you's form items: the transcript says a form is waiting, the item holds its fields.
+    var forms: [NeedsYouItem] = []
+    var onOpenWorker: (Agent) -> Void = { _ in }
+    /// A row to open the thread at instead of the newest, as a search hit asks.
+    var focus: Int? = nil
+    /// The agent's settings page, which takes the chat's place in the detail pane on the Mac.
+    var onOpenSettings: () -> Void = {}
 
-    @State private var loaded: [Message] = []
+    @State private var loaded: [Message] = [] {
+        didSet { rows = ChatRows(loaded, mark: mark) }
+    }
+    /// Everything drawn that follows from `loaded` and `mark` alone, rebuilt when either changes.
+    @State private var rows = ChatRows()
     @State private var more = false
     @State private var live: LiveReply?
     @State private var draft = ""
@@ -57,6 +71,13 @@ struct ChatView: View {
     @State private var loadingOlder = false
     @State private var dressing = false
     @State private var watching = false
+    @State private var filling: NeedsYouItem?
+    /// The agent's triggers, fetched only while the chat shows a trigger card.
+    @State private var triggers: [Trigger] = []
+    /// A reply the owner gave a thumbs down, waiting on the optional reason.
+    @State private var faulting: Message?
+    @State private var forwarder = Forwarder()
+    @State private var screenAfterForm = false
     /// The agent's pages, presented on the one a command or the toolbar asked for.
     @State private var pages: AgentPages.Page?
     @State private var stopping = false
@@ -74,13 +95,16 @@ struct ChatView: View {
     @FocusState private var editing: Bool
     #if os(macOS)
     @State private var pasteMonitor: Any?
+    @Environment(\.openWindow) private var openWindow
     #endif
     /// How far the reader had got when this thread was opened, captured before it is marked seen
     /// so the divider stays where it was as more arrives. A send from here retires it: the reply
     /// to what the owner just wrote is not news, and an owner row polled in from another client
     /// looks the same as a routine firing, so only this client's own send counts.
-    @State private var mark = 0
-    /// A rewind that would also take later messages of the owner's with it, waiting on a yes.
+    @State private var mark = 0 {
+        didSet { rows = ChatRows(loaded, mark: mark) }
+    }
+    /// A Restore or Retry, waiting on a yes in the preview sheet.
     @State private var confirming: Rewind?
 
     /// Whether the reader is at the newest row, which is what decides if new rows pull the view down.
@@ -88,10 +112,7 @@ struct ChatView: View {
     @State private var prepending = false
     /// On while the reader is at the newest row, off once they scroll away from it.
     @State private var following = true
-    /// A tool line the reader just opened or closed grows downwards, under the pointer, instead of
-    /// being pushed up by the bottom anchor. Released on its own: an anchor that changes in the same
-    /// update as new rows is applied to them too late.
-    @State private var holding = false
+    @State private var scrollHold = ScrollHold()
     /// A scroll view drops anchor adjustments while a finger or a fling is moving it, so an older
     /// page that arrives mid-scroll waits here for the scroll to settle.
     @State private var phase = ScrollPhase.idle
@@ -99,32 +120,37 @@ struct ChatView: View {
     /// The first page and the owner's own send jump to the newest row once it is laid out; asked
     /// for in the same update that adds the row, the scroll view cannot find it yet.
     @State private var jumpPending = false
+    @State private var focusPending = false
     @State private var position = ScrollPosition(edge: .bottom)
 
     @Environment(AgentLooks.self) private var looks
     @Environment(Unread.self) private var unread
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var scheme
+
+    /// The thread's colours: the agent's own, so every thread is recognisably its agent's. A
+    /// shared thread has several and keeps the ground and the app's accent.
+    private var palette: AgentPalette? {
+        thread.only.map { looks[$0.name].palette(dark: scheme == .dark) }
+    }
+
+    private var agentColor: BloubColorId? { thread.only.map { looks[$0.name].color } }
+    private var accent: Color { palette?.accentText.color ?? Theme.ink.rgb(dark: scheme == .dark).color }
+    private var bubble: Color { palette?.bubble.color ?? Theme.ink.rgb(dark: scheme == .dark).color }
+    private var bubbleText: Color { palette?.bubbleText.color ?? Theme.onInk.rgb(dark: scheme == .dark).color }
 
     /// By id rather than `scrollTo(edge:)`: in a lazy stack the edge is an estimate, and landing on
     /// it left the view scrolled past rows that were never laid out.
-    private func hold() {
-        holding = true
-        Task {
-            try? await Task.sleep(for: .milliseconds(500))
-            holding = false
-        }
-    }
-
     private func scrollToNewest() {
         following = true
         if live != nil {
             position.scrollTo(id: "live", anchor: .bottom)
-        } else if let last = items.last {
+        } else if let last = rows.items.last {
             position.scrollTo(id: last.id, anchor: .bottom)
         }
     }
 
-    private var followAnchor: UnitPoint { following && !holding ? .bottom : .top }
+    private var followAnchor: UnitPoint { following && !scrollHold.holding ? .bottom : .top }
 
     private struct Extent: Equatable {
         var height: CGFloat
@@ -155,15 +181,9 @@ struct ChatView: View {
         }
     }
 
-    private var items: [ChatItem] {
-        let dayStarts = dayStarts
-        let unreadId = firstUnread(in: loaded, after: mark)
-        return chatItems(loaded, breaks: { dayStarts.contains($0.id) || $0.id == unreadId })
-    }
-
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 10) {
+            LazyVStack(alignment: .leading, spacing: 16) {
                 // Keyed by the oldest row rather than fired when the top comes near: a page that folds
                 // into the tool line already there adds no height, the top stays near, and a
                 // trigger on nearness changing would never fire again.
@@ -174,39 +194,57 @@ struct ChatView: View {
                         .task(id: oldestId(loaded)) { await older() }
                 }
 
-                let unreadId = firstUnread(in: loaded, after: mark)
-                let dayStarts = dayStarts
-                ForEach(items) { item in
+                ForEach(rows.items) { item in
                     let message = item.first
-                    if dayStarts.contains(message.id) {
+                    if rows.dayStarts.contains(message.id) {
                         DaySeparator(millis: message.createdAt)
                     }
-                    if message.id == unreadId {
+                    if message.id == rows.unreadId {
                         NewDivider()
                     }
                     switch item {
+                    case .message(let message, _) where message.isIdleNote:
+                        IdleNoteLine(millis: message.createdAt)
+                    case .message(let message, _) where message.isTriggerLine:
+                        TriggerLine(message: message)
+                    case .message(let message, _) where message.isRestoreLine:
+                        RestoreLine(message: message)
+                    case .message(let message, _) where message.isShownLine:
+                        ShownLine(message: message)
+                    case .message(let message, _) where message.isSystemLine:
+                        SystemLine(message: message)
                     case .message(let message, let shown):
                         MessageRow(
                             session: session,
                             message: message,
                             shown: shown,
-                            own: thread.only?.name,
-                            members: thread.members,
+                            speaker: speakerLabel(of: message, own: thread.only?.name, among: thread.members),
+                            bubble: bubble,
+                            bubbleText: bubbleText,
                             onRestore: rewindable(restoring: message).map { request in { ask(request) } },
-                            onRetry: rewindable(retrying: message).map { request in { ask(request) } }
+                            onRetry: rewindable(retrying: message).map { request in { ask(request) } },
+                            onFeedback: message.role == .assistant ? { rating in rate(message, rating) } : nil
                         )
+                        .equatable()
                     case .tools(let run):
-                        ToolRun(run: run, loaded: loaded, by: thread.only == nil ? speaker(of: run[0], among: thread.members) : nil)
+                        ToolRun(run: run, by: thread.only == nil ? speaker(of: run[0].message, among: thread.members) : nil)
+                            .equatable()
                     }
                 }
 
                 if let live, let agent = thread.only {
-                    LiveRow(reply: live, agent: agent.title).id("live")
+                    LiveRow(reply: live, agent: agent.title) { useBackup in
+                        await retryModel(agent.name, useBackup: useBackup)
+                    }
+                    .id("live")
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 10)
-            .environment(\.holdScroll, hold)
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+            .frame(maxWidth: readingWidth)
+            .frame(maxWidth: .infinity)
+            .environment(\.holdScroll, scrollHold)
+            .environment(forwarder)
         }
         .defaultScrollAnchor(.bottom, for: .initialOffset)
         .defaultScrollAnchor(followAnchor, for: .sizeChanges)
@@ -219,7 +257,12 @@ struct ChatView: View {
         // offset moves by exactly what the older page added.
         .onScrollGeometryChange(for: Extent.self, of: Extent.init) { old, new in
             guard new.height != old.height else { return }
-            if jumpPending {
+            if focusPending {
+                focusPending = false
+                if let focus, let item = rows.items.last(where: { $0.first.id <= focus }) {
+                    position.scrollTo(id: item.id, anchor: .center)
+                }
+            } else if jumpPending {
                 jumpPending = false
                 scrollToNewest()
             } else if prepending {
@@ -243,35 +286,20 @@ struct ChatView: View {
             jumpToBottom.animation(.easeOut(duration: 0.15), value: atBottom)
         }
         .overlay {
-            if loaded.isEmpty && !more {
-                if let agent = thread.only, agent.parentId == nil, agent.profile == nil {
-                    // A new agent has nothing to say until it knows what it is for. The same
-                    // request the Profile page sends, offered where the owner lands first.
-                    ContentUnavailableView {
-                        Label("\(agent.title) is new", systemImage: "person.crop.circle.badge.questionmark")
-                    } description: {
-                        Text("It has no profile yet. Let it interview you about what it should be and do; you can also just write to it.")
-                    } actions: {
-                        Button("Set up \(agent.title)") {
-                            Task { await send(interviewRequest(hasProfile: false)) }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(sending || agent.state.busy)
-                    }
-                } else {
-                    ContentUnavailableView("Nothing here yet", systemImage: "text.bubble")
-                }
-            }
+            if loaded.isEmpty && !more { empty }
         }
+        // The content and the composer, not the toolbar. Text-strength: a filled control in the
+        // agent's colour sets the bubble colour on itself.
+        .tint(accent)
+        .background(palette.map { AnyShapeStyle($0.tint.color) } ?? AnyShapeStyle(Theme.ground))
         .safeAreaInset(edge: .bottom) { composer }
-        .confirmationDialog(
-            "Later messages will be removed",
-            isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
-            presenting: confirming
-        ) { request in
-            Button(request.retry ? "Retry" : "Restore", role: .destructive) { Task { await rewind(request) } }
-        } message: { _ in
-            Text("Everything after this point is deleted from the thread. What the agent already did on its computer stays done.")
+        .sheet(item: $confirming) { request in
+            RewindSheet(
+                retry: request.retry,
+                title: { name in thread.members.first { $0.name == name }?.title ?? name },
+                load: { try await session.run { try await $0.rewindPreview(thread.source, from: request.from) } },
+                confirm: { files in try await rewind(request, files: files) }
+            )
         }
         .navigationTitle(thread.title)
         #if os(iOS)
@@ -279,20 +307,35 @@ struct ChatView: View {
         #else
         // The pill already names the thread; the plain title beside it is the same words twice.
         .toolbar(removing: .title)
+        .safeAreaInset(edge: .top, spacing: 0) { header }
         #endif
         .toolbar {
+            #if os(iOS)
             ToolbarItem(placement: .principal) { pill.padding(.horizontal, 8) }
             // Only a permanent agent: `desktopAgent` refuses a task worker a display, and a worker
-            // holds no schedules of its own — the web UI gives it neither tab. One menu on compact
-            // width, where three buttons beside the pill would not fit.
-            if let agent = thread.only, agent.parentId == nil, inspector == nil {
+            // holds no schedules of its own — the web UI gives it neither tab. One menu, where three
+            // buttons beside the pill would not fit; with an inspector too, which no longer lists the pages.
+            if let agent = thread.only, agent.parentId == nil {
                 ToolbarItem {
                     Menu {
-                        Button("Screen", systemImage: "display") { watching = true }
-                        Button("Profile, routines and memory", systemImage: "clock.arrow.circlepath") { pages = .profile }
+                        if inspector == nil {
+                            Button("Screen", systemImage: "display") { watching = true }
+                        }
+                        Button("Profile", systemImage: "person.text.rectangle") { pages = .profile }
+                        Button("Rules", systemImage: "checkmark.shield") { pages = .rules }
+                        Button("When idle", systemImage: "moon.zzz") { pages = .idle }
+                        Button("Routines and triggers", systemImage: "bolt.badge.clock") { pages = .routines }
+                        Button("Activity", systemImage: "list.bullet.rectangle") { pages = .activity }
+                        Button("Memory", systemImage: "book.closed") { pages = .memory }
                         export
                     } label: {
-                        Label("More", systemImage: "ellipsis.circle")
+                        if let percent = agent.contextFullness {
+                            Image(systemName: "ellipsis")
+                                .overlay { ContextRing(percent: percent, identity: looks[agent.name], radius: 11.2) }
+                                .accessibilityLabel("More. \(ContextFullness.label(percent))")
+                        } else {
+                            Label("More", systemImage: "ellipsis.circle")
+                        }
                     }
                 }
             }
@@ -300,13 +343,19 @@ struct ChatView: View {
             // before the centred pill to its left, and a parent's items are declared first.
             if let inspector {
                 ToolbarSpacer(.flexible)
-                ToolbarItem { export }
+                if let agent = thread.only, let percent = agent.contextFullness {
+                    ToolbarItem { ContextMeter(percent: percent, identity: looks[agent.name]).padding(.horizontal, 6) }
+                }
+                if thread.only?.parentId != nil || thread.only == nil {
+                    ToolbarItem { export }
+                }
                 ToolbarItem {
                     Button("Inspector", systemImage: "sidebar.trailing") { inspector.wrappedValue.toggle() }
                 }
             } else if thread.only?.parentId != nil || thread.only == nil {
                 ToolbarItem { export }
             }
+            #endif
         }
         .fileImporter(isPresented: $picking, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
             guard case .success(let urls) = result else { return }
@@ -370,6 +419,31 @@ struct ChatView: View {
             if let agent = thread.only {
                 AgentLookSheet(session: session, agent: agent, identity: looks[agent.name])
             }
+        }
+        .task(id: rows.trigger == nil ? nil : thread.only?.name) {
+            if rows.trigger != nil, let agent = thread.only, agent.parentId == nil { await watchTriggers(agent.name) }
+        }
+        .sheet(item: $filling, onDismiss: takeScreenAfterForm) { item in
+            if let form = item.form {
+                FormSheet(agent: thread.only?.title ?? item.agent, form: form) { fill in
+                    let cursor = newestId(loaded)
+                    try await session.run { try await $0.fillForm(agent: item.agent, id: form.id, fill: fill) }
+                    mark = Int.max
+                    jumpPending = true
+                    await catchUp(after: cursor)
+                } onScreen: {
+                    screenAfterForm = true
+                    filling = nil
+                }
+            }
+        }
+        .sheet(item: $faulting) { message in
+            FeedbackSheet { reason in
+                try await sendFeedback(message.id, FeedbackUpdate(rating: .down, reason: reason))
+            }
+        }
+        .sheet(item: Binding(get: { forwarder.pending }, set: { forwarder.pending = $0 })) { forwarding in
+            ForwardSheet(session: session, forwarding: forwarding, excluding: thread.only?.name)
         }
         .sheet(item: $pages) { page in
             if let agent = thread.only {
@@ -441,31 +515,199 @@ struct ChatView: View {
         .disabled(loaded.isEmpty)
     }
 
+    /// Prose reads best under about 80 characters a line; a Mac window is far wider than that.
+    private let readingWidth: CGFloat = 760
+
+    /// A thread with nothing in it opens on the face it belongs to, not on a grey glyph. A new
+    /// agent is offered the interview here, where the owner lands first, with the same request the
+    /// Profile page sends.
+    @ViewBuilder private var empty: some View {
+        VStack(spacing: 16) {
+            if let agent = thread.only {
+                BloubView(state: .idle, identity: looks[agent.name], size: 120)
+            } else {
+                HStack(alignment: .top, spacing: 16) {
+                    ForEach(thread.members) { member in
+                        VStack(spacing: 6) {
+                            BloubView(state: .idle, identity: looks[member.name], size: 88)
+                            Text(member.title).font(.subheadline.weight(.semibold)).fontDesign(.rounded)
+                            if let tagline = member.tagline {
+                                Text(tagline).font(.caption).foregroundStyle(Theme.muted).lineLimit(2)
+                            }
+                        }
+                        .frame(maxWidth: 140)
+                    }
+                }
+            }
+            Text(thread.title)
+                .font(.title2.weight(.bold))
+                .fontDesign(.rounded)
+            if let agent = thread.only, agent.parentId == nil, agent.profile == nil {
+                Text("It has no profile yet. Let it interview you about what it should be and do, or just start writing to it.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Button("Set up \(agent.title)") {
+                    Task { await send(interviewRequest(hasProfile: false)) }
+                }
+                .buttonStyle(.pill(.agent(agentColor)))
+                .controlSize(.large)
+                .disabled(sending || agent.state.busy)
+            } else {
+                Text(thread.isWorker ? "Nothing reported yet." : "Nothing here yet. Whatever you write below starts the thread.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .frame(maxWidth: 360)
+        .padding(24)
+    }
+
     @ViewBuilder private var pill: some View {
         if let agent = thread.only {
             // The pill is also the way into the agent's look: there is nowhere else the owner is
             // already looking at the avatar they want to change.
             Button { dressing = true } label: {
-                HStack(spacing: 7) {
-                    BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 22)
-                    Text(agent.title).font(.headline)
-                    StateDot(state: agent.state)
-                }
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("\(agent.title), \(agent.state.label). Change its name and appearance")
-        } else {
-            HStack(spacing: 7) {
-                HStack(spacing: -7) {
-                    ForEach(thread.members) { member in
-                        BloubView(state: member.state.bloub, identity: looks[member.name], size: 22)
+                HStack(spacing: 8) {
+                    BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 26)
+                        .busyHalo(agent.state.busy, color: looks[agent.name].color)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(agent.title).font(.headline).fontDesign(.rounded)
+                        StateLine(state: agent.state, identity: looks[agent.name], font: .caption2.weight(.semibold))
                     }
                 }
-                Text(thread.title).font(.headline)
+                .lineLimit(1)
+                .padding(.leading, 2)
+                .padding(.trailing, 6)
             }
+            // The Mac's toolbar already sets its items on glass; iOS leaves a custom principal
+            // item bare, so only there does the button bring its own.
+            #if os(iOS)
+            .buttonStyle(.glass)
+            #else
+            .buttonStyle(.plain)
+            #endif
+            .accessibilityLabel("\(agent.title), \(agent.state.label). Change its name and appearance")
+        } else {
+            HStack(spacing: 10) {
+                ForEach(thread.members) { member in
+                    HStack(spacing: 5) {
+                        BloubView(state: member.state.bloub, identity: looks[member.name], size: 22)
+                            .busyHalo(member.state.busy, color: looks[member.name].color)
+                        Text(member.title).font(.subheadline.weight(.semibold)).fontDesign(.rounded)
+                    }
+                }
+            }
+            .lineLimit(1)
+            #if os(iOS)
+            .padding(.vertical, 5)
+            .padding(.leading, 6)
+            .padding(.trailing, 12)
+            .glassEffect(.regular, in: .capsule)
+            #endif
             .accessibilityLabel("thread with \(thread.title)")
         }
     }
+
+    #if os(macOS)
+    private var header: some View {
+        HStack(spacing: 14) {
+            headerTitle
+            Spacer(minLength: 0)
+            if let agent = thread.only, let percent = agent.contextFullness {
+                ContextMeter(percent: percent, identity: looks[agent.name])
+                    .padding(.leading, 9)
+                    .padding(.trailing, 12)
+                    .frame(height: 36)
+                    .background(Theme.card.opacity(0.72), in: .capsule)
+                    .overlay { Capsule().strokeBorder(Theme.card.opacity(0.95), lineWidth: 1) }
+            }
+            headerTools
+        }
+        .padding(EdgeInsets(top: 16, leading: 24, bottom: 10, trailing: 20))
+        .background {
+            Rectangle()
+                .fill(palette.map { AnyShapeStyle($0.tint.color) } ?? AnyShapeStyle(Theme.ground))
+                .ignoresSafeArea(edges: .top)
+        }
+    }
+
+    @ViewBuilder private var headerTitle: some View {
+        if let agent = thread.only {
+            Button { dressing = true } label: {
+                HStack(spacing: 14) {
+                    BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 44)
+                        .busyHalo(agent.state.busy, color: looks[agent.name].color)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(agent.title).font(.system(size: 22, weight: .bold, design: .rounded))
+                        StateLine(state: agent.state, identity: looks[agent.name], font: .system(size: 13, weight: .semibold))
+                    }
+                }
+                .lineLimit(1)
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .help("Change its name and appearance")
+            .accessibilityLabel("\(agent.title), \(agent.state.label). Change its name and appearance")
+        } else {
+            HStack(spacing: 14) {
+                HStack(spacing: -10) {
+                    ForEach(thread.members) { member in
+                        BloubView(state: member.state.bloub, identity: looks[member.name], size: 34)
+                            .busyHalo(member.state.busy, color: looks[member.name].color)
+                    }
+                }
+                Text(thread.title).font(.system(size: 22, weight: .bold, design: .rounded))
+            }
+            .lineLimit(1)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("thread with \(thread.title)")
+        }
+    }
+
+    private var headerTools: some View {
+        HStack(spacing: 2) {
+            if let agent = thread.only, agent.parentId == nil {
+                headerButton("Routines and triggers", symbol: "bolt.badge.clock") { pages = .routines }
+                headerButton("Memory", symbol: "book.closed") { pages = .memory }
+                headerButton("\(agent.title)'s settings", symbol: "gearshape", action: onOpenSettings)
+            }
+            export
+                .labelStyle(.iconOnly)
+                .font(.system(size: 16, weight: .medium))
+                .frame(width: 36, height: 36)
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.ink)
+                .help("Export as Markdown")
+            if let inspector {
+                headerButton(
+                    inspector.wrappedValue ? "Hide inspector" : "Show inspector",
+                    symbol: "sidebar.trailing",
+                    active: inspector.wrappedValue
+                ) { inspector.wrappedValue.toggle() }
+            }
+        }
+        .padding(4)
+        .background(Theme.card.opacity(0.72), in: .capsule)
+        .overlay { Capsule().strokeBorder(Theme.card.opacity(0.95), lineWidth: 1) }
+        .shadow(color: .black.opacity(0.06), radius: 8, y: 4)
+    }
+
+    private func headerButton(_ title: String, symbol: String, active: Bool = false, action: @escaping () -> Void) -> some View {
+        let text = active ? palette.map { AnyShapeStyle($0.softText.color) } ?? AnyShapeStyle(Theme.ink) : AnyShapeStyle(Theme.ink)
+        let fill = active ? palette.map { AnyShapeStyle($0.soft.color) } ?? AnyShapeStyle(Theme.ink.opacity(0.06)) : AnyShapeStyle(.clear)
+        return Button(title, systemImage: symbol, action: action)
+            .labelStyle(.iconOnly)
+            .font(.system(size: 16, weight: .medium))
+            .foregroundStyle(text)
+            .frame(width: 36, height: 36)
+            .background(fill, in: .circle)
+            .contentShape(.circle)
+            .buttonStyle(.plain)
+            .help(title)
+    }
+    #endif
 
     @ViewBuilder private var composer: some View {
         if thread.isWorker {
@@ -480,7 +722,8 @@ struct ChatView: View {
             .padding(.horizontal, 24)
             .padding(.bottom, 12)
         } else {
-            VStack(spacing: 6) {
+            GlassEffectContainer(spacing: 12) {
+            VStack(spacing: 10) {
                 if thread.only == nil {
                     Text("Agents stop writing to each other after a few messages without you. Posting here is what clears that.")
                         .font(.caption2)
@@ -489,24 +732,105 @@ struct ChatView: View {
                         .padding(.horizontal, 8)
                 }
 
-                if let trouble {
-                    Text(trouble)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                        .padding(.horizontal, 8)
-                } else if let notice {
-                    Text(notice)
-                        .font(.footnote)
+                #if os(macOS)
+                if !workers.isEmpty {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) { workerChips }
+                        VStack(spacing: 8) { workerChips }
+                    }
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                #else
+                ForEach(workers) { worker in
+                    Button { onOpenWorker(worker) } label: {
+                        WorkerRow(agent: worker, inset: 0)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular, in: .capsule)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .accessibilityHint("Opens the worker's thread")
+                }
+                #endif
+
+                if trouble != nil || notice != nil {
+                    HStack(spacing: 10) {
+                        Image(systemName: trouble != nil ? "exclamationmark.triangle.fill" : "info.circle")
+                            .foregroundStyle(trouble != nil ? AnyShapeStyle(Theme.failed) : AnyShapeStyle(Theme.muted))
+                        Text(trouble ?? notice ?? "")
+                            .font(.footnote)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button("Dismiss", systemImage: "xmark") {
+                            trouble = nil
+                            notice = nil
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.plain)
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
-                        .padding(.horizontal, 8)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    #if os(macOS)
+                    .floatingCard(radius: 18)
+                    #else
+                    .glassEffect(.regular, in: .rect(cornerRadius: 18))
+                    #endif
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
                 // Keyed by the call, so a second round of questions starts from a blank form.
-                if let agent = thread.only, !agent.state.busy, let interview = pendingInterview(in: loaded) {
+                if let agent = thread.only, !agent.state.busy, let interview = rows.interview {
                     InterviewCard(interview: interview, agent: agent.title) { text in
                         await send(text)
                     }
                     .id(interview.callId)
+                    .actionCard(bubble)
+                }
+
+                if let agent = thread.only, agent.parentId == nil, !agent.state.busy, let hang = rows.browserHang {
+                    BrowserHungCard(agent: agent.title, onScreen: showScreen) { desktop in
+                        await restartBrowser(agent.name, desktop: desktop)
+                    }
+                    .id(hang)
+                    .actionCard(bubble)
+                }
+
+                if let agent = thread.only, agent.parentId == nil, !agent.state.busy, let handOver = rows.handOver {
+                    HandOverCard(agent: agent.title, reason: handOver.reason) {
+                        await takeScreen(agent.name)
+                    }
+                    .id(handOver.callId)
+                    .actionCard(bubble)
+                }
+
+                if let agent = thread.only, agent.parentId == nil, !agent.state.busy, let pending = rows.form,
+                   let item = forms.first(where: { $0.messageId == pending.messageId }), let form = item.form {
+                    FormCard(agent: agent.title, form: form) {
+                        filling = item
+                    } onScreen: {
+                        await takeScreen(agent.name)
+                    }
+                    .id(pending.callId)
+                    .actionCard(bubble)
+                }
+
+                // Not held back while the agent is busy: turning it on starts the turn that offers the test.
+                if let agent = thread.only, agent.parentId == nil, let pending = rows.trigger,
+                   let trigger = triggers.first(where: { $0.id == pending.triggerId }), trigger.state != .off {
+                    TriggerCard(
+                        trigger: trigger,
+                        pending: pending,
+                        hookURL: trigger.webhook.flatMap { session.client?.hookURL($0) },
+                        onLogin: forms.first(where: { $0.triggerId == trigger.id }).map { item in { filling = item } }
+                    ) { action in
+                        let updated = try await session.run { try await $0.actOnTrigger(id: trigger.id, action: action) }
+                        triggers = triggers.compactMap { $0.id == trigger.id ? updated : $0 }
+                    }
+                    .id(pending.callId)
+                    .actionCard(bubble)
                 }
 
                 if !matches.isEmpty {
@@ -558,12 +882,23 @@ struct ChatView: View {
                                 Button("File…", systemImage: "doc") { picking = true }
                             } label: {
                                 Label("Attach", systemImage: "paperclip")
+                                    #if os(macOS)
+                                    .font(.system(size: 16, weight: .medium))
+                                    .frame(width: 36, height: 36)
+                                    .background(Theme.ink.opacity(0.06), in: .circle)
+                                    .contentShape(.circle)
+                                    #endif
                             }
                             .labelStyle(.iconOnly)
                             .menuStyle(.button)
                             .buttonStyle(.plain)
                             .menuIndicator(.hidden)
+                            #if os(macOS)
+                            .foregroundStyle(Theme.ink)
+                            #else
                             .foregroundStyle(.secondary)
+                            #endif
+                            .accessibilityLabel("Attach a photo or file")
                             .disabled(sending)
                         }
 
@@ -583,7 +918,7 @@ struct ChatView: View {
                             .overlay {
                                 TextEditor(text: $draft)
                                     .scrollContentBackground(.hidden)
-                                    .accessibilityLabel(placeholder)
+                                    .accessibilityLabel(recipient)
                                     // An ignored Shift+Return reaches the editor, which puts the newline at the caret.
                                     // With the command list open, Return takes the picked row instead.
                                     .onKeyPress(.return, phases: .down) { press in
@@ -600,26 +935,38 @@ struct ChatView: View {
                                     }
                                     .focused($editing)
                             }
-                            .font(.body)
+                            .font(.canvas(15, .body))
 
                         if thread.only?.state.busy == true { stopButton }
 
                         Button("Send", systemImage: "arrow.up") { Task { await send() } }
                             .labelStyle(.iconOnly)
-                            .buttonStyle(.borderedProminent)
-                            .buttonBorderShape(.circle)
+                            .buttonStyle(.pill(canSend ? .agent(agentColor) : .secondary, round: true))
                             .keyboardShortcut(.return, modifiers: .command)
                             .disabled(!canSend)
                     }
+                    #if os(macOS)
+                    .padding(.leading, thread.only?.parentId == nil && thread.only != nil ? 8 : 18)
+                    #else
                     .padding(.leading, thread.only?.parentId == nil && thread.only != nil ? 12 : 18)
+                    #endif
                     .padding(.trailing, 6)
                     .padding(.vertical, 6)
                 }
+                #if os(macOS)
+                .floatingCard(radius: 26, fill: 0.86, shadow: 0.08, blur: 28, y: 8)
+                #else
                 .glassEffect(.regular, in: attachments.isEmpty ? AnyShape(.capsule) : AnyShape(.rect(cornerRadius: 24)))
+                #endif
             }
+            .frame(maxWidth: readingWidth)
             .padding(.horizontal, 14)
             .padding(.bottom, 8)
             .animation(reduceMotion ? nil : .snappy, value: matches.isEmpty)
+            .animation(reduceMotion ? nil : .snappy, value: trouble == nil && notice == nil)
+            .animation(reduceMotion ? nil : .snappy, value: workers.map(\.name))
+            .tint(accent)
+            }
         }
     }
 
@@ -666,7 +1013,7 @@ struct ChatView: View {
         case .interview:
             if let agent = thread.only { await send(interviewRequest(hasProfile: agent.profile != nil)) }
         case .screen:
-            if let inspector { inspector.wrappedValue = true } else { watching = true }
+            showScreen()
         case .profile:
             pages = .profile
         case .routines:
@@ -685,6 +1032,25 @@ struct ChatView: View {
     /// `rewind` from the first id there is: every row and every summary goes, the thread stays.
     /// Not a delete of the conversation, which would leave a shared thread's row — and its
     /// place in the sidebar — gone from under this view.
+    private func rate(_ message: Message, _ rating: FeedbackRating?) {
+        if rating == .down {
+            faulting = message
+            return
+        }
+        Task {
+            do {
+                try await sendFeedback(message.id, FeedbackUpdate(rating: rating))
+            } catch {
+                if !error.isCancellation { trouble = error.localizedDescription }
+            }
+        }
+    }
+
+    private func sendFeedback(_ id: Int, _ update: FeedbackUpdate) async throws {
+        let stored = try await session.run { try await $0.setFeedback(message: id, update) }
+        if let index = loaded.firstIndex(where: { $0.id == id }) { loaded[index].feedback = stored }
+    }
+
     private func clear() async {
         do {
             try await session.run { try await $0.rewind(thread.source, from: 1, retry: false) }
@@ -735,9 +1101,7 @@ struct ChatView: View {
     private var stopButton: some View {
         Button(stopping ? "Stopping…" : "Stop", systemImage: "stop.fill") { stop() }
             .labelStyle(.iconOnly)
-            .buttonStyle(.bordered)
-            .buttonBorderShape(.circle)
-            .tint(.red)
+            .buttonStyle(.pill(.destructive, round: true))
             .keyboardShortcut(.escape, modifiers: [])
             .disabled(stopping)
             .accessibilityLabel("Stop the turn")
@@ -793,30 +1157,56 @@ struct ChatView: View {
         }
     }
 
+    private var recipient: String {
+        thread.only.map { "Message \($0.title)" } ?? "Message this thread"
+    }
+
     private var placeholder: String {
-        thread.only.map { "Write to \($0.title)" } ?? "Write to this thread"
+        SlashCommand.offered(in: thread).isEmpty ? recipient : recipient + ", or / for commands"
     }
 
-    private var dayStarts: Set<Int> {
-        Set(loaded.indices.filter { index in
-            index == 0 || !Calendar.current.isDate(
-                date(loaded[index - 1].createdAt),
-                inSameDayAs: date(loaded[index].createdAt)
-            )
-        }.map { loaded[$0].id })
+    #if os(macOS)
+    private var workerChips: some View {
+        ForEach(workers) { worker in
+            Button { onOpenWorker(worker) } label: {
+                HStack(spacing: 8) {
+                    BloubView(state: worker.state.bloub, identity: looks[worker.name], size: 20)
+                    Text(worker.title).fontWeight(.bold).foregroundStyle(Theme.ink)
+                    StateLine(state: worker.state, identity: looks[worker.name], font: .canvas(12, .caption))
+                }
+                .font(.canvas(12, .caption))
+                .lineLimit(1)
+                .padding(.leading, 8)
+                .padding(.trailing, 12)
+                .frame(height: 32)
+                .floatingCard(radius: 16, fill: 0.8, shadow: 0.06, blur: 14, y: 4)
+                .contentShape(.capsule)
+            }
+            .buttonStyle(.plain)
+            .accessibilityElement(children: .combine)
+            .accessibilityHint("Opens the worker's thread")
+        }
     }
-
-    private func date(_ millis: Int) -> Date {
-        Date(timeIntervalSince1970: Double(millis) / 1000)
-    }
+    #endif
 
     private func open() async {
         mark = unread.lastSeen(thread.source)
         do {
-            let page = try await session.run { try await $0.messages(thread.source) }
-            loaded = page
+            var page = try await session.run { try await $0.messages(thread.source) }
             more = !atStart(page, PAGE)
-            jumpPending = !page.isEmpty
+            if let focus {
+                for _ in 0..<10 where more && !page.contains(where: { $0.id <= focus }) {
+                    guard let before = oldestId(page) else { break }
+                    let older = try await session.run {
+                        try await $0.messages(thread.source, window: MessageWindow(before: before))
+                    }
+                    page = merge(page, older)
+                    more = !atStart(older, PAGE)
+                }
+                following = false
+            }
+            loaded = page
+            if focus != nil, !page.isEmpty { focusPending = true } else { jumpPending = !page.isEmpty }
             trouble = nil
         } catch {
             if !error.isCancellation { trouble = error.localizedDescription }
@@ -852,11 +1242,11 @@ struct ChatView: View {
     }
 
     private func prepend(_ page: [Message]) {
-        let before = items.count
+        let before = rows.items.count
         loaded = merge(loaded, page)
         // Rows that only join the tool line on top add no item and no height, and a flag left up
         // would shift the view at the next unrelated change instead.
-        prepending = items.count != before
+        prepending = rows.items.count != before
         more = !atStart(page, PAGE)
         loadingOlder = false
     }
@@ -873,35 +1263,25 @@ struct ChatView: View {
     /// A retry asks again the message the reply answered, so everything after that message goes,
     /// the tool work leading up to the reply included.
     private func rewindable(retrying message: Message) -> Rewind? {
-        guard rewindAllowed, message.role == .assistant,
-              let prompt = loaded.last(where: { $0.id < message.id && $0.role == .user })
-        else { return nil }
-        return Rewind(message: message, from: prompt.id + 1, retry: true)
+        guard rewindAllowed, let from = rows.retryFrom[message.id] else { return nil }
+        return Rewind(message: message, from: from, retry: true)
     }
 
     private func ask(_ request: Rewind) {
-        if loaded.contains(where: { $0.isOwner && $0.id >= request.from && $0.id != request.message.id }) {
-            confirming = request
-        } else {
-            Task { await rewind(request) }
-        }
+        confirming = request
     }
 
-    private func rewind(_ request: Rewind) async {
+    private func rewind(_ request: Rewind, files: Bool) async throws {
         trouble = nil
-        do {
-            try await session.run { try await $0.rewind(thread.source, from: request.from, retry: request.retry) }
-            if !request.retry {
-                draft = [request.message.content, draft].filter { !$0.isEmpty }.joined(separator: "\n\n")
-                if let image = request.message.image {
-                    attachments.append(Attachment(name: "image", data: Data(), image: image))
-                }
+        try await session.run { try await $0.rewind(thread.source, from: request.from, retry: request.retry, files: files) }
+        if !request.retry {
+            draft = [request.message.content, draft].filter { !$0.isEmpty }.joined(separator: "\n\n")
+            if let image = request.message.image {
+                attachments.append(Attachment(name: "image", data: Data(), image: image))
             }
-            await open()
-            mark = Int.max
-        } catch {
-            if !error.isCancellation { trouble = error.localizedDescription }
         }
+        await open()
+        mark = Int.max
     }
 
     private func pollLive(_ name: String) async {
@@ -913,6 +1293,61 @@ struct ChatView: View {
             }
         } else if live != next {
             live = next
+        }
+    }
+
+    private func showScreen() {
+        if let inspector { inspector.wrappedValue = true } else { watching = true }
+    }
+
+    /// Takes the agent's mouse and keyboard, then opens its desktop where "Give it back" is.
+    /// Polled, not pushed: a fire and a login entered elsewhere both change what the card shows.
+    private func watchTriggers(_ name: String) async {
+        while !Task.isCancelled {
+            if let rows = try? await session.run({ try await $0.triggers(agent: name) }) { triggers = rows }
+            try? await Task.sleep(for: .seconds(3))
+        }
+    }
+
+    private func takeScreen(_ name: String) async {
+        do {
+            _ = try await session.run { try await $0.setControl(agent: name, held: true) }
+        } catch {
+            if !error.isCancellation { trouble = error.localizedDescription }
+            return
+        }
+        #if os(macOS)
+        openWindow(id: desktopWindowID, value: name)
+        #else
+        watching = true
+        #endif
+    }
+
+    /// A sheet can't present over one still going away, so the screen waits for the form to close.
+    private func takeScreenAfterForm() {
+        guard screenAfterForm, let name = thread.only?.name else { return }
+        screenAfterForm = false
+        Task { await takeScreen(name) }
+    }
+
+    private func restartBrowser(_ name: String, desktop: Bool) async {
+        let cursor = newestId(loaded)
+        do {
+            try await session.run { try await $0.restartBrowser(agent: name, desktop: desktop) }
+            mark = Int.max
+            jumpPending = true
+            await catchUp(after: cursor)
+        } catch {
+            if !error.isCancellation { trouble = error.localizedDescription }
+        }
+    }
+
+    private func retryModel(_ name: String, useBackup: Bool) async {
+        do {
+            try await session.run { try await $0.retryModel(agent: name, useBackup: useBackup) }
+            await pollLive(name)
+        } catch {
+            if !error.isCancellation { trouble = error.localizedDescription }
         }
     }
 
@@ -992,110 +1427,296 @@ struct Attachment: Identifiable {
     var image: Base64Image? = nil
 }
 
+/// Why a reply missed, optional. It goes into the agent's memory with the thumbs down.
+struct FeedbackSheet: View {
+    let onSend: (String?) async throws -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var reason = ""
+    @State private var sending = false
+    @State private var trouble: String?
+
+    private static let limit = 500
+
+    var body: some View {
+        ThemedForm {
+            Section {
+                TextField("What was wrong with it?", text: $reason, axis: .vertical)
+                    .lineLimit(3...8)
+                    .onChange(of: reason) { if reason.count > Self.limit { reason = String(reason.prefix(Self.limit)) } }
+                if let trouble {
+                    Label(trouble, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(Theme.failed)
+                }
+            } footer: {
+                Text("Optional. The agent finds it in its memory.")
+            }
+        }
+        .sheetChrome(
+            "Bad reply",
+            confirm: "Send",
+            confirmDisabled: sending,
+            cancel: { dismiss() },
+            onConfirm: send
+        )
+        .presentationDetents([.medium])
+        .presentationBackground(Theme.ground)
+        #if os(macOS)
+        .frame(minWidth: 380, idealWidth: 420, minHeight: 220)
+        #endif
+    }
+
+    private func send() {
+        sending = true
+        trouble = nil
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            do {
+                try await onSend(trimmed.isEmpty ? nil : trimmed)
+                dismiss()
+            } catch {
+                trouble = error.localizedDescription
+            }
+            sending = false
+        }
+    }
+}
+
+#if os(iOS)
+private let dividerFont = Font.caption
+#else
+private let dividerFont = Font.system(size: 12)
+#endif
+
+private let dayFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateStyle = .medium
+    formatter.doesRelativeDateFormatting = true
+    return formatter
+}()
+
 struct DaySeparator: View {
     let millis: Int
 
     var body: some View {
-        Text(Date(timeIntervalSince1970: Double(millis) / 1000)
-            .formatted(date: .abbreviated, time: .omitted))
-            .font(.caption2.weight(.medium))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 6)
-    }
-}
-
-/// Where the owner had got to when the thread was opened. Everything below it arrived since.
-struct NewDivider: View {
-    var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 12) {
             rule
-            Text("new")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tint)
+            Text(dayFormatter.string(from: Date(timeIntervalSince1970: Double(millis) / 1000)))
+                .font(dividerFont.weight(.semibold))
+                .foregroundStyle(Theme.muted)
+                .fixedSize()
             rule
         }
         .padding(.vertical, 4)
     }
 
     private var rule: some View {
-        Rectangle()
-            .fill(.tint)
-            .opacity(0.35)
-            .frame(height: 1)
+        Rectangle().fill(Theme.hairline).frame(height: 1).accessibilityHidden(true)
+    }
+}
+
+/// Where an idle pass began: the daemon's note to the agent, which is not the owner speaking.
+struct IdleNoteLine: View {
+    let millis: Int
+
+    var body: some View {
+        Label {
+            Text("Idle work · \(Date(timeIntervalSince1970: Double(millis) / 1000).formatted(date: .omitted, time: .shortened))")
+        } icon: {
+            Image(systemName: "moon.zzz")
+        }
+        .font(.caption2.weight(.medium))
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct SystemLine: View {
+    let message: Message
+
+    var body: some View {
+        Label {
+            Text("\(message.systemLabel) · \(Date(timeIntervalSince1970: Double(message.createdAt) / 1000).formatted(date: .omitted, time: .shortened))")
+        } icon: {
+            Image(systemName: "info.circle")
+        }
+        .font(.caption2.weight(.medium))
+        .foregroundStyle(Theme.muted)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+        .help(message.content)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Where the owner had got to when the thread was opened. Everything below it arrived since.
+struct NewDivider: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            Rectangle()
+                .fill(.tint)
+                .opacity(0.45)
+                .frame(height: 1)
+                .accessibilityHidden(true)
+            Text("New")
+                .font(dividerFont.weight(.bold))
+                .foregroundStyle(.tint)
+        }
+        .padding(.vertical, 4)
     }
 }
 
 /// The row the "new" divider sits above: the first one past the mark. No row's shape says the owner
-/// wrote it, because the daemon stores a routine firing exactly like an owner's message.
+/// wrote it: routines that fired before the System sender existed are stored like an owner's message.
 func firstUnread(in loaded: [Message], after mark: Int) -> Int? {
     loaded.first { $0.id > mark }?.id
 }
 
 extension Message {
-    /// A `user` row with a sender is another agent's message delivered to this one; without one
-    /// it is the owner, and the owner's rows are the ones on the right.
-    var isOwner: Bool { role == .user && sender == nil }
+    /// A `user` row with a sender is another agent's message or a daemon line; without one it is
+    /// the owner, and the owner's rows are the ones on the right. Restore lines written before the
+    /// System sender have none and are still not the owner speaking.
+    var isOwner: Bool { role == .user && sender == nil && !isRestoreLine && !isShownLine }
+
+    /// The daemon's hand-off of a "Show the agent how" recording, stored as the owner's line.
+    var isShownLine: Bool { role == .user && sender == nil && content.hasPrefix(shownLinePrefix) }
+
+    var isRestoreLine: Bool {
+        role == .user && (sender == nil || sender == systemSender) && content.hasPrefix(restoredLineStart) && content.contains(restoredLineMiddle)
+    }
+
+    var isIdleNote: Bool { role == .user && sender == idleSender }
+
+    /// The daemon's line when a trigger fires or is turned on; not the owner speaking either.
+    var isTriggerLine: Bool { role == .user && sender == triggerSender }
+
+    var isSystemLine: Bool { role == .user && sender == systemSender }
+
+    var systemLabel: String {
+        if content.hasPrefix("The owner approved your request to ") { return "You approved" }
+        if content.hasPrefix("Scheduled task ") { return "Routine ran" }
+        return systemSender
+    }
 
     /// Only a reply that calls nothing is an answer. Words said alongside calls are the agent
     /// narrating its work, and they fold in with the calls they came with.
     var hasBubble: Bool { role != .tool && toolCalls == nil }
 }
 
-struct MessageRow: View {
+struct MessageRow: View, Equatable {
     let session: Session
     let message: Message
     var shown: [Base64Image] = []
-    /// The agent whose own thread this is, so its name is not repeated over every row it wrote.
-    /// A shared thread has none, and there every sender is worth naming.
-    let own: String?
-    /// The agents in this thread, for the owner's word and the avatar of whoever wrote a row.
-    let members: [Agent]
+    /// The name over the reply, where the thread has more than one voice.
+    let speaker: String?
+    /// The owner's bubble, flat in the agent's colour, and the text that reads on it.
+    let bubble: Color
+    let bubbleText: Color
     var onRestore: (() -> Void)?
     var onRetry: (() -> Void)?
+    /// The rating the owner picked, `nil` when they tapped the one already chosen.
+    var onFeedback: ((FeedbackRating?) -> Void)?
 
-    @Environment(\.colorScheme) private var scheme
     @Environment(AgentLooks.self) private var looks
+    @Environment(Forwarder.self) private var forwarder: Forwarder?
     @State private var hovering = false
     @State private var copied = false
 
-    private var isOwner: Bool { message.isOwner }
+    private var canForward: Bool { forwarder != nil && !message.content.isEmpty }
 
-    /// A `user` row with a sender in a two-agent thread is one writing to the other, and reads
-    /// nothing like that agent's reply to the owner unless the label says so.
-    private var speakerLabel: String? {
-        guard let sender = message.sender, sender != own else { return nil }
-        let name = titles(members)[sender] ?? sender
-        if message.role == .user, members.count == 2, let other = members.first(where: { $0.name != sender }) {
-            return "\(name) to \(other.title)"
-        }
-        return name
+    private func forward() {
+        forwarder?.pending = Forwarding(messageId: message.id)
     }
 
-    /// Concrete colours rather than `.primary` over `.background`: those two resolve against the
-    /// same environment, so setting one changes what the other means and the bubble disappears.
-    private var ownerFill: Color { scheme == .dark ? Color(white: 0.92) : Color(white: 0.13) }
-    private var ownerInk: Color { scheme == .dark ? Color(white: 0.09) : .white }
+    private var isOwner: Bool { message.isOwner }
 
+    /// The closures are never equal, so what is compared is whether the row offers each action.
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message == rhs.message && lhs.shown == rhs.shown && lhs.speaker == rhs.speaker
+            && lhs.bubble == rhs.bubble && lhs.bubbleText == rhs.bubbleText
+            && (lhs.onRestore == nil) == (rhs.onRestore == nil)
+            && (lhs.onRetry == nil) == (rhs.onRetry == nil)
+            && (lhs.onFeedback == nil) == (rhs.onFeedback == nil)
+    }
+
+    /// The owner's words sit in a bubble on the right, as every chat app has them. A reply is
+    /// prose across the column: it is the long side of the conversation, and a box around three
+    /// paragraphs of Markdown is a box around the page.
     var body: some View {
-        HStack {
-            if isOwner { Spacer(minLength: 40) }
-            VStack(alignment: isOwner ? .trailing : .leading, spacing: 2) {
-                ForEach(Array(([message.image].compactMap { $0 } + shown).enumerated()), id: \.offset) { _, image in
-                    ScreenshotView(image: image).padding(.bottom, 4)
-                }
-                bubble
-                #if os(macOS)
-                // Hidden rather than removed, so a row does not change height under the pointer.
-                actions.opacity(hovering ? 1 : 0)
-                #else
-                if !isOwner { actions }
-                #endif
+        VStack(alignment: isOwner ? .trailing : .leading, spacing: 4) {
+            ForEach(Array(([message.image].compactMap { $0 } + shown).enumerated()), id: \.offset) { _, image in
+                ScreenshotView(image: image).padding(.bottom, 4)
             }
-            if !isOwner { Spacer(minLength: 40) }
+            if isOwner { ownerBubble } else { reply }
+            meta
         }
+        .frame(maxWidth: .infinity, alignment: isOwner ? .trailing : .leading)
         .contentShape(.rect)
         .onHover { hovering = $0 }
+        .environment(\.forwardedMessage, message.id)
+        .contextMenu {
+            if !message.content.isEmpty {
+                Button("Copy", systemImage: "doc.on.doc") { copyToPasteboard(message.content) }
+            }
+            if canForward { Button("Send to…", systemImage: "arrowshape.turn.up.right") { forward() } }
+            if let onRetry { Button("Retry", systemImage: "arrow.clockwise", action: onRetry) }
+            if let onRestore { Button("Restore to this message", systemImage: "arrow.uturn.backward", action: onRestore) }
+            if onFeedback != nil {
+                Divider()
+                ForEach([FeedbackRating.up, .down], id: \.self) { rating in
+                    Button(thumbTitle(rating), systemImage: thumbSymbol(rating)) { thumb(rating) }
+                }
+            }
+        }
+    }
+
+    private var chosen: FeedbackRating? { message.feedback?.rating }
+
+    private func thumbTitle(_ rating: FeedbackRating) -> String {
+        switch (rating, chosen == rating) {
+        case (.up, false): "Good reply"
+        case (.down, false): "Bad reply"
+        case (.up, true): "Remove thumbs up"
+        case (.down, true): "Remove thumbs down"
+        }
+    }
+
+    private func thumbSymbol(_ rating: FeedbackRating) -> String {
+        "hand.thumbs\(rating == .up ? "up" : "down")\(chosen == rating ? ".fill" : "")"
+    }
+
+    private func thumb(_ rating: FeedbackRating) {
+        onFeedback?(chosen == rating ? nil : rating)
+    }
+
+    /// When it was said and what can be done about it, in one quiet line under the message. On
+    /// a Mac it shows under the pointer; a phone has no pointer and keeps the actions in the
+    /// long-press menu, as Messages does.
+    @ViewBuilder private var meta: some View {
+        HStack(spacing: 2) {
+            if let chosen {
+                Image(systemName: thumbSymbol(chosen))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 4)
+                    .accessibilityLabel(chosen == .up ? "You rated this good" : "You rated this bad")
+            }
+            HStack(spacing: 2) {
+                Text(shortTime(message.createdAt))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
+                #if os(macOS)
+                actions
+                #endif
+            }
+            #if os(macOS)
+            // Hidden rather than removed, so a row does not change height under the pointer.
+            .opacity(hovering ? 1 : 0)
+            #endif
+        }
     }
 
     private var actions: some View {
@@ -1103,8 +1724,14 @@ struct MessageRow: View {
             if !message.content.isEmpty {
                 action(copied ? "Copied" : "Copy", copied ? "checkmark" : "doc.on.doc") { copy() }
             }
+            if canForward { action("Send to…", "arrowshape.turn.up.right") { forward() } }
             if let onRetry { action("Retry", "arrow.clockwise", onRetry) }
             if let onRestore { action("Restore to this message", "arrow.uturn.backward", onRestore) }
+            if onFeedback != nil {
+                ForEach([FeedbackRating.up, .down], id: \.self) { rating in
+                    action(thumbTitle(rating), thumbSymbol(rating)) { thumb(rating) }
+                }
+            }
         }
         .foregroundStyle(.secondary)
     }
@@ -1134,125 +1761,162 @@ struct MessageRow: View {
         }
     }
 
-    private var bubble: some View {
-        VStack(alignment: isOwner ? .trailing : .leading, spacing: 6) {
-            if let speakerLabel, let sender = message.sender {
-                HStack(spacing: 5) {
-                    BloubView(
-                        state: members.first { $0.name == sender }?.state.bloub ?? .idle,
-                        identity: looks[sender],
-                        size: 16
-                    )
-                    Text(speakerLabel)
-                }
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+    private var ownerBubble: some View {
+        Group {
+            if let answers = interviewAnswers(message.content) {
+                InterviewAnswers(answers: answers)
+            } else {
+                Text(message.content).textSelection(.enabled)
             }
-            if !message.content.isEmpty {
-                if isOwner {
-                    if let answers = interviewAnswers(message.content) {
-                        InterviewAnswers(answers: answers)
-                    } else {
-                        Text(message.content).textSelection(.enabled)
-                    }
-                } else {
-                    MarkdownText(
-                        content: message.content,
-                        files: message.role == .assistant ? message.sender.map { FileSource(session: session, agent: $0) } : nil
-                    )
-                }
-            }
-            Text(shortTime(message.createdAt))
-                .font(.caption2)
-                .opacity(0.6)
         }
-        .foregroundStyle(isOwner ? AnyShapeStyle(ownerInk) : AnyShapeStyle(.foreground))
+        .foregroundStyle(bubbleText)
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(isOwner ? AnyShapeStyle(ownerFill) : AnyShapeStyle(.quaternary),
-                    in: .rect(cornerRadius: 18))
-        .contextMenu {
-            if !message.content.isEmpty {
-                Button("Copy", systemImage: "doc.on.doc") { copyToPasteboard(message.content) }
+        .background(bubble, in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 20, bottomTrailingRadius: 6, topTrailingRadius: 20))
+        .padding(.leading, 48)
+    }
+
+    private var reply: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let speaker, let sender = message.sender {
+                HStack(spacing: 6) {
+                    // Still: a row is history, and a live avatar per row is a canvas per row per
+                    // frame. The pill above carries the agent's real state.
+                    BloubView(state: .idle, identity: looks[sender], size: 18, frozenAt: 0)
+                    Text(speaker)
+                }
+                .font(.subheadline.weight(.semibold))
+                .fontDesign(.rounded)
             }
-            if let onRetry { Button("Retry", systemImage: "arrow.clockwise", action: onRetry) }
-            if let onRestore { Button("Restore to this message", systemImage: "arrow.uturn.backward", action: onRestore) }
+            if !message.content.isEmpty {
+                MarkdownText(
+                    content: message.content,
+                    files: message.role == .assistant ? message.sender.map { FileSource(session: session, agent: $0) } : nil
+                )
+                .equatable()
+            }
         }
+        .padding(.horizontal, 4)
+        .padding(.trailing, 24)
     }
 }
 
-/// A stretch of tool traffic folded into one summary line, screenshots included.
-struct ToolRun: View {
-    let run: [Message]
-    let loaded: [Message]
+/// A stretch of tool traffic folded into one chip, screenshots included. Open, the steps hang
+/// off a rail under it, the way a build log sits under its target.
+struct ToolRun: View, Equatable {
+    let run: [ToolStep]
     /// Who did it, in a thread where several agents work. An agent's own thread names nobody.
     var by: String? = nil
 
     @State private var open = false
 
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.run == rhs.run && lhs.by == rhs.by
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            DisclosureGroup(isExpanded: $open) {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(run) { message in
-                        if message.role == .assistant, !message.content.isEmpty {
-                            MarkdownText(content: message.content)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 6)
-                        }
-                        ToolRow(
-                            message: message,
-                            name: toolName(for: message, in: loaded),
-                            orphaned: isOrphanTool(message, loaded)
-                        )
+        DisclosureGroup(isExpanded: $open) {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(run) { step in
+                    if step.message.role == .assistant, !step.message.content.isEmpty {
+                        MarkdownText(content: step.message.content)
+                            .equatable()
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 6)
                     }
+                    ToolRow(message: step.message, name: step.name, orphaned: step.orphaned)
                 }
-                .padding(.top, 4)
-            } label: {
-                Text(by.map { "\($0): \(toolSummary(run))" } ?? toolSummary(run))
-                    .font(.caption)
-                    .foregroundStyle(Color.secondary)
+            }
+            .padding(.leading, 20)
+            .padding(.top, 6)
+            .overlay(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(.quaternary)
+                    .frame(width: 2)
+                    .padding(.leading, 9)
+                    .padding(.vertical, 6)
+            }
+        } label: {
+            let summary = toolSummary(run.map(\.message))
+            HStack(spacing: 6) {
+                Image(systemName: "wrench.and.screwdriver")
+                    .font(.caption2)
+                Text(by.map { "\($0): \(summary)" } ?? summary)
+                    .font(.canvas(13, .footnote))
                     .lineLimit(1)
             }
-
         }
-        .padding(.horizontal, 6)
-        .disclosureGroupStyle(WholeRowDisclosure())
+        .disclosureGroupStyle(WholeRowDisclosure(chip: true))
+    }
+}
+
+/// A tool line the reader just opened or closed grows downwards, under the pointer, instead of
+/// being pushed up by the bottom anchor. Released on its own: an anchor that changes in the same
+/// update as new rows is applied to them too late. An object rather than a closure in the
+/// environment: a closure is never equal to the last one, so every line reading it redrew with
+/// each change to the chat.
+@Observable
+final class ScrollHold {
+    private(set) var holding = false
+
+    func hold() {
+        holding = true
+        Task {
+            try? await Task.sleep(for: .milliseconds(500))
+            holding = false
+        }
     }
 }
 
 extension EnvironmentValues {
-    @Entry var holdScroll: () -> Void = {}
+    @Entry var holdScroll: ScrollHold?
+    /// The message a file card sits in, so forwarding the file brings the message along.
+    @Entry var forwardedMessage: Int?
 }
 
-/// A macOS `DisclosureGroup` answers only its chevron; here the whole line is the control.
+/// A macOS `DisclosureGroup` answers only its chevron; here the whole line is the control. As a
+/// chip, the line is a capsule that reads as one thing folded away; bare, it is a row in a list
+/// of steps.
 struct WholeRowDisclosure: DisclosureGroupStyle {
+    var chip = false
+
     func makeBody(configuration: Configuration) -> some View {
-        Line(configuration: configuration)
+        Line(configuration: configuration, chip: chip)
     }
 
     private struct Line: View {
         let configuration: Configuration
+        let chip: Bool
         @Environment(\.accessibilityReduceMotion) private var reduceMotion
         @Environment(\.holdScroll) private var holdScroll
+
+        #if os(macOS)
+        private var card: Bool { chip }
+        #else
+        private let card = false
+        #endif
 
         var body: some View {
             VStack(alignment: .leading, spacing: 0) {
                 Button {
-                    holdScroll()
+                    holdScroll?.hold()
                     withAnimation(reduceMotion ? nil : .snappy) { configuration.isExpanded.toggle() }
                 } label: {
                     HStack(spacing: 6) {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.semibold))
-                            .rotationEffect(.degrees(configuration.isExpanded ? 90 : 0))
+                        if !chip { chevron }
                         configuration.label
-                        Spacer(minLength: 0)
+                        if card { Spacer(minLength: 0) }
+                        if chip { chevron }
+                        if !chip { Spacer(minLength: 0) }
                     }
-                    .foregroundStyle(Color.secondary)
+                    .foregroundStyle(card ? AnyShapeStyle(Theme.secondary) : AnyShapeStyle(Color.secondary))
+                    .fontWeight(card ? .semibold : nil)
+                    .padding(.horizontal, card ? 14 : chip ? 12 : 0)
+                    .padding(.vertical, card ? 10 : chip ? 6 : 0)
+                    .background(chip && !card ? AnyShapeStyle(.fill.tertiary) : AnyShapeStyle(.clear), in: .capsule)
                     #if os(iOS)
-                    .frame(minHeight: 44)
+                    .frame(minHeight: chip ? 44 : 36)
                     #else
                     .frame(minHeight: 24)
                     #endif
@@ -1261,8 +1925,26 @@ struct WholeRowDisclosure: DisclosureGroupStyle {
                 .buttonStyle(.plain)
                 .accessibilityValue(configuration.isExpanded ? "Expanded" : "Collapsed")
 
-                if configuration.isExpanded { configuration.content }
+                if configuration.isExpanded {
+                    configuration.content
+                        .padding(.horizontal, card ? 14 : 0)
+                        .padding(.bottom, card ? 10 : 0)
+                }
             }
+            .background {
+                if card {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Theme.card)
+                        .strokeBorder(Theme.hairline, lineWidth: 1)
+                }
+            }
+            .frame(maxWidth: card ? 640 : nil, alignment: .leading)
+        }
+
+        private var chevron: some View {
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.semibold))
+                .rotationEffect(.degrees(configuration.isExpanded ? 90 : 0))
         }
     }
 }
@@ -1300,12 +1982,14 @@ struct ToolRow: View {
                     .font(.caption.monospaced())
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 4)
+                    .padding(10)
+                    .background(.fill.quaternary, in: .rect(cornerRadius: 10))
+                    .padding(.top, 6)
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: message.role == .tool ? "arrow.turn.down.left" : "wrench.adjustable")
                         .frame(width: 14)
-                    Text(title)
+                    Text(title).monospaced()
                 }
                 .font(.caption)
                 .foregroundStyle(Color.secondary)
@@ -1318,34 +2002,207 @@ struct ToolRow: View {
                 ScreenshotView(image: image)
             }
         }
-        .padding(.horizontal, 6)
     }
 }
 
-/// The reply as the model is still writing it. Gone the moment the stored message arrives.
+/// The reply as the model is still writing it, in the same column its finished form will take.
+/// Gone the moment the stored message arrives.
 struct LiveRow: View {
     let reply: LiveReply
     let agent: String
+    var onRetry: (_ useBackup: Bool) async -> Void = { _ in }
 
     var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("\(agent) is writing…")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
-                if !reply.reasoning.isEmpty {
-                    Text(reply.reasoning)
-                        .font(.caption.italic())
+        VStack(alignment: .leading, spacing: 8) {
+            if let retry = reply.retry {
+                RetryCard(retry: retry, onRetry: onRetry)
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("\(agent) is writing…")
+                        .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                 }
-                if !reply.text.isEmpty {
-                    MarkdownText(content: reply.text)
-                }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(.quaternary, in: .rect(cornerRadius: 18))
-            Spacer(minLength: 40)
+            if !reply.reasoning.isEmpty {
+                Text(reply.reasoning)
+                    .font(.callout.italic())
+                    .foregroundStyle(.secondary)
+            }
+            if !reply.text.isEmpty {
+                MarkdownText(content: reply.text).equatable()
+            }
+        }
+        .padding(.horizontal, 4)
+        .padding(.trailing, 24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A browser the watchdog restarted once and that still does not answer: the owner's three ways out.
+struct BrowserHungCard: View {
+    let agent: String
+    let onScreen: () -> Void
+    let onRestart: (_ desktop: Bool) async -> Void
+
+    @State private var acting = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle")
+                Text("Needs you · browser stuck")
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(Theme.needsYou)
+            Text("\(agent)'s browser stopped answering")
+                .font(.subheadline.weight(.semibold))
+            Text("It was restarted once on its own and still does not answer.")
+                .font(.footnote)
+                .foregroundStyle(Theme.secondary)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) { choices }
+                VStack(alignment: .leading, spacing: 8) { choices }
+            }
+            .controlSize(.small)
+            .disabled(acting)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private var choices: some View {
+        Button("Restart browser") { restart(desktop: false) }
+            .buttonStyle(.pill(.primary))
+        Button("Restart desktop and retry") { restart(desktop: true) }
+            .buttonStyle(.pill(.secondary))
+        Button("Look at the screen", action: onScreen)
+            .buttonStyle(.pill(.secondary))
+    }
+
+    private func restart(desktop: Bool) {
+        acting = true
+        Task {
+            await onRestart(desktop)
+            acting = false
         }
     }
+}
+
+/// The agent asked the owner to take its screen: why, and the one way to do it.
+struct HandOverCard: View {
+    let agent: String
+    let reason: String
+    let onTake: () async -> Void
+
+    @State private var acting = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "hand.raised")
+                Text("Needs you · hands")
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(Theme.needsYou)
+            Text("\(agent) asks you to take the screen")
+                .font(.subheadline.weight(.semibold))
+            Text(reason)
+                .font(.footnote)
+                .foregroundStyle(Theme.secondary)
+            Button("Take the screen") {
+                acting = true
+                Task {
+                    await onTake()
+                    acting = false
+                }
+            }
+            .buttonStyle(.pill(.primary))
+            .controlSize(.small)
+            .disabled(acting)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The model call that failed and is about to be asked again: the canvas "Retrying" state, the
+/// attempt, and the owner's two ways to not wait for it.
+struct RetryCard: View {
+    let retry: RetryState
+    let onRetry: (_ useBackup: Bool) async -> Void
+
+    @State private var acting = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.clockwise")
+                Text("Retrying")
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(Theme.retrying)
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(Self.headline(retry, now: context.date))
+                    .font(.subheadline.weight(.semibold))
+            }
+            Text(retry.error)
+                .font(.footnote)
+                .foregroundStyle(Theme.secondary)
+                .lineLimit(2)
+            HStack(spacing: 8) {
+                Button("Retry now") { act(useBackup: false) }
+                    .buttonStyle(.pill(.primary))
+                if let backup = retry.backup {
+                    Button("Use backup model") { act(useBackup: true) }
+                        .buttonStyle(.pill(.secondary))
+                        .help("Switch this turn to \(backup)")
+                        .accessibilityHint("Switches this turn to \(backup)")
+                }
+            }
+            .controlSize(.small)
+            .disabled(acting)
+        }
+        .padding(14)
+        .frame(maxWidth: 420, alignment: .leading)
+        .background(Theme.card, in: .rect(cornerRadius: 16))
+        .overlay { RoundedRectangle(cornerRadius: 16).strokeBorder(Theme.hairline) }
+    }
+
+    /// "Main is busy. Trying again in 12 s, attempt 2 of 5", or "… again now" once the wait is over.
+    static func headline(_ retry: RetryState, now: Date) -> String {
+        let seconds = Int((Double(retry.retryAt) / 1000 - now.timeIntervalSince1970).rounded(.up))
+        let when = seconds > 0 ? "in \(seconds) s" : "now"
+        return "\(retry.model) is busy. Trying again \(when), attempt \(retry.attempt) of \(retry.of)"
+    }
+
+    private func act(useBackup: Bool) {
+        acting = true
+        Task {
+            await onRetry(useBackup)
+            acting = false
+        }
+    }
+}
+
+private extension View {
+    func actionCard(_ agent: Color) -> some View {
+        background(Theme.card, in: .rect(cornerRadius: 20))
+            .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(agent.opacity(0.45), lineWidth: 1.5))
+            .shadow(color: .black.opacity(0.08), radius: 10, y: 6)
+    }
+
+    #if os(macOS)
+    /// Main's white over the chat: the composer and its chips. `blur` is the canvas's CSS blur,
+    /// which SwiftUI's radius halves.
+    func floatingCard(radius: CGFloat, fill: Double = 0.86, shadow: Double = 0.08, blur: CGFloat = 28, y: CGFloat = 8) -> some View {
+        background {
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .fill(Theme.card.opacity(fill))
+                .strokeBorder(Theme.card.opacity(0.95), lineWidth: 1)
+                .shadow(color: .black.opacity(shadow), radius: blur / 2, y: y)
+        }
+    }
+    #endif
 }

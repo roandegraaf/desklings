@@ -20,7 +20,7 @@ apt-get update -qq
 apt-get install -y --no-install-recommends \
   ca-certificates curl gnupg sudo procps psmisc iproute2 less vim git openssh-client \
   build-essential python3 python3-venv python3-pip \
-  jq ripgrep htop zip unzip tar xz-utils file poppler-utils imagemagick \
+  jq ripgrep htop zip unzip tar xz-utils file poppler-utils imagemagick tesseract-ocr \
   tigervnc-standalone-server openbox xterm dbus-x11 \
   tint2 pcmanfm lxterminal hsetroot \
   x11-utils x11-xserver-utils xdotool scrot xclip xauth \

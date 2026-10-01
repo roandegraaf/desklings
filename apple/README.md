@@ -4,6 +4,34 @@ A native SwiftUI app that talks to the schermes daemon's HTTP API. One target bu
 iOS 26 and macOS 26 and every view is shared; the split view is a sidebar on a Mac and an iPad,
 and its own screen on an iPhone.
 
+## Targets
+
+| Target | Platform | Sources | What it is |
+| --- | --- | --- | --- |
+| `Schermes` | iOS and macOS, one target | `Schermes/` | The app. On the Mac it also carries the menu bar extra and the "Send to Schermes…" Service. |
+| `SchermesWidgets` | iOS | `SchermesWidgets/`, plus `AgentActivity.swift`, `Bloub/Skins.swift`, `Bloub/Tables.swift` | The Live Activity: lock screen and Dynamic Island views of an agent's turn. |
+| `SchermesShare` | iOS | `SchermesShare/`, plus `Share.swift`, `Session.swift`, `Api/SchermesClient.swift`, `Api/Types.swift` | The share sheet's "Schermes" entry. |
+| `SchermesTests` | iOS and macOS | `SchermesTests/` | Swift Testing, hosted in the app. |
+
+Both extensions are embedded in the app with `destinationFilters: [iOS]`, so the Mac app ships
+neither. They compile a handful of app files by path rather than the app's views, which is why the
+widget repeats the app's state words and the share sheet draws no bloub and no `Theme` colours. The
+share extension builds with `SCHERMES_EXTENSION`, which leaves out the app-only device
+registration.
+
+The two Mac-only pieces live in the app target:
+
+- **Menu bar extra** (`Views/MenuBar.swift`, scene in `SchermesApp.swift`): a bell with the Needs
+  you count, and a panel with a quick-message field (`@name message` picks the agent), the Needs you
+  items and the agents working now. Only yes/no answers are given in place; everything else opens
+  the console window. It polls on its own, because the console window can be closed while the
+  extra lives on. ⌥Space opens it from any app through a Carbon hot key (no Accessibility
+  permission); a test run skips registering it, and a clash with Alfred or Raycast fails silently.
+- **Services** (`ShareService` in `Share.swift`, `NSServices` in `project.yml`): "Send to
+  Schermes…" takes text, a URL or a file from any app and opens the same `SendToSheet` the iOS
+  share extension shows. A new Service entry may need a relaunch, or
+  `/System/Library/CoreServices/pbs -update`, before the menu shows it.
+
 ## Build and run
 
 The Xcode project is generated, never committed. `project.yml` is the source of truth.
@@ -29,17 +57,54 @@ xcrun simctl create 'iPhone 17' \
   com.apple.CoreSimulator.SimRuntime.iOS-26-5
 ```
 
-Signing is automatic on the owner's paid team (`DEVELOPMENT_TEAM` in `project.yml`), which is
-what a device build and push need. The first device build registers the App ID with the push
-capability and makes the profile:
+Signing is automatic on the owner's paid team (`DEVELOPMENT_TEAM` in `project.yml`, applied to
+every target), which is what a device build, push and the app group need. The first device build
+registers everything with Apple and makes the profiles:
 
 ```sh
 xcodebuild -scheme Schermes -destination 'generic/platform=iOS' -allowProvisioningUpdates build
 ```
 
+That one build registers three App IDs (`dev.schermes.Schermes`, `.Widgets`, `.Share`), the push
+capability on the app, and the App Group `group.dev.schermes` on the app and the share extension.
+Nothing needs clicking in the developer portal first.
+
 A clone without that team still builds for the simulator and this Mac: put
 `CODE_SIGN_STYLE: Manual`, `CODE_SIGN_IDENTITY: "-"` and an empty `DEVELOPMENT_TEAM` back under
 `signing` in `project.yml`.
+
+### Device builds only
+
+Entitlements are applied to `iphoneos` builds only (`CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]`),
+because a restricted entitlement needs a provisioning profile, and a Mac app that carries one
+without a profile does not launch. So:
+
+| File | Entitlements |
+| --- | --- |
+| `Schermes/Schermes.entitlements` | `aps-environment`, App Group `group.dev.schermes` |
+| `SchermesShare/SchermesShare.entitlements` | App Group `group.dev.schermes` |
+| `SchermesWidgets` | none: a Live Activity needs only `NSSupportsLiveActivities` in the app's `Info.plist` |
+
+The simulator and the Mac build get no push token and no app group. Everything that needs either
+is therefore checked on a physical iPhone, by the owner: remote and actionable push, the Live
+Activity started and updated over APNs, and the share extension (its login hand-off goes through the
+group). The Live Activity's views can still be looked at on a simulator with the DEBUG launch
+argument `-schermes.debugActivity YES`, which starts a local one with made-up content.
+
+**The app group.** The share extension has no `Session` and cannot see the app's container, so the
+iPhone app shares two things with it through `group.dev.schermes`:
+
+- the daemon address, mirrored into the group's `UserDefaults` suite on every connect
+  (`Session.storeAddress`);
+- a second Keychain copy of the owner password with the group as its access group, added beside
+  the app's own item rather than in its place (`Keychain.save`, `Keychain.shareWithExtension`).
+  Signing out clears both.
+
+The extension reads the address, logs in with that copy on a 401 and keeps its own cookie after that
+(`StoredDaemon` in `Share.swift`). In a simulator build the group add fails quietly, the extension
+finds no address, and it says "Open Schermes and sign in first." The Mac never touches a group
+container, since one it is not entitled to can raise a privacy prompt; its Service runs inside the
+app and uses the ordinary defaults.
 
 ## A daemon to talk to
 
@@ -76,10 +141,12 @@ file as an artifact: a pane beside the chat on a Mac and an iPad, a sheet on a p
 rendered preview, its source, copy and save. Anything else opens in Quick Look. The arrow saves a
 file to Downloads on a Mac and through the Files sheet on a phone. On a Mac an image can also be pasted into the composer or dropped on the chat. The red stop button, or Escape, ends the agent's turn. The More menu on a
 phone, or the toolbar on a Mac and an iPad, exports the loaded thread as Markdown and opens the
-agent's routines, activity and memory; the memory page rewrites `MEMORY.md`. The sidebar's search
-box also searches every thread through the daemon. On a Mac, a turn that ends or a deletion
-request that arrives while the app is not in front becomes a notification, and the badge counts
-unread threads and pending requests.
+agent's pages (profile, rules, when idle, routines and triggers, activity, memory); the memory page
+rewrites `MEMORY.md`. The sidebar's "Search or ask" field asks the daemon (`POST /api/search`),
+which reads the question with the default model into filters over messages, files and screenshot
+text, and falls back to plain words without one. On a Mac, a turn that ends or a Needs you item
+that arrives while the app is not in front becomes a notification, and the badge counts unread
+threads and Needs you items.
 
 ## Push notifications
 
@@ -94,6 +161,33 @@ profile, which the team's automatic signing supplies for a device. The simulator
 build register no token, so on them the Settings screen shows why under Devices and the daemon
 has nobody to push to.
 
+**Environment.** The daemon keeps one APNs gateway for all devices, and the last build to register
+picks it: a profile saying `development` (every Xcode device build) switches it to the sandbox,
+`production` to the live gateway. A build with no embedded profile reports `production`. An Xcode
+build and a TestFlight build on two phones therefore cannot both be pushed to at once.
+
+**Actionable push.** A push about a Needs you item carries its id and a category, registered at
+launch by `PushCategory` in `Notifier.swift`:
+
+| Category | Buttons |
+| --- | --- |
+| `needs.approval` | Approve (unlocked device only), Don't |
+| `needs.delete` | Keep it, Delete it (destructive, unlocked device only) |
+| `needs.yours` (passwords and security) | I'll do it, Don't |
+| `needs.watch` (a hand-over) | Watch (opens the app) |
+| `needs.open` (everything else) | Open (opens the app) |
+
+Yes and no answer through `POST /api/needs-you/:id/action` from the background, on a client of its
+own built off the stored address, since a background launch has no `Session`. "Always allow" is
+never offered on a lock screen. A failed answer comes back as a local notification.
+
+**Live Activity.** While a permanent agent runs a turn, the daemon starts, updates and ends a Live
+Activity on the phone over APNs (goal title, steps done, a Needs you count, the state). The app
+hands the daemon its push-to-start token and each running activity's own token
+(`POST /api/live-activities`, `LiveActivityTokens` in `Notifier.swift`) from launch on, because a
+push-to-start wakes the app in the background. The payload's shape is `AgentActivity.swift`, shared
+with `SchermesWidgets`, and `AgentActivityTests.swift` pins it against the daemon's JSON.
+
 The APNs key itself comes from the developer portal, once per team: Certificates, Identifiers &
 Profiles ▸ Keys ▸ add a key with **Apple Push Notifications service (APNs)** enabled and download
 the `AuthKey_<KEYID>.p8` (it can be downloaded only once). Put its path and id in the daemon's
@@ -104,16 +198,16 @@ into.
 
 ## Deleting things
 
-Right-click (or long-press) an agent in the list for its appearance, its routines and activity, and
-**Delete**; a shared thread and a task worker have a Delete of their own. Every one of them asks
+Right-click (or long-press) an agent in the list for its name and appearance, its pages, its rules,
+what it does when idle, and **Delete**; a shared thread and a task worker have a Delete of their own. Every one of them asks
 first and says what goes with it. `DELETE /api/agents/:name` takes the agent's workers, its threads,
 its routines and its history; its Linux user and home stay, because that is the agent's work and no
 button here is worth destroying it. The daemon stops the desktop before it drops the row, so the
 display number can be handed out again. Either delete is refused with a 409 while a turn is running.
 
 Agents can ask for the same two deletions through the `request_deletion` tool, and nothing happens
-until the owner answers: the request stands in `approvals` and appears at the top of the agent list
-with **Delete it** and **Keep it**. Either answer drops the request and writes the outcome back into
+until the owner answers: the request stands in `approvals` and appears under Needs you (and as a
+push) with **Delete it** and **Keep it**. Either answer drops the request and writes the outcome back into
 the thread the agent asked in, which starts a turn so the agent reads it. An agent may ask to delete
 itself.
 
@@ -130,15 +224,29 @@ itself.
 - `Schermes/Api/Readable.swift` says a cron expression in words (croner's dialect, since that is
   what the daemon parses with) and turns an execution event into a sentence. A cron it cannot
   say exactly reads as nothing rather than as a guess.
-- `Schermes/Session.swift` owns the server address, the Keychain password and the auth state.
+- `Schermes/Session.swift` owns the server address, the Keychain password and the auth state, and
+  on iOS mirrors the address and a password copy into the app group.
+- `Schermes/Notifier.swift` is local notifications, push registration (`PushRegistration`), the
+  actionable categories, the background relay that answers them, and the Live Activity tokens.
+- `Schermes/Share.swift` is shared by the app and `SchermesShare`: the shared item, the message it
+  becomes, the upload name, `StoredDaemon`, `SendToSheet`, and the Mac `ShareService`.
+- `Schermes/AgentActivity.swift` is the Live Activity's attributes and state, compiled by the app
+  and `SchermesWidgets`; the widget's views are `SchermesWidgets/AgentActivityWidget.swift`.
 - `Schermes/Views/` is the connect and login screens, the agent list, the chat, an agent's
-  routines (schedules) and activity feed, and the settings: one gear under the agent list opening
-  six categories — Model, Web search, Notifications, Plugins (the MCP servers), Daemon and About.
-  On the Mac that gear is a `SettingsLink` into a real `Settings` scene, which brings ⌘, and the
-  app menu's Settings… item with it; on iOS it opens a sheet. A stored key is never shown, and a
+  routines (schedules) and activity feed, and the settings: one gear opening
+  six categories — Models, Web search, Notifications, Plugins (the MCP servers), Daemon and About.
+  Models is the daemon's model registry (`/api/models`): every provider entry, which one is the
+  default and which the backup, a Test per entry, and each agent can be given its own on its
+  overview. The app no longer reads or writes the provider fields of `/api/settings`.
+  On the Mac that gear sits under the agent list as a `SettingsLink` into a real `Settings` scene,
+  which brings ⌘, and the app menu's Settings… item with it; on iOS it is in the bottom bar beside
+  the search field and opens a sheet. A stored key is never shown, and a
   blank key field keeps the stored one. Plugins edits one MCP server at a time in a sheet, which
   also takes a pasted `{"mcpServers": {…}}` README snippet to fill itself from. On macOS and regular width an inspector
-  column shows the picked agent's live screen as a thumbnail over its routines and activity; the
+  column shows the picked agent's live screen as a thumbnail over an overview — its state, the
+  user it runs as, its model, and the pages (profile, rules, when idle, routines and triggers,
+  activity, memory; a task worker gets no rules or idle page), each pushed on its own so only the
+  page on screen polls; the
   full desktop it opens (its own resizable, full-screen-capable window per agent on the Mac) shares
   the thumbnail's connection through `Desktops`, so Xvnc only ever sees one viewer.
   Compact width reaches the same screens from the chat's toolbar instead. The About page carries
@@ -150,6 +258,31 @@ itself.
 - `Schermes/Assets.xcassets/AppIcon.appiconset` is one bloub on a dark tile, rendered at 1024 by
   `ImageRenderer` over the engine itself rather than drawn by hand, and downsampled for the Mac's
   sizes. The engine is a pure function of time, so re-rendering it gives the same picture.
+- `SchermesTests/` is the one test target, run on both platforms. Wire types are pinned in
+  `TypesTests`, the palette and state words in `ThemeTests`, the Live Activity JSON in
+  `AgentActivityTests`, the share message and file names in `ShareTests`, the menu bar's
+  `@name` parsing in `QuickMessageTests`.
+
+Where the newer screens live, in `Schermes/Views/` unless named otherwise:
+
+| File | Holds |
+| --- | --- |
+| `Theme.swift` | The design system: `Token` light/dark pairs, `Theme` grounds, ink and state colours, `AgentPalette` (each agent's tints, derived from its bloub colour and pinned by goldens), the state line and the context-fullness ring and meter. |
+| `NeedsYou.swift` | The Needs you page, card and iPhone strip, fed by `/api/needs-you`: approvals, questions, failures, hand-overs, forms, goals. Also the "Right now" busy rows the menu bar reuses. |
+| `Rules.swift` | An agent's rules: one level per category, pre-approved targets, passwords always the owner's. |
+| `Settings.swift` | Settings, including the Models page and its edit sheet. |
+| `Forms.swift` | A web form an agent asks the owner to fill: the sheet with native fields and the chat card. |
+| `ChatView.swift` | Besides the chat: thumbs up/down with the `FeedbackSheet`, and the retry, hand-over and stuck-browser cards. |
+| `Idle.swift` | "When idle" settings and the "Last night" panel of what idle work did. |
+| `Triggers.swift` | Proposed and live triggers: the chat card, the rows, and the list inside Routines. |
+| `Goals.swift` | Goals: the sidebar rows and cards, the goal page, helpers drawn under their lead. |
+| `Search.swift` | The search answer: what the question was read as, and the hits. |
+| `Restore.swift` | The rewind sheet that shows which files come back and what cannot be undone. |
+| `Forward.swift` | "Send to…" on a message or a file card, to another agent. |
+| `NewAgent.swift` | A new agent from a description: the daemon suggests a label, tagline, look, rules and a routine, all editable before Create. |
+| `MenuBar.swift` | The Mac menu bar extra and the ⌥Space hot key. |
+| `Vnc/DesktopView.swift` | The agent's screen, including "Show how" (teach a skill): recording the owner's input, the Secret toggle and "Stop and hand over". |
+| `Notifier.swift` (app root) | The actionable push categories. |
 
 In the composer, Return sends and Shift+Return is the newline. A vertical `TextField` takes Return
 as a newline by default, so `onKeyPress` answers it — both ways, because returning `.ignored` does

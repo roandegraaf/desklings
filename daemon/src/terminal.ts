@@ -49,7 +49,8 @@ export function commandToolDef(): ToolDef {
     description:
       'Run a shell command as your own Linux user, from your home directory. Returns stdout, ' +
       'stderr and the exit code. Use it to read and write files, install packages with sudo ' +
-      'apt-get, and launch desktop applications (with background true, so they keep running).',
+      'apt-get when your rules allow it, and launch desktop applications (with background true, so ' +
+      'they keep running).',
     parameters: {
       type: 'object',
       properties: {

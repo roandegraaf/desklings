@@ -7,12 +7,16 @@ struct ConnectView: View {
 
     var body: some View {
         VStack(spacing: 20) {
+            BloubView(state: .idle, identity: .standard(for: "schermes"), size: 112)
+                .padding(.bottom, 4)
+
             Text("schermes")
-                .font(.largeTitle.weight(.semibold))
+                .font(.pageTitle)
+                .foregroundStyle(Theme.ink)
 
             Text("Your daemon's domain, or its address on this network.")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.muted)
                 .multilineTextAlignment(.center)
 
             TextField("schermes.example.com or 127.0.0.1:7777", text: $session.address)
@@ -22,24 +26,25 @@ struct ConnectView: View {
                 .textInputAutocapitalization(.never)
                 .keyboardType(.URL)
                 #endif
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .glassEffect(.regular, in: .capsule)
+                .gateField()
                 .onSubmit(connect)
 
-            Button("Connect", action: connect)
-                .buttonStyle(.borderedProminent)
+            Button(action: connect) { Text("Connect").frame(maxWidth: .infinity) }
+                .buttonStyle(.pill(.primary))
+                .controlSize(.large)
                 .disabled(working || Session.parse(session.address) == nil)
 
             if let trouble = session.trouble {
                 Text(trouble)
                     .font(.footnote)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Theme.failed)
                     .multilineTextAlignment(.center)
             }
         }
         .padding(32)
         .frame(maxWidth: 420)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.ground)
     }
 
     private func connect() {
@@ -69,41 +74,46 @@ struct GateView: View {
 
     var body: some View {
         VStack(spacing: 20) {
+            BloubView(state: isSetup ? .wink : .idle, identity: .standard(for: "schermes"), size: 112)
+                .padding(.bottom, 4)
+
             Text("schermes")
-                .font(.largeTitle.weight(.semibold))
+                .font(.pageTitle)
+                .foregroundStyle(Theme.ink)
 
             Text(isSetup
                  ? "First visit. Choose the owner password — at least \(MIN_PASSWORD_LENGTH) characters."
                  : "Log in to reach your agents.")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.muted)
                 .multilineTextAlignment(.center)
 
             SecureField("password", text: $password)
                 .textFieldStyle(.plain)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .glassEffect(.regular, in: .capsule)
+                .gateField()
                 .onSubmit(submit)
 
-            Button(isSetup ? "Set password" : "Log in", action: submit)
-                .buttonStyle(.borderedProminent)
+            Button(action: submit) { Text(isSetup ? "Set password" : "Log in").frame(maxWidth: .infinity) }
+                .buttonStyle(.pill(.primary))
+                .controlSize(.large)
                 .disabled(working || !longEnough)
 
             Button("Use a different daemon") { session.forgetServer() }
                 .buttonStyle(.plain)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(Theme.secondary)
 
             if let trouble {
                 Text(trouble)
                     .font(.footnote)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Theme.failed)
                     .multilineTextAlignment(.center)
             }
         }
         .padding(32)
         .frame(maxWidth: 420)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.ground)
     }
 
     private func submit() {
@@ -119,5 +129,17 @@ struct GateView: View {
             }
             working = false
         }
+    }
+}
+
+private extension View {
+    /// The canvas's text field: a solid r12 well with a hairline, 44 high.
+    func gateField() -> some View {
+        font(.body)
+            .foregroundStyle(Theme.ink)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 44)
+            .background(Theme.panel, in: .rect(cornerRadius: 12))
+            .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.ink.opacity(0.12)) }
     }
 }

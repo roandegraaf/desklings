@@ -31,6 +31,12 @@ targets:
     supportedDestinations: [iOS, macOS]
     sources:
       - path: Schermes
+    dependencies:
+      # The Live Activity is iPhone only; the Mac app embeds nothing.
+      - target: SchermesWidgets
+        destinationFilters: [iOS]
+      - target: SchermesShare
+        destinationFilters: [iOS]
     info:
       path: Schermes/Info.plist
       properties:
@@ -47,6 +53,17 @@ targets:
         # one. Without this the prompt gives no reason for the app's own main path.
         NSLocalNetworkUsageDescription:
           Schermes connects to your daemon, which usually runs on this network.
+        # The daemon starts and updates each agent's turn on the lock screen over APNs.
+        NSSupportsLiveActivities: true
+        # "Send to Schermes…" in the Mac Services menu (ignored on iOS). Handled by `ShareService`.
+        NSServices:
+          - NSMenuItem:
+              default: Send to Schermes…
+            NSMessage: sendToSchermes
+            NSPortName: Schermes
+            NSSendTypes: [public.utf8-plain-text, public.url, public.file-url]
+            NSSendFileTypes: [public.item]
+            NSRequiredContext: {}
     settings:
       base:
         <<: *signing
@@ -54,6 +71,8 @@ targets:
         ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: NO
         # One 1024 rendered from the app's own avatar engine; see apple/README.md.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Theme.ink, for the chrome SwiftUI's `.tint` doesn't reach (alerts, dialogs).
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         # `import zlib` resolves against the SDK's own module, but nothing links libz for us.
         # ZRLE is one continuous inflate stream, which is what zlib gives and the Compression
         # framework's raw-deflate API does not.
@@ -62,6 +81,70 @@ targets:
         # only a device build signed by a real team has. Ad-hoc simulator and Mac builds carry
         # none: a Mac app with a restricted entitlement and no profile does not launch.
         CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]: Schermes/Schermes.entitlements
+
+  # The Live Activity's lock screen and Dynamic Island views. It compiles only the activity's
+  # shared types and the bloub palette out of the app, not the app's views.
+  SchermesWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: SchermesWidgets
+      - path: Schermes/AgentActivity.swift
+      - path: Schermes/Bloub/Skins.swift
+      - path: Schermes/Bloub/Tables.swift
+    info:
+      path: SchermesWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Schermes
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        <<: *signing
+        PRODUCT_BUNDLE_IDENTIFIER: dev.schermes.Schermes.Widgets
+        ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: NO
+
+  # The share sheet's "Schermes" entry. It has no `Session`: the address and a copy of the
+  # password come from the app group, which only a device build signed by the team carries.
+  SchermesShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: SchermesShare
+      - path: Schermes/Share.swift
+      - path: Schermes/Session.swift
+      - path: Schermes/Api/SchermesClient.swift
+      - path: Schermes/Api/Types.swift
+    info:
+      path: SchermesShare/Info.plist
+      properties:
+        CFBundleDisplayName: Schermes
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        # A bundle of its own, so its own exceptions: the daemon is plain HTTP on the LAN.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSLocalNetworkUsageDescription:
+          Schermes connects to your daemon, which usually runs on this network.
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsFileWithMaxCount: 1
+              NSExtensionActivationSupportsImageWithMaxCount: 1
+              NSExtensionActivationSupportsMovieWithMaxCount: 1
+    settings:
+      base:
+        <<: *signing
+        PRODUCT_BUNDLE_IDENTIFIER: dev.schermes.Schermes.Share
+        # Leaves out the app-only `registerDevice`, whose `PushRegistration` lives with the app.
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SCHERMES_EXTENSION"
+        CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]: SchermesShare/SchermesShare.entitlements
 
   SchermesTests:
     type: bundle.unit-test

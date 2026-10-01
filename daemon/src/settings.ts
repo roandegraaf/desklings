@@ -1,21 +1,16 @@
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { eq } from 'drizzle-orm';
-import type { ProviderSettings, PushSettings, WebSettings } from '@schermes/shared';
+import type { PushSettings, WebSettings } from '@schermes/shared';
 import type { Db } from './db.ts';
 import { log } from './log.ts';
 import { parseMcpServers } from './mcp.ts';
 import type { McpServerSpec } from './mcp.ts';
-import type { ProviderConfig } from './provider.ts';
 import { settings } from './schema.ts';
 import { decrypt, encrypt } from './secrets.ts';
 import { BRAVE_SEARCH_URL } from './web.ts';
 import type { SearchConfig } from './web.ts';
 
-const BASE_URL = 'provider.baseUrl';
-const MODEL = 'provider.model';
-const API_KEY = 'provider.apiKey';
-const EXTRA_BODY = 'provider.extraBody';
 const SEARCH_URL = 'web.searchUrl';
 const SEARCH_KEY = 'web.searchKey';
 const MCP_SERVERS = 'mcp.servers';
@@ -24,20 +19,6 @@ const PUSH_TEAM_ID = 'push.teamId';
 const PUSH_BUNDLE_ID = 'push.bundleId';
 const PUSH_KEY = 'push.key';
 const PUSH_SANDBOX = 'push.sandbox';
-
-/** The stored text as the request body fields it stands for; undefined when it is not a JSON
- * object, which is also what an empty setting is. */
-export function parseExtraBody(text: string | undefined): Record<string, unknown> | undefined {
-  if (text === undefined || text.trim() === '') return undefined;
-  try {
-    const parsed: unknown = JSON.parse(text);
-    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 function read(db: Db, key: string): string | undefined {
   return db.select().from(settings).where(eq(settings.key, key)).get()?.value;
@@ -48,47 +29,6 @@ function write(db: Db, key: string, value: string, encrypted: boolean): void {
     .values({ key, value, encrypted })
     .onConflictDoUpdate({ target: settings.key, set: { value, encrypted } })
     .run();
-}
-
-/** The shape the API returns. The API key is reported as present or absent, never echoed. */
-export function readProviderSettings(db: Db): ProviderSettings {
-  return {
-    baseUrl: read(db, BASE_URL) ?? '',
-    model: read(db, MODEL) ?? '',
-    apiKeySet: read(db, API_KEY) !== undefined,
-    extraBody: read(db, EXTRA_BODY) ?? '',
-  };
-}
-
-export function writeExtraBody(db: Db, value: string): void {
-  write(db, EXTRA_BODY, value, false);
-}
-
-export function writeBaseUrl(db: Db, value: string): void {
-  write(db, BASE_URL, value, false);
-}
-
-export function writeModel(db: Db, value: string): void {
-  write(db, MODEL, value, false);
-}
-
-export function writeApiKey(db: Db, masterKey: Buffer, value: string): void {
-  write(db, API_KEY, encrypt(masterKey, value), true);
-}
-
-export function readApiKey(db: Db, masterKey: Buffer): string | undefined {
-  const stored = read(db, API_KEY);
-  return stored === undefined ? undefined : decrypt(masterKey, stored);
-}
-
-/** Everything the model client needs, or undefined when the owner has not finished setting up. */
-export function providerConfig(db: Db, masterKey: Buffer): ProviderConfig | undefined {
-  const baseUrl = read(db, BASE_URL);
-  const model = read(db, MODEL);
-  const apiKey = readApiKey(db, masterKey);
-  if (!baseUrl || !model || !apiKey) return undefined;
-  const extraBody = parseExtraBody(read(db, EXTRA_BODY));
-  return { baseUrl, model, apiKey, ...(extraBody === undefined ? {} : { extraBody }) };
 }
 
 /** The web half of the settings screen. The key is reported as present or absent, like the

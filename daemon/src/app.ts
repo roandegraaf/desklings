@@ -1,19 +1,31 @@
 import { Hono } from 'hono';
 import { getCookie } from 'hono/cookie';
+import { bodyLimit } from 'hono/body-limit';
 import { MIN_PASSWORD_LENGTH } from '@schermes/shared';
 import type {
   Agent,
   Approval,
   CompactResult,
   Conversation,
+  FileChanges,
+  Goal,
   HealthResponse,
   McpServerSummary,
   McpTestResult,
   Message,
+  ModelEntry,
   ProviderTestResult,
   PushTestResult,
+  RetryState,
+  RewindPreview,
+  SearchAnswer,
+  AgentSuggestion,
+  ApprovalCategory,
+  NeedsYouAction,
+  RuleLevel,
   AgentFile,
   UploadResult,
+  ForwardResult,
 } from '@schermes/shared';
 import type { Context } from 'hono';
 import type { Db } from './db.ts';
@@ -28,25 +40,45 @@ import {
 } from './auth.ts';
 import {
   mcpServers,
-  parseExtraBody,
-  providerConfig,
   pushConfig,
-  readProviderSettings,
   readPushSettings,
   readWebSettings,
   searchConfig,
-  writeApiKey,
-  writeBaseUrl,
-  writeExtraBody,
   writeMcpServers,
-  writeModel,
   writeSearchKey,
   writePushIds,
   writePushKey,
   writePushSandbox,
   writeSearchUrl,
 } from './settings.ts';
-import { MAX_PUSH_BODY_CHARS, deleteDevice, listDevices, sendPush, upsertDevice } from './push.ts';
+import {
+  assignModel,
+  backupConfig,
+  clearAuthFailure,
+  createModel,
+  deleteModel,
+  findModel,
+  listModels,
+  modelConfig,
+  modelIdFor,
+  parseExtraBody,
+  providerConfig,
+  readProviderSettings,
+  recordAuthFailure,
+  setBackupModel,
+  setDefaultModel,
+  updateModel,
+  writeProviderSettings,
+} from './models.ts';
+import type { ModelFields } from './models.ts';
+import { MAX_QUESTION_CHARS, answerSearch } from './search.ts';
+import { MAX_DESCRIPTION_CHARS, suggestAgent } from './suggest.ts';
+import { alwaysAllow, alwaysAllowable, grantOnce, parseLevels, readRules, updateRules } from './rules.ts';
+import { listIdlePasses, readIdle, resolveIdleOutput, updateIdle } from './idle.ts';
+import { MAX_HOOK_BYTES, SECRET_HEADER, actOnTrigger, fireWebhook, listTriggers, loginRequests, saveLogin } from './triggers.ts';
+import { MAX_PUSH_BODY_CHARS, deleteDevice, listDevices, pushCategory, sendPush, upsertDevice } from './push.ts';
+import type { PushSend } from './push.ts';
+import { createLiveActivities } from './liveactivity.ts';
 import {
   AGENT_NAME,
   MAX_LABEL_CHARS,
@@ -65,12 +97,22 @@ import {
   setAgentCosmetics,
 } from './agents.ts';
 import {
+  APPROVED,
+  CATEGORY_WORDS,
+  GO_AHEAD,
   describeApproval,
   dropApproval,
   findApproval,
   listApprovals,
 } from './approvals.ts';
+import { cdpConnect, fillForm, focusedField, stopBrowser } from './browser.ts';
+import { createRecorder, saveRecording, shownLine } from './recording.ts';
+import type { Recording } from './recording.ts';
+import type { Connect } from './browser.ts';
+import { filledLine, fillSteps, findForm, hideFromAgent, rememberSteps } from './forms.ts';
+import { formRequests, handOvers, hungBrowsers, listNeedsYou, pushedItem, threadsOf } from './needs.ts';
 import type { DesktopOps } from './agents.ts';
+import { deleteGoal, findGoal, finishGoal, keepHelper, listGoals } from './goals.ts';
 import { parseComputerAction, performComputerAction } from './computer.ts';
 import { parseCommand, runCommand } from './terminal.ts';
 import {
@@ -79,6 +121,7 @@ import {
   conversationWith,
   deleteConversation,
   findConversation,
+  findMessage,
   listConversations,
   listEvents,
   listMessages,
@@ -86,9 +129,11 @@ import {
   participantAgents,
   recordEvent,
   rewindConversation,
-  searchMessages,
+  rewoundRows,
+  SYSTEM_SENDER,
 } from './conversations.ts';
 import type { MessagePage } from './conversations.ts';
+import { cantUndo, fileChanges, restoreFiles, restoredLine } from './snapshots.ts';
 import {
   deleteSchedule,
   findSchedule,
@@ -97,21 +142,24 @@ import {
   parseSchedule,
   setPaused,
 } from './schedules.ts';
+import type { ScheduleRequest } from './schedules.ts';
 import { isHttpServer, openMcp, parseMcpServers, withStoredSecrets } from './mcp.ts';
 import type { McpServerSpec } from './mcp.ts';
-import { compactNow, createRunner, liveReply, workersBusy } from './loop.ts';
+import { compactNow, contextFullness, createRunner, liveReply, workersBusy } from './loop.ts';
 import {
   MAX_FILE_BYTES,
   MAX_MEMORY_FILE_CHARS,
   homePath,
   readHomeFile,
   readMemory,
+  remember,
   writeMemory,
 } from './home.ts';
-import { CONTROL_REFUSAL, createControl } from './control.ts';
-import { KICKOFF, MAX_PROFILE_CHARS } from './interview.ts';
-import { openAiProvider } from './provider.ts';
-import type { Image, Provider, ProviderConfig } from './provider.ts';
+import { FEEDBACK_HEADING, feedbackLine, findFeedback, findReply, parseFeedback, setFeedback, withFeedback } from './feedback.ts';
+import { CONTROL_REFUSAL, createControl, HANDS_BACK } from './control.ts';
+import { KICKOFF, MAX_PROFILE_CHARS, describedKickoff } from './interview.ts';
+import { RETRY_BASE_MS, openAiProvider, withRetries } from './provider.ts';
+import type { Image, Provider, ProviderConfig, RetryControl } from './provider.ts';
 import { config } from './config.ts';
 import type { Exec } from './exec.ts';
 import { log } from './log.ts';
@@ -185,7 +233,6 @@ const TEAM_ID = /^[A-Z0-9]{10}$/;
 const BUNDLE_ID = /^[A-Za-z0-9.-]{1,155}$/;
 /** A picture the owner sends an agent. Decoded size, the model request carries it as base64. */
 export const MAX_IMAGE_BYTES = 5_000_000;
-const MAX_SEARCH_CHARS = 200;
 
 /** An uploaded file's name: one path segment of ordinary characters, nothing hidden. */
 const UPLOAD_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._()+-]{0,127}$/;
@@ -195,6 +242,50 @@ const UPLOAD_SCRIPT = `set -eu
 mkdir -p "$HOME/uploads"
 base64 -d > "$HOME/uploads/$1"
 `;
+
+/** A file's own name made into one `UPLOAD_NAME`: whatever an agent called it, it lands whole. */
+export function uploadName(name: string): string {
+  const plain = name
+    .replace(/[^A-Za-z0-9 ._()+-]/g, '_')
+    .replace(/\.{2,}/g, '.')
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .slice(0, 128);
+  return plain === '' ? 'file' : plain;
+}
+
+type Forward = { messageId?: number; file?: { agent: string; path: string }; note?: string };
+
+function parseForward(body: Record<string, unknown>): Forward | { error: string } {
+  const out: Forward = {};
+  const id = body['messageId'];
+  if (id !== undefined) {
+    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id < 1) return { error: 'messageId must be a message id' };
+    out.messageId = id;
+  }
+  const file = body['file'];
+  if (file !== undefined) {
+    const fields = typeof file === 'object' && file !== null ? (file as Record<string, unknown>) : {};
+    const agent = stringField(fields, 'agent') ?? '';
+    const path = stringField(fields, 'path') ?? '';
+    if (agent === '' || path === '') return { error: 'file must be {agent, path}' };
+    out.file = { agent, path };
+  }
+  const note = body['note'];
+  if (note !== undefined && typeof note !== 'string') return { error: 'note must be a string' };
+  if (typeof note === 'string' && note.trim() !== '') out.note = note.trim();
+  if (out.messageId === undefined && out.file === undefined) return { error: 'forward a message, a file or both' };
+  return out;
+}
+
+/** The owner's line in the target's thread: their note, then what they passed on, quoted. */
+export function forwardedText(note: string | undefined, source: { from: string; text: string } | undefined, file: string | undefined): string {
+  const parts = [note ?? 'Forwarding this to you.'];
+  if (source !== undefined && source.text.trim() !== '') {
+    parts.push(`Forwarded from ${source.from}:\n${source.text.trim().replace(/^/gm, '> ')}`);
+  }
+  if (file !== undefined) parts.push(`I put the file in your home: ${file}`);
+  return parts.join('\n\n');
+}
 
 type AgentFields = { label?: string; look?: string; profile?: string | null };
 
@@ -217,6 +308,48 @@ function agentFields(body: Record<string, unknown>): AgentFields | { error: stri
       return { error: `profile must be at most ${MAX_PROFILE_CHARS} characters` };
     }
     out.profile = profile.trim() === '' ? null : profile.trim();
+  }
+  return out;
+}
+
+type DescribedStart = {
+  description?: string;
+  tagline?: string;
+  levels?: Partial<Record<ApprovalCategory, RuleLevel>>;
+  routine?: ScheduleRequest;
+};
+
+/** The parts of a new agent that come from a description, checked before anything is created. */
+function describedStart(body: Record<string, unknown>): DescribedStart | { error: string } {
+  const out: DescribedStart = {};
+  const description = stringField(body, 'description')?.trim();
+  if (description !== undefined) {
+    if (description === '' || description.length > MAX_DESCRIPTION_CHARS) {
+      return { error: `description must be 1-${MAX_DESCRIPTION_CHARS} characters` };
+    }
+    out.description = description;
+  }
+  const extras = ['tagline', 'levels', 'routine'].filter((key) => body[key] !== undefined);
+  if (out.description === undefined) {
+    return extras.length === 0 ? out : { error: `${extras.join(', ')} come with a description` };
+  }
+  const tagline = stringField(body, 'tagline');
+  if (tagline !== undefined) {
+    const clean = cleanLabel(tagline);
+    if (clean === undefined) return { error: `tagline must be 1-${MAX_LABEL_CHARS} characters on one line` };
+    out.tagline = clean;
+  }
+  if (body['levels'] !== undefined) {
+    const levels = parseLevels(body['levels']);
+    if ('error' in levels) return levels;
+    out.levels = levels;
+  }
+  const routine = body['routine'];
+  if (routine !== undefined) {
+    if (routine === null || typeof routine !== 'object') return { error: 'routine must be {cron, prompt}' };
+    const parsed = parseSchedule(routine as Record<string, unknown>);
+    if ('error' in parsed) return { error: `routine: ${parsed.error}` };
+    out.routine = parsed;
   }
   return out;
 }
@@ -277,6 +410,14 @@ export type AppDeps = {
   /** The resource caps, which come from the environment unless a test wants smaller ones. */
   maxLoops?: number;
   maxWorkers?: number;
+  /** The first wait before a failed model call is asked again; tests shrink it. */
+  retryBaseMs?: number;
+  /** How turns and form fills reach an agent's Chromium; tests hand in a fake page. */
+  connect?: Connect;
+  /** How a push reaches APNs; tests capture it instead. */
+  pushSend?: PushSend;
+  /** The Live Activity update throttle; tests shrink it. */
+  activityThrottleMs?: number;
 };
 
 export function createApp({
@@ -287,16 +428,75 @@ export function createApp({
   makeProvider,
   maxLoops = config.maxLoops,
   maxWorkers = config.maxWorkers,
+  retryBaseMs = RETRY_BASE_MS,
+  connect = cdpConnect,
+  pushSend,
+  activityThrottleMs,
 }: AppDeps) {
   const app = new Hono();
+  const activities = createLiveActivities({
+    db,
+    config: () => pushConfig(db, masterKey),
+    send: pushSend,
+    ...(activityThrottleMs === undefined ? {} : { throttleMs: activityThrottleMs }),
+  });
   const buildProvider = makeProvider ?? openAiProvider;
+  /** The model call each agent is waiting to ask again, with the owner's levers over it. */
+  const waits = new Map<string, { state: RetryState; control: RetryControl }>();
+
+  /**
+   * An agent's turn provider: its model, retried, with the backup on offer while it waits. A
+   * refused key is recorded against the model under the agent that owns the thread, since a
+   * worker has no place in Needs you.
+   */
+  function agentProvider(agent: Agent, modelId?: number): Provider | undefined {
+    const id = modelId ?? modelIdFor(db, agent);
+    const settings = id === undefined ? undefined : modelConfig(db, masterKey, id);
+    if (id === undefined || settings === undefined) return undefined;
+    const backup = backupConfig(db, masterKey, id);
+    const owner = agent.parentId === undefined ? agent : (findAgentById(db, agent.parentId) ?? agent);
+    const { provider, control } = withRetries({
+      primary: { provider: buildProvider(settings), modelId: id, name: findModel(db, id)?.name ?? settings.model },
+      ...(backup === undefined
+        ? {}
+        : { backup: { provider: buildProvider(backup.config), modelId: backup.id, name: backup.name } }),
+      baseMs: retryBaseMs,
+      onWait: (state) => {
+        if (state === undefined) waits.delete(agent.name);
+        else waits.set(agent.name, { state, control });
+      },
+      onAuthFailure: (call, error) => {
+        if (call.modelId === undefined) return;
+        recordAuthFailure(db, {
+          modelId: call.modelId,
+          agent: owner.name,
+          conversationId: conversationFor(db, owner.id),
+          error: error.message,
+        });
+      },
+      onSuccess: (call) => {
+        if (call.modelId !== undefined) clearAuthFailure(db, call.modelId);
+      },
+    });
+    return provider;
+  }
   // Owns the one-turn-per-agent rule. Both the routes below and `send_message` inside a turn
   // start turns through it, which is why it cannot live in a route closure.
   const control = createControl();
+  const recorder = createRecorder({
+    screen: config.screen,
+    focused: (display) => focusedField(connect, display),
+    screenshot: async (target) => {
+      const shot = await performComputerAction(exec, target, { action: 'screenshot' }, config.screen);
+      if (shot.action !== 'screenshot' || shot.image === undefined) throw new Error('no screenshot');
+      return shot.image;
+    },
+  });
   const runner = createRunner({
     db,
     exec,
     control,
+    connect,
     screen: config.screen,
     maxLoops,
     maxWorkers,
@@ -305,25 +505,33 @@ export function createApp({
     // device. Fire and forget; nothing configured or nobody registered is silence, and a
     // failed delivery is a log line.
     rename: (agent, name) => moveAgent(agent, name).then(() => undefined),
+    turn: (agent, phase) => (phase === 'start' ? activities.started(agent) : activities.ended(agent)),
+    progress: (agent) => activities.changed(agent),
+    desktop,
     // Called from inside a turn, so a throw here would fail a turn that already finished.
     deliver: (agent, conversationId, text, kind) => {
       try {
         if (agent.parentId !== undefined) return;
+        if (kind === 'approval') activities.changed(agent);
         if (kind !== 'approval' && participantAgents(db, conversationId).length !== 1) return;
         const push = pushConfig(db, masterKey);
         if (push === undefined) return;
+        const item = pushedItem(db, agent.name, conversationId, kind);
         sendPush(
-          { db, config: push },
-          { title: agent.label ?? agent.name, body: text, agent: agent.name, conversationId },
+          { db, config: push, ...(pushSend === undefined ? {} : { send: pushSend }) },
+          {
+            title: agent.label ?? agent.name,
+            body: text,
+            agent: agent.name,
+            conversationId,
+            ...(item === undefined ? {} : { needsYou: item.id, category: pushCategory(item) }),
+          },
         ).catch((error: unknown) => log.error('push failed', { agent: agent.name, error }));
       } catch (error) {
         log.error('push failed', { agent: agent.name, error });
       }
     },
-    provider: () => {
-      const settings = providerConfig(db, masterKey);
-      return settings === undefined ? undefined : buildProvider(settings);
-    },
+    provider: agentProvider,
     search: () => searchConfig(db, masterKey),
     // Reads the row every turn like the provider and the search key do, and resolves the agent's
     // Linux user only when there is something to connect to: a daemon with no MCP server
@@ -406,12 +614,12 @@ export function createApp({
       return c.json({ error: 'pushSandbox must be a boolean' }, 400);
     }
 
-    if (baseUrl !== undefined) writeBaseUrl(db, baseUrl);
-    if (extraBody !== undefined) writeExtraBody(db, extraBody);
-    const model = stringField(body, 'model');
-    if (model !== undefined) writeModel(db, model);
-    const apiKey = stringField(body, 'apiKey');
-    if (apiKey !== undefined) writeApiKey(db, masterKey, apiKey);
+    writeProviderSettings(db, masterKey, {
+      baseUrl,
+      extraBody,
+      model: stringField(body, 'model'),
+      apiKey: stringField(body, 'apiKey'),
+    });
     if (searchUrl !== undefined) writeSearchUrl(db, searchUrl);
     const searchKey = stringField(body, 'searchKey');
     if (searchKey !== undefined) writeSearchKey(db, masterKey, searchKey);
@@ -465,6 +673,21 @@ export function createApp({
     return c.json({ ok: true }, 201);
   });
 
+  // A phone's push-to-start token, and each running activity's own token with the agent it shows.
+  app.post('/api/live-activities', async (c) => {
+    const body = await jsonBody(c);
+    const token = stringField(body, 'token') ?? '';
+    const kind = stringField(body, 'kind');
+    const agent = stringField(body, 'agent');
+    if (!DEVICE_TOKEN.test(token)) return c.json({ error: 'token must be a hex APNs token' }, 400);
+    if (kind !== 'start' && kind !== 'update') return c.json({ error: 'kind must be start or update' }, 400);
+    if (kind === 'update' && (agent === undefined || findAgent(db, agent) === undefined)) {
+      return c.json({ error: 'an update token names the agent its activity shows' }, 400);
+    }
+    activities.registered(token.toLowerCase(), kind, kind === 'update' ? agent : undefined);
+    return c.json({ ok: true }, 201);
+  });
+
   app.delete('/api/devices/:token', (c) => {
     if (!deleteDevice(db, c.req.param('token').toLowerCase())) return c.json({ error: 'no such device' }, 404);
     return c.json({ ok: true });
@@ -480,6 +703,10 @@ export function createApp({
     if (settings === undefined) {
       return c.json({ error: 'set a provider base url, model and api key first' }, 400);
     }
+    return c.json<ProviderTestResult>(await testProvider(settings));
+  });
+
+  async function testProvider(settings: ProviderConfig): Promise<ProviderTestResult> {
     try {
       const reply = await buildProvider(settings)(
         [
@@ -489,11 +716,88 @@ export function createApp({
         [],
       );
       const first = reply.text.trim().split('\n')[0] ?? '';
-      return c.json<ProviderTestResult>({ ok: true, reply: first.slice(0, 200) });
+      return { ok: true, reply: first.slice(0, 200) };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return c.json<ProviderTestResult>({ ok: false, error: message });
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  function modelFields(body: Record<string, unknown>, creating: boolean): ModelFields | { error: string } {
+    const fields: ModelFields = {};
+    for (const name of ['name', 'baseUrl', 'model', 'apiKey', 'extraBody'] as const) {
+      const value = body[name];
+      if (value === undefined) continue;
+      if (typeof value !== 'string') return { error: `${name} must be a string` };
+      fields[name] = name === 'apiKey' || name === 'extraBody' ? value : value.trim();
+    }
+    for (const name of ['name', 'baseUrl', 'model'] as const) {
+      if ((creating || fields[name] !== undefined) && !fields[name]) return { error: `${name} is required` };
+    }
+    if (fields.baseUrl !== undefined && !validBaseUrl(fields.baseUrl)) return { error: 'baseUrl must be an http(s) URL' };
+    if (fields.extraBody !== undefined && fields.extraBody.trim() !== '' && parseExtraBody(fields.extraBody) === undefined) {
+      return { error: 'extraBody must be a JSON object' };
+    }
+    return fields;
+  }
+
+  function modelId(value: unknown): number | undefined {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  }
+
+  app.get('/api/models', (c) => c.json<ModelEntry[]>(listModels(db)));
+
+  app.post('/api/models', async (c) => {
+    const fields = modelFields(await jsonBody(c), true);
+    if ('error' in fields) return c.json({ error: fields.error }, 400);
+    return c.json<ModelEntry>(createModel(db, masterKey, fields), 201);
+  });
+
+  app.put('/api/models/default', async (c) => {
+    const id = modelId((await jsonBody(c))['id']);
+    if (id === undefined || !setDefaultModel(db, id)) return c.json({ error: 'no such model' }, 404);
+    return c.json<ModelEntry[]>(listModels(db));
+  });
+
+  /** `id: null` leaves no backup. */
+  app.put('/api/models/backup', async (c) => {
+    const raw = (await jsonBody(c))['id'];
+    const id = raw === null ? null : modelId(raw);
+    if (id === undefined || !setBackupModel(db, id)) return c.json({ error: 'no such model' }, 404);
+    return c.json<ModelEntry[]>(listModels(db));
+  });
+
+  app.put('/api/models/:id', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (findModel(db, id) === undefined) return c.json({ error: 'no such model' }, 404);
+    const fields = modelFields(await jsonBody(c), false);
+    if ('error' in fields) return c.json({ error: fields.error }, 400);
+    return c.json<ModelEntry | undefined>(updateModel(db, masterKey, id, fields));
+  });
+
+  app.delete('/api/models/:id', (c) => {
+    const result = deleteModel(db, Number(c.req.param('id')));
+    if ('error' in result) return c.json({ error: result.error }, result.status);
+    return c.json({ ok: true });
+  });
+
+  app.post('/api/models/:id/test', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (findModel(db, id) === undefined) return c.json({ error: 'no such model' }, 404);
+    const settings = modelConfig(db, masterKey, id);
+    if (settings === undefined) return c.json({ error: 'this model needs a base url, a model id and an api key' }, 400);
+    const result = await testProvider(settings);
+    if (result.ok) clearAuthFailure(db, id);
+    return c.json<ProviderTestResult>(result);
+  });
+
+  /** `id: null` puts the agent back on the default. A worker runs on its parent's model. */
+  app.put('/api/agents/:name/model', async (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined || agent.parentId !== undefined) return c.json({ error: 'no such agent' }, 404);
+    const raw = (await jsonBody(c))['id'];
+    const id = raw === null ? null : modelId(raw);
+    if (id === undefined || !assignModel(db, agent.name, id)) return c.json({ error: 'no such model' }, 404);
+    return c.json(findAgent(db, agent.name));
   });
 
   // The owner's MCP servers. Their own routes rather than fields on `PUT /api/settings`: the
@@ -601,20 +905,37 @@ export function createApp({
     log.info('agent deleted', { agent: agent.name, display: agent.display });
   }
 
-  /** The outcome, written into the thread the request came from as the owner's own words, and a
+  /** The outcome, written into the thread the request came from as a system line, and a
    * turn so the agent reads it. A thread or an agent that is already gone is nobody to tell. */
   function tellTheAsker(approval: Approval, text: string): void {
     const asker = findAgent(db, approval.agent);
     if (asker === undefined || findConversation(db, approval.conversationId) === undefined) return;
-    appendMessage(db, approval.conversationId, { role: 'user', content: text });
+    appendMessage(db, approval.conversationId, { role: 'user', content: text, sender: SYSTEM_SENDER });
     runner.start(asker, approval.conversationId);
   }
 
-  app.get('/api/agents', (c) => c.json(listAgents(db)));
+  app.get('/api/agents', (c) =>
+    c.json(listAgents(db).map((agent) => ({ ...agent, contextFullness: contextFullness(db, agent) }))),
+  );
 
   app.get('/api/agents/:name', (c) => {
     const agent = findAgent(db, c.req.param('name'));
     return agent === undefined ? c.json({ error: 'no such agent' }, 404) : c.json(agent);
+  });
+
+  /** A starting point for a new agent from what the owner wants it for; nothing is created. */
+  app.post('/api/agents/suggest', async (c) => {
+    const description = (stringField(await jsonBody(c), 'description') ?? '').trim();
+    if (description === '' || description.length > MAX_DESCRIPTION_CHARS) {
+      return c.json({ error: `description must be 1-${MAX_DESCRIPTION_CHARS} characters` }, 400);
+    }
+    const settings = providerConfig(db, masterKey);
+    const reader =
+      settings === undefined
+        ? undefined
+        : withRetries({ primary: { provider: buildProvider(settings), modelId: undefined, name: '' }, baseMs: retryBaseMs })
+            .provider;
+    return c.json<AgentSuggestion>(await suggestAgent(db, description, reader));
   });
 
   app.post('/api/agents', async (c) => {
@@ -627,9 +948,31 @@ export function createApp({
     const fields = agentFields(body);
     if ('error' in fields) return c.json({ error: fields.error }, 400);
     const { profile, ...cosmetics } = fields;
+    const described = describedStart(body);
+    if ('error' in described) return c.json({ error: described.error }, 400);
+    if (described.description !== undefined && profile !== undefined && profile !== null) {
+      return c.json({ error: 'send a description or a profile, not both' }, 400);
+    }
 
     const agent = insertAgent(db, name, cosmetics);
     if (agent === undefined) return c.json({ error: 'agent already exists' }, 409);
+
+    if (described.description !== undefined) {
+      const { description, tagline, levels, routine } = described;
+      if (levels !== undefined) updateRules(db, agent, { levels });
+      if (routine !== undefined) insertSchedule(db, agent, routine, Date.now());
+      // The interview needs no screen, so it starts now and the desktop catches up; one that
+      // will not start is logged, and a restart of it or of the daemon brings it up later.
+      if (providerConfig(db, masterKey, agent) !== undefined && runner.atCapacity(agent.name) === undefined) {
+        const conversationId = conversationFor(db, agent.id);
+        appendMessage(db, conversationId, { role: 'user', content: describedKickoff(description, tagline) });
+        runner.start(agent, conversationId);
+      }
+      void desktop.ensure(agent.name, agent.display).catch((error: unknown) => {
+        log.error('agent desktop did not start', { agent: name, display: agent.display, error });
+      });
+      return c.json(findAgent(db, name) ?? agent, 201);
+    }
 
     try {
       await desktop.ensure(agent.name, agent.display);
@@ -643,7 +986,7 @@ export function createApp({
     // provider yet it cannot run, and the prompt tells a profile-less agent to ask anyway, so
     // the owner's first message gets the same interview later.
     if (profile === undefined || profile === null) {
-      if (providerConfig(db, masterKey) !== undefined && runner.atCapacity(agent.name) === undefined) {
+      if (providerConfig(db, masterKey, agent) !== undefined && runner.atCapacity(agent.name) === undefined) {
         const conversationId = conversationFor(db, agent.id);
         appendMessage(db, conversationId, { role: 'user', content: KICKOFF });
         runner.start(agent, conversationId);
@@ -702,6 +1045,17 @@ export function createApp({
    * does, which keeps one request shape and one body parser. The name is an operand to the
    * script, never a word in it, so a space in it is a space in the filename and nothing else.
    */
+  async function writeUpload(agent: Agent, name: string, base64: string): Promise<string> {
+    const target = await agentTarget(exec, agent);
+    const { code, stderr } = await exec(
+      'sudo',
+      asAgent(target, ['bash', '-c', UPLOAD_SCRIPT, 'schermes-upload', name]),
+      { input: base64, timeoutMs: 60_000 },
+    );
+    if (code !== 0) throw new Error(stderr.trim() || `exit ${code}`);
+    return `${target.home}/uploads/${name}`;
+  }
+
   app.post('/api/agents/:name/uploads', async (c) => {
     const agent = desktopAgent(db, c.req.param('name'));
     if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
@@ -719,15 +1073,9 @@ export function createApp({
     const bytes = Buffer.from(base64, 'base64').length;
 
     try {
-      const target = await agentTarget(exec, agent);
-      const { code, stderr } = await exec(
-        'sudo',
-        asAgent(target, ['bash', '-c', UPLOAD_SCRIPT, 'schermes-upload', name]),
-        { input: base64, timeoutMs: 60_000 },
-      );
-      if (code !== 0) throw new Error(stderr.trim() || `exit ${code}`);
+      const path = await writeUpload(agent, name, base64);
       log.info('file uploaded', { agent: agent.name, bytes });
-      return c.json<UploadResult>({ path: `${target.home}/uploads/${name}`, bytes }, 201);
+      return c.json<UploadResult>({ path, bytes }, 201);
     } catch (error) {
       log.error('upload failed', { agent: agent.name, error });
       return c.json({ error: 'upload failed' }, 500);
@@ -845,13 +1193,27 @@ export function createApp({
     if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
     const page = messagePage(c);
     if (page === undefined) return c.json({ error: PAGE_REFUSAL }, 400);
-    return c.json(withImages(c, pageMessages(db, conversationFor(db, agent.id), page)));
+    return c.json(withImages(c, withFeedback(db, pageMessages(db, conversationFor(db, agent.id), page))));
   });
 
   app.get('/api/agents/:name/live', (c) => {
     const agent = findAgent(db, c.req.param('name'));
     if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
-    return c.json(liveReply(agent.name) ?? { text: '', reasoning: '' });
+    const retry = waits.get(agent.name)?.state;
+    return c.json({ ...(liveReply(agent.name) ?? { text: '', reasoning: '' }), ...(retry === undefined ? {} : { retry }) });
+  });
+
+  /** "Retry now" (`now`) or "Use backup model" (`backup`) on a model call that is waiting. */
+  app.post('/api/agents/:name/retry', async (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
+    const action = (await jsonBody(c))['action'];
+    if (action !== 'now' && action !== 'backup') return c.json({ error: 'action must be now or backup' }, 400);
+    const wait = waits.get(agent.name);
+    if (wait === undefined) return c.json({ error: `${agent.name} is not waiting to try again` }, 409);
+    const done = action === 'now' ? wait.control.now() : wait.control.useBackup();
+    if (!done) return c.json({ error: 'there is no backup model to switch to' }, 409);
+    return c.json({ ok: true });
   });
 
   /** The whole log by default, or `?limit=` the newest that many: the log grows for the life
@@ -873,7 +1235,7 @@ export function createApp({
 
     const sent = messageBody(await jsonBody(c));
     if ('error' in sent) return c.json({ error: sent.error }, 400);
-    if (providerConfig(db, masterKey) === undefined) {
+    if (providerConfig(db, masterKey, agent) === undefined) {
       return c.json({ error: 'set a provider base url, model and api key first' }, 400);
     }
 
@@ -888,13 +1250,101 @@ export function createApp({
     return c.json({ message }, 202);
   });
 
+  /**
+   * The owner passes a message or a file (or a file with the message it came in) on to another
+   * agent. The file is copied into the target's `~/uploads` as the target; the note and the
+   * quoted message become one owner line in the target's own thread, and a turn starts there.
+   */
+  app.post('/api/agents/:name/forward', async (c) => {
+    const agent = desktopAgent(db, c.req.param('name'));
+    if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
+    const wanted = parseForward(await jsonBody(c));
+    if ('error' in wanted) return c.json({ error: wanted.error }, 400);
+
+    const source = wanted.messageId === undefined ? undefined : findMessage(db, wanted.messageId);
+    if (wanted.messageId !== undefined && source === undefined) return c.json({ error: 'no such message' }, 404);
+    const named = wanted.file === undefined ? undefined : findAgent(db, wanted.file.agent);
+    // A task worker runs as its parent, so what it names is in the parent's home.
+    const holder = named?.parentId === undefined ? named : findAgentById(db, named.parentId);
+    if (wanted.file !== undefined && holder === undefined) return c.json({ error: 'no such agent' }, 404);
+    if (providerConfig(db, masterKey, agent) === undefined) {
+      return c.json({ error: 'set a provider base url, model and api key first' }, 400);
+    }
+    const busy = runner.atCapacity(agent.name);
+    if (busy !== undefined) return c.json({ error: busy }, 429);
+
+    let copied: UploadResult | undefined;
+    if (wanted.file !== undefined && holder !== undefined) {
+      try {
+        const home = await agentTarget(exec, holder);
+        const path = homePath(home.home, wanted.file.path);
+        if (path === undefined) return c.json({ error: "path must point inside the agent's home" }, 400);
+        const file = await readHomeFile(exec, home, path);
+        if ('error' in file) {
+          return file.error === 'missing'
+            ? c.json({ error: 'no such file' }, 404)
+            : c.json({ error: `a file may be at most ${MAX_FILE_BYTES / 1_000_000} MB` }, 413);
+        }
+        copied = { path: await writeUpload(agent, uploadName(file.name), file.base64), bytes: file.bytes };
+      } catch (error) {
+        log.error('forward copy failed', { agent: agent.name, error });
+        return c.json({ error: `could not copy the file to ${agent.name}` }, 500);
+      }
+    }
+
+    // Checked again: the copy awaited, and something else may have taken the last free loop.
+    const refusal = runner.atCapacity(agent.name);
+    if (refusal !== undefined) return c.json({ error: refusal }, 429);
+    const from = source?.sender === undefined ? 'something I wrote earlier' : (findAgent(db, source.sender)?.label ?? source.sender);
+    const content = forwardedText(wanted.note, source === undefined ? undefined : { from, text: source.content }, copied?.path);
+    const conversationId = conversationFor(db, agent.id);
+    const message = appendMessage(db, conversationId, { role: 'user', content });
+    runner.start(agent, conversationId);
+    return c.json<ForwardResult>({ message, ...(copied === undefined ? {} : { file: copied }) }, 202);
+  });
+
   // Input ownership. Taking it does not interrupt a tool call already in flight — there is no
   // result to hand back and a half-finished drag would leave a button down — it refuses what
   // the agent asks for next, which ends that turn in `waiting_for_user`.
   app.get('/api/agents/:name/control', (c) => {
     const agent = desktopAgent(db, c.req.param('name'));
     if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
-    return c.json({ held: control.held(agent.display) });
+    const recording = recorder.state(agent.display);
+    return c.json({
+      held: control.held(agent.display),
+      handOver: screenAsked(agent) !== undefined,
+      ...(recording === undefined ? {} : { recording }),
+    });
+  });
+
+  /** "Show the agent how": takes the screen and records the owner's hands until it is given back.
+   * Only an agent with a home of its own learns a skill, so a goal's screen worker is refused. */
+  app.post('/api/agents/:name/recording', async (c) => {
+    const agent = desktopAgent(db, c.req.param('name'));
+    if (agent === undefined || agent.parentId !== undefined) return c.json({ error: 'no such agent' }, 404);
+    if (recorder.state(agent.display) !== undefined) return c.json({ error: 'already recording' }, 409);
+    let target;
+    try {
+      target = await agentTarget(exec, agent);
+    } catch (error) {
+      log.error('recording could not start', { agent: agent.name, error });
+      return c.json({ error: 'could not reach the agent\'s desktop' }, 500);
+    }
+    if (recorder.state(agent.display) !== undefined) return c.json({ error: 'already recording' }, 409);
+    control.hold(agent.display);
+    recordEvent(db, agent.id, 'control', { held: true, recording: true });
+    const recording = recorder.start(target);
+    return c.json({ held: true, handOver: screenAsked(agent) !== undefined, recording });
+  });
+
+  app.put('/api/agents/:name/recording', async (c) => {
+    const agent = desktopAgent(db, c.req.param('name'));
+    if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
+    const secret = (await jsonBody(c))['secret'];
+    if (typeof secret !== 'boolean') return c.json({ error: 'secret must be true or false' }, 400);
+    const recording = recorder.setSecret(agent.display, secret);
+    if (recording === undefined) return c.json({ error: 'not recording' }, 404);
+    return c.json({ held: control.held(agent.display), handOver: screenAsked(agent) !== undefined, recording });
   });
 
   app.post('/api/agents/:name/control', (c) => {
@@ -905,12 +1355,110 @@ export function createApp({
     return c.json({ held: true });
   });
 
-  app.delete('/api/agents/:name/control', (c) => {
+  app.delete('/api/agents/:name/control', async (c) => {
     const agent = desktopAgent(db, c.req.param('name'));
     if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
     control.release(agent.display);
     recordEvent(db, agent.id, 'control', { held: false });
-    return c.json({ held: false });
+    // Only when the agent asked for hands or a form: an ordinary take-over is given back silently.
+    const asked = screenAsked(agent);
+    if (asked !== undefined) {
+      appendMessage(db, asked.conversationId, { role: 'user', content: HANDS_BACK });
+      runner.start(agent, asked.conversationId);
+    }
+    const recording = await recorder.stop(agent.display);
+    if (recording !== undefined && recording.steps.length > 0) await handOver(agent, recording);
+    return c.json({ held: false, handOver: false });
+  });
+
+  /**
+   * The owner fills a form the agent asked for. The daemon types the values into the page itself
+   * and writes a line naming the fields, secret ones marked hidden, so no value reaches the model
+   * or the transcript. Remembered values fill what the owner left out; nothing is filled without
+   * the owner sending this.
+   */
+  app.post('/api/agents/:name/forms/:id', async (c) => {
+    const agent = desktopAgent(db, c.req.param('name'));
+    if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
+    const id = Number(c.req.param('id'));
+    const login = loginRequests(db, agent).find((i) => i.form?.id === id);
+    const loginForm = login === undefined ? undefined : findForm(db, id);
+    if (loginForm?.triggerId != null) {
+      const saved = saveLogin(db, masterKey, loginForm, loginForm.triggerId, await jsonBody(c));
+      return 'error' in saved ? c.json({ error: saved.error }, 400) : c.json(saved);
+    }
+    const item = formRequests(db, agent).find((i) => i.form?.id === id);
+    const form = item?.form === undefined ? undefined : findForm(db, item.form.id);
+    if (item === undefined || form === undefined) return c.json({ error: 'no such form is waiting' }, 404);
+    if (runner.running(agent.name)) {
+      return c.json({ error: `${agent.name} is in the middle of a turn; stop it first` }, 409);
+    }
+    const parsed = fillSteps(db, masterKey, form, await jsonBody(c));
+    if ('error' in parsed) return c.json({ error: parsed.error }, 400);
+    hideFromAgent(agent.id, parsed.steps.filter((s) => s.secret).map((s) => s.value));
+    const filled = await fillForm(connect, agent.display, form.origin, parsed.steps);
+    if ('error' in filled) return c.json({ error: filled.error }, 409);
+    if (parsed.remember) rememberSteps(db, masterKey, form, parsed.steps);
+    appendMessage(db, item.conversationId, { role: 'user', content: filledLine(form.origin, parsed.steps) });
+    runner.start(agent, item.conversationId);
+    return c.json({ ok: true });
+  });
+
+  /** The recording goes to the agent's own thread as the owner's line, with the shots beside it. */
+  async function handOver(agent: Agent, recording: Recording) {
+    let saved: Awaited<ReturnType<typeof saveRecording>> = { dir: '~/recordings', picture: 'none' };
+    try {
+      saved = await saveRecording(exec, await agentTarget(exec, agent), recording);
+    } catch (error) {
+      log.error('recording not saved', { agent: agent.name, error });
+    }
+    const thread = conversationFor(db, agent.id);
+    appendMessage(db, thread, {
+      role: 'user',
+      content: shownLine(recording, saved.dir, saved.picture),
+      ...(saved.image === undefined ? {} : { image: saved.image }),
+    });
+    runner.start(agent, thread);
+  }
+
+  /** The newest request of the agent's that the owner answers on its screen. */
+  function screenAsked(agent: Agent) {
+    const threads = threadsOf(db, agent);
+    return [...handOvers(db, agent, threads), ...formRequests(db, agent, threads)].sort((a, b) => b.createdAt - a.createdAt)[0];
+  }
+
+  /**
+   * The owner's way out of a browser the watchdog could not bring back: kill it (the agent's next
+   * browse starts it) or restart the whole desktop, then tell the agent in the thread it hung in
+   * and start a turn there. That line is also what clears the card and the Needs you item.
+   */
+  app.post('/api/agents/:name/browser/restart', async (c) => {
+    const agent = desktopAgent(db, c.req.param('name'));
+    if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
+    const what = (await jsonBody(c))['what'];
+    if (what !== 'browser' && what !== 'desktop') return c.json({ error: 'what must be browser or desktop' }, 400);
+    if (runner.running(agent.name)) {
+      return c.json({ error: `${agent.name} is in the middle of a turn; stop it first` }, 409);
+    }
+    try {
+      if (what === 'desktop') {
+        await desktop.stop(agent.name);
+        await desktop.ensure(agent.name, agent.display);
+      } else {
+        const stopped = await stopBrowser(exec, await agentTarget(exec, agent));
+        if ('error' in stopped) return c.json({ error: stopped.error }, 500);
+      }
+    } catch (error) {
+      log.error('restart failed', { agent: agent.name, what, error });
+      return c.json({ error: `the ${what} could not be restarted` }, 500);
+    }
+    const hang = hungBrowsers(db, agent).sort((a, b) => b.createdAt - a.createdAt)[0];
+    if (hang !== undefined) {
+      const done = what === 'desktop' ? 'I restarted your desktop, browser included.' : 'I restarted your browser.';
+      appendMessage(db, hang.conversationId, { role: 'user', content: `${done} Try again.` });
+      runner.start(agent, hang.conversationId);
+    }
+    return c.json({ ok: true });
   });
 
   /** The schedule two path segments name, and only if the second belongs to the first. */
@@ -955,6 +1503,105 @@ export function createApp({
     return c.json({ ok: true });
   });
 
+  // A thumbs down is written into the memory of the agent that answered (a worker's goes to its
+  // parent) before it is stored, so a failed write can be tried again.
+  app.put('/api/messages/:id/feedback', async (c) => {
+    const id = Number(c.req.param('id'));
+    const reply = Number.isSafeInteger(id) ? findReply(db, id) : undefined;
+    const sender = reply === undefined ? undefined : findAgent(db, reply.sender);
+    if (reply === undefined || sender === undefined) return c.json({ error: 'no such reply' }, 404);
+    const update = parseFeedback(await jsonBody(c));
+    if ('error' in update) return c.json(update, 400);
+
+    const before = findFeedback(db, id);
+    const changed = before?.rating !== 'down' || before.reason !== update.reason;
+    if (update.rating === 'down' && changed) {
+      const agent = sender.parentId === undefined ? sender : (findAgentById(db, sender.parentId) ?? sender);
+      try {
+        const written = await remember(
+          exec,
+          await agentTarget(exec, agent),
+          { text: feedbackLine(reply.content, update.reason), scope: 'lasting' },
+          FEEDBACK_HEADING,
+        );
+        if ('error' in written) throw new Error(written.error);
+      } catch (error) {
+        log.error('feedback memory write failed', { agent: agent.name, error });
+        return c.json({ error: `could not write to ${agent.name}'s memory` }, 500);
+      }
+    }
+    return c.json({ feedback: setFeedback(db, id, update) ?? null });
+  });
+
+  // A worker runs under its parent's rules and has none of its own.
+  app.get('/api/agents/:name/rules', (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined || isWorker(agent)) return c.json({ error: 'no such agent' }, 404);
+    return c.json(readRules(db, agent));
+  });
+
+  app.put('/api/agents/:name/rules', async (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined || isWorker(agent)) return c.json({ error: 'no such agent' }, 404);
+    const rules = updateRules(db, agent, await jsonBody(c));
+    return 'error' in rules ? c.json(rules, 400) : c.json(rules);
+  });
+
+  app.get('/api/agents/:name/idle', (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined || isWorker(agent)) return c.json({ error: 'no such agent' }, 404);
+    return c.json(readIdle(db, agent));
+  });
+
+  app.put('/api/agents/:name/idle', async (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined || isWorker(agent)) return c.json({ error: 'no such agent' }, 404);
+    const idle = updateIdle(db, agent, await jsonBody(c));
+    return 'error' in idle ? c.json(idle, 400) : c.json(idle);
+  });
+
+  // Every agent's idle passes since `since` (ms, default the last day), with their outputs.
+  app.get('/api/idle/passes', (c) => {
+    const since = Number(c.req.query('since') ?? Date.now() - 86_400_000);
+    if (!Number.isSafeInteger(since)) return c.json({ error: 'since must be a time in milliseconds' }, 400);
+    return c.json(listIdlePasses(db, since));
+  });
+
+  app.post('/api/idle/outputs/:id', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (!Number.isSafeInteger(id)) return c.json({ error: 'no such output' }, 404);
+    try {
+      const result = await resolveIdleOutput(db, exec, id, (await jsonBody(c))['action']);
+      return 'error' in result ? c.json({ error: result.error }, result.status) : c.json(result);
+    } catch (error) {
+      log.error('idle output action failed', { id, error });
+      return c.json({ error: 'could not reach the agent\'s memory' }, 500);
+    }
+  });
+
+  app.get('/api/agents/:name/triggers', (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined || isWorker(agent)) return c.json({ error: 'no such agent' }, 404);
+    return c.json(listTriggers(db, masterKey, agent));
+  });
+
+  app.post('/api/triggers/:id', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (!Number.isSafeInteger(id)) return c.json({ error: 'no such trigger' }, 404);
+    const result = actOnTrigger(db, masterKey, runner, id, (await jsonBody(c))['action']);
+    return 'error' in result ? c.json({ error: result.error }, result.status) : c.json(result);
+  });
+
+  // Outside /api on purpose: the caller is another service with a secret, not the owner's session.
+  app.post(
+    '/hooks/:token',
+    bodyLimit({ maxSize: MAX_HOOK_BYTES, onError: (c) => c.json({ error: `the body is over ${MAX_HOOK_BYTES} bytes` }, 413) }),
+    async (c) => {
+      const result = fireWebhook(db, masterKey, runner, c.req.param('token'), c.req.header(SECRET_HEADER), await c.req.text());
+      return c.json(result.body, result.status);
+    },
+  );
+
   app.get('/api/agents/:name/conversations', (c) => {
     const agent = findAgent(db, c.req.param('name'));
     if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
@@ -984,7 +1631,7 @@ export function createApp({
     if (conversation === undefined) return c.json({ error: 'no such conversation' }, 404);
     const page = messagePage(c);
     if (page === undefined) return c.json({ error: PAGE_REFUSAL }, 400);
-    return c.json(withImages(c, pageMessages(db, conversation.id, page)));
+    return c.json(withImages(c, withFeedback(db, pageMessages(db, conversation.id, page))));
   });
 
   app.post('/api/conversations/:id/messages', async (c) => {
@@ -993,12 +1640,12 @@ export function createApp({
 
     const sent = messageBody(await jsonBody(c));
     if ('error' in sent) return c.json({ error: sent.error }, 400);
-    if (providerConfig(db, masterKey) === undefined) {
-      return c.json({ error: 'set a provider base url, model and api key first' }, 400);
-    }
 
     // Every agent in the thread answers, so the whole fan-out has to fit under the cap.
     const agents = participantAgents(db, conversation.id);
+    if (agents.some((agent) => providerConfig(db, masterKey, agent) === undefined)) {
+      return c.json({ error: 'set a provider base url, model and api key first' }, 400);
+    }
     const refusal = agents.map((agent) => runner.atCapacity(agent.name)).find(Boolean);
     if (refusal !== undefined) return c.json({ error: refusal }, 429);
 
@@ -1025,11 +1672,42 @@ export function createApp({
     return c.json({ ok: true });
   });
 
-  /** With `retry` the message left last is asked again, so its author must not answer itself. */
+  /** The permanent agents whose files a rewind of this thread would put back. */
+  function fileOwners(conversationId: number): Agent[] {
+    return participantAgents(db, conversationId).filter((agent) => agent.parentId === undefined);
+  }
+
+  /** What a rewind from `from` takes away and what it can't: the confirmation's preview. */
+  async function rewindPreview(c: Context, conversationId: number) {
+    const from = Number(c.req.query('from'));
+    if (!Number.isSafeInteger(from) || from < 1) return c.json({ error: 'from must be a message id' }, 400);
+    const stored = listMessages(db, conversationId);
+    const gone = rewoundRows(stored, from);
+    const preview: RewindPreview = { removed: gone.length, files: [], noSnapshot: [], cantUndo: cantUndo(gone, stored) };
+    const now = Date.now();
+    for (const agent of fileOwners(conversationId)) {
+      try {
+        const found = await fileChanges(exec, agent, from, now);
+        if (found === undefined) preview.noSnapshot.push(agent.name);
+        else preview.files.push(found.changes);
+      } catch (error) {
+        log.error('reading a snapshot failed', { agent: agent.name, error });
+        preview.noSnapshot.push(agent.name);
+      }
+    }
+    return c.json(preview);
+  }
+
+  /**
+   * With `retry` the message left last is asked again, so its author must not answer itself.
+   * With `files` every agent in the thread gets its home back as it was before the first turn
+   * the rewind removes, or nothing happens: files first, because they can fail and rows can't.
+   */
   async function rewind(c: Context, conversationId: number) {
     const body = await jsonBody(c);
     const from = body['from'];
     const retry = body['retry'] === true;
+    const files = body['files'] === true;
     if (typeof from !== 'number' || !Number.isSafeInteger(from) || from < 1) {
       return c.json({ error: 'from must be a message id' }, 400);
     }
@@ -1042,16 +1720,67 @@ export function createApp({
     const askers = agents.filter((agent) => agent.name !== prompt?.sender);
     if (retry) {
       if (prompt?.role !== 'user') return c.json({ error: 'only a message to the agents can be retried' }, 400);
-      if (providerConfig(db, masterKey) === undefined) {
+      if (askers.some((agent) => providerConfig(db, masterKey, agent) === undefined)) {
         return c.json({ error: 'set a provider base url, model and api key first' }, 400);
       }
       const refusal = askers.map((agent) => runner.atCapacity(agent.name)).find(Boolean);
       if (refusal !== undefined) return c.json({ error: refusal }, 429);
     }
+    const restored: FileChanges[] = [];
+    if (files) {
+      const now = Date.now();
+      const owners = fileOwners(conversationId);
+      for (const agent of owners) {
+        const found = await fileChanges(exec, agent, from, now).catch(() => undefined);
+        if (found === undefined) {
+          return c.json({ error: `there is no snapshot of ${agent.name}'s files from before that point` }, 409);
+        }
+      }
+      // The snapshot reads awaited, and a message, routine, trigger or idle tick may have started a turn.
+      const started = agents.find((agent) => runner.running(agent.name));
+      if (started !== undefined) {
+        return c.json({ error: `${started.name} is in the middle of a turn; stop it first` }, 409);
+      }
+      const already = () =>
+        restored.length === 0 ? '' : `, but ${restored.map((done) => done.agent).join(' and ')}'s files were already put back`;
+      for (const agent of owners) {
+        let changes: FileChanges | undefined;
+        try {
+          changes = await restoreFiles(exec, agent, from, now);
+        } catch (error) {
+          log.error('restoring files failed', { agent: agent.name, error });
+          return c.json({ error: `could not put ${agent.name}'s files back; the thread was left as it was${already()}` }, 500);
+        }
+        if (changes === undefined) {
+          return c.json({ error: `there is no snapshot of ${agent.name}'s files from before that point${already()}` }, 409);
+        }
+        restored.push(changes);
+      }
+      const late = agents.find((agent) => runner.running(agent.name));
+      if (late !== undefined) {
+        return c.json(
+          { error: `${late.name} started a turn while its files were put back; the files are restored, the thread is not` },
+          409,
+        );
+      }
+    }
     rewindConversation(db, conversationId, from);
+    for (const changes of restored) appendMessage(db, conversationId, { role: 'user', content: restoredLine(changes), sender: SYSTEM_SENDER });
     if (retry) for (const agent of askers) runner.start(agent, conversationId);
-    return c.json({ ok: true });
+    return c.json({ ok: true, ...(files ? { files: restored } : {}) });
   }
+
+  app.get('/api/agents/:name/rewind', async (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
+    return rewindPreview(c, conversationFor(db, agent.id));
+  });
+
+  app.get('/api/conversations/:id/rewind', async (c) => {
+    const conversation = conversationParam(db, c.req.param('id'));
+    if (conversation === undefined) return c.json({ error: 'no such conversation' }, 404);
+    return rewindPreview(c, conversation.id);
+  });
 
   app.post('/api/agents/:name/rewind', async (c) => {
     const agent = findAgent(db, c.req.param('name'));
@@ -1076,17 +1805,20 @@ export function createApp({
     if (busy !== undefined) {
       return c.json({ error: `${busy.name} is in the middle of a turn; stop it first` }, 409);
     }
-    const settings = providerConfig(db, masterKey);
-    if (settings === undefined) {
+    const settings = agents.map((agent) => providerConfig(db, masterKey, agent));
+    if (settings.some((entry) => entry === undefined)) {
       return c.json({ error: 'set a provider base url, model and api key first' }, 400);
     }
-    const provider = buildProvider(settings);
     const compacted: Record<string, number> = {};
-    for (const agent of agents) {
+    for (const [index, agent] of agents.entries()) {
       // The model call for the agent before gave the owner's next message time to start a turn.
       if (runner.running(agent.name)) {
         return c.json({ error: `${agent.name} is in the middle of a turn; stop it first` }, 409);
       }
+      const { provider } = withRetries({
+        primary: { provider: buildProvider(settings[index]!), modelId: undefined, name: '' },
+        baseMs: retryBaseMs,
+      });
       const result = await compactNow({ db, provider }, agent, conversationId);
       if ('error' in result) return c.json({ error: result.error }, 500);
       compacted[agent.name] = result.covered;
@@ -1119,28 +1851,65 @@ export function createApp({
 
   app.get('/api/approvals', (c) => c.json(listApprovals(db)));
 
-  /** Every thread at once, for a reader who remembers a phrase and not where it was said. */
-  app.get('/api/search', (c) => {
-    const needle = (c.req.query('q') ?? '').trim();
-    if (needle === '' || needle.length > MAX_SEARCH_CHARS) {
-      return c.json({ error: `q must be 1-${MAX_SEARCH_CHARS} characters` }, 400);
+  app.get('/api/needs-you', (c) => c.json(listNeedsYou(db)));
+
+  app.get('/api/goals', (c) => c.json<Goal[]>(listGoals(db)));
+
+  app.get('/api/goals/:id', (c) => {
+    const goal = findGoal(db, Number(c.req.param('id')));
+    return goal === undefined ? c.json({ error: 'no such goal' }, 404) : c.json(goal);
+  });
+
+  app.post('/api/goals/:id/finish', async (c) => {
+    const done = await finishGoal({ db, desktop, runner }, Number(c.req.param('id')));
+    return 'error' in done ? c.json({ error: done.error }, done.status) : c.json(done);
+  });
+
+  app.delete('/api/goals/:id', async (c) => {
+    const gone = await deleteGoal({ db, desktop, runner }, Number(c.req.param('id')));
+    return 'error' in gone ? c.json({ error: gone.error }, gone.status) : c.json(gone);
+  });
+
+  app.post('/api/goals/:id/helpers/:name/keep', (c) => {
+    const kept = keepHelper(db, Number(c.req.param('id')), c.req.param('name'));
+    return 'error' in kept ? c.json({ error: kept.error }, kept.status) : c.json(kept);
+  });
+
+  /** A question rather than a phrase: the default model reads it into filters over the index. */
+  app.post('/api/search', async (c) => {
+    const question = (stringField(await jsonBody(c), 'q') ?? '').trim();
+    if (question === '' || question.length > MAX_QUESTION_CHARS) {
+      return c.json({ error: `q must be 1-${MAX_QUESTION_CHARS} characters` }, 400);
     }
-    return c.json(searchMessages(db, needle));
+    const settings = providerConfig(db, masterKey);
+    const reader =
+      settings === undefined
+        ? undefined
+        : withRetries({ primary: { provider: buildProvider(settings), modelId: undefined, name: '' }, baseMs: retryBaseMs })
+            .provider;
+    return c.json<SearchAnswer>(await answerSearch(db, question, reader, Date.now()));
   });
 
   /** The owner's answer. Either way the request is gone afterwards and the agent that asked is
    * told, in the thread it asked in, so it learns the outcome the same way it learns anything. */
-  app.post('/api/approvals/:id', async (c) => {
-    const approval = findApproval(db, Number(c.req.param('id')));
-    if (approval === undefined) return c.json({ error: 'no such request' }, 404);
-    const approve = (await jsonBody(c))['approve'];
-    if (typeof approve !== 'boolean') return c.json({ error: 'approve must be true or false' }, 400);
+  const answered = { status: 200 as const, body: { ok: true as const } };
+  /** The owner's answer to an approval, from the app's buttons or a notification's. */
+  async function decide(
+    approval: Approval,
+    approve: boolean,
+    always: boolean,
+  ): Promise<{ status: 200 | 400 | 409; body: { ok: true } | { error: string } }> {
+    const allowed = alwaysAllowable(approval);
+    if (always && (!approve || allowed === undefined)) {
+      return { status: 400, body: { error: 'only an approved action with a site or recipient can be always allowed' } };
+    }
 
     const asker = findAgent(db, approval.agent);
     const target = approval.kind === 'agent' ? findAgent(db, approval.target) : undefined;
     const inFlight = [asker, target].find((agent) => agent !== undefined && runner.running(agent.name));
-    if (approve && inFlight !== undefined) {
-      return c.json({ error: `${inFlight.name} is in the middle of a turn; try again in a moment` }, 409);
+    // An action is not performed here, and its asker was told to carry on meanwhile.
+    if (approve && approval.kind !== 'action' && inFlight !== undefined) {
+      return { status: 409, body: { error: `${inFlight.name} is in the middle of a turn; try again in a moment` } };
     }
 
     dropApproval(db, approval.id);
@@ -1155,24 +1924,70 @@ export function createApp({
 
     if (!approve) {
       tellTheAsker(approval, `The owner said no to your request to ${describeApproval(approval)}.`);
-      return c.json({ ok: true });
+      return answered;
     }
 
+    if (approval.kind === 'action') {
+      if (asker !== undefined && readRules(db, asker).levels[approval.category] === 'hand_to_you') {
+        tellTheAsker(
+          approval,
+          `The owner saw your request to ${describeApproval(approval)} and will do it themselves. Do not do it.`,
+        );
+        return answered;
+      }
+      if (asker !== undefined && always && allowed !== undefined) {
+        alwaysAllow(db, asker, approval.category, allowed);
+      } else if (asker !== undefined) {
+        grantOnce(db, asker, approval);
+      }
+      const standing = always ? ` ${allowed} is on your pre-approved list to ${CATEGORY_WORDS[approval.category]} from now on.` : '';
+      tellTheAsker(approval, `${APPROVED}${describeApproval(approval)}${GO_AHEAD}${standing}`);
+      return answered;
+    }
     if (approval.kind === 'conversation') {
       deleteConversation(db, Number(approval.target));
-      return c.json({ ok: true });
+      return answered;
     }
     if (target === undefined) {
       tellTheAsker(approval, `The agent ${approval.target} was already gone, so nothing was deleted.`);
-      return c.json({ ok: true });
+      return answered;
     }
     // Told before it is done: deleting the asker takes the thread the answer would go in.
     tellTheAsker(approval, `The owner approved: ${approval.target} has been deleted.`);
     await removeAgent(target);
-    return c.json({ ok: true });
+    return answered;
+  }
+
+  app.post('/api/approvals/:id', async (c) => {
+    const approval = findApproval(db, Number(c.req.param('id')));
+    if (approval === undefined) return c.json({ error: 'no such request' }, 404);
+    const body = await jsonBody(c);
+    const approve = body['approve'];
+    if (typeof approve !== 'boolean') return c.json({ error: 'approve must be true or false' }, 400);
+    const always = body['always'] ?? false;
+    if (typeof always !== 'boolean') return c.json({ error: 'always must be true or false' }, 400);
+    const decided = await decide(approval, approve, always);
+    return c.json(decided.body, decided.status);
+  });
+
+  // What a notification button answers, with no app state: the item is found again by id, so a
+  // stale one (already answered from the app) is a 404 rather than a second answer.
+  app.post('/api/needs-you/:id/action', async (c) => {
+    const id = c.req.param('id');
+    const item = listNeedsYou(db).find((candidate) => candidate.id === id);
+    if (item === undefined) return c.json({ error: 'nothing is waiting under that id any more' }, 404);
+    const action = (await jsonBody(c))['action'];
+    if (typeof action !== 'string' || !item.actions.includes(action as NeedsYouAction)) {
+      return c.json({ error: `this item does not offer ${JSON.stringify(action)}` }, 400);
+    }
+    if (item.approval === undefined || !['approve', 'always', 'deny'].includes(action)) {
+      return c.json({ error: `${action} happens in the app` }, 400);
+    }
+    const decided = await decide(item.approval, action !== 'deny', action === 'always');
+    return c.json(decided.body, decided.status);
   });
 
   // The runner comes back out because the scheduler tick starts turns through it too, and it
   // cannot be built twice: the one-turn-per-agent set is process state inside this one.
-  return { app, runner };
+  return { app, runner, recorder };
 }

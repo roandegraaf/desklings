@@ -10,6 +10,8 @@ import {
   approvals,
   conversationParticipants,
   events,
+  forms,
+  formVault,
   messages,
   schedules,
   summaries,
@@ -42,7 +44,10 @@ export const MAX_DISPLAY = 999;
 export type DesktopOutcome = 'adopted' | 'started';
 
 export type DesktopOps = {
-  ensure(name: string, display: number): Promise<DesktopOutcome>;
+  /** `tag` starts an extra display on the same Linux user, for a helper with a screen of its own. */
+  ensure(name: string, display: number, tag?: string): Promise<DesktopOutcome>;
+  /** One display of this agent's user, and nothing else it runs. */
+  stopDisplay(name: string, display: number): Promise<void>;
   /** Everything this agent is running, stopped. Called when the agent is deleted: its display
    * number goes back in the pool, and an Xvnc still holding it would take the next agent's. */
   stop(name: string): Promise<void>;
@@ -59,15 +64,20 @@ export const systemDesktop: DesktopOps = {
     await run('sudo', ['-n', '-u', user, 'pkill', '-u', user]).catch(() => undefined);
   },
 
+  async stopDisplay(name, display) {
+    const user = `agent-${name}`;
+    await run('sudo', ['-n', '-u', user, 'pkill', '-u', user, '-f', `Xvnc :${display}( |$)`]).catch(() => undefined);
+  },
+
   async rename(from, to) {
     await run('sudo', ['-n', `${config.desktopScripts}/rename-agent-user.sh`, from, to]);
   },
 
-  async ensure(name, display) {
+  async ensure(name, display, tag) {
     await run('sudo', ['-n', `${config.desktopScripts}/create-agent-user.sh`, name]);
     const { stdout } = await run(
       `${config.desktopScripts}/start-desktop.sh`,
-      [name, String(display)],
+      [name, String(display), ...(tag === undefined ? [] : [tag])],
       {
         env: {
           ...process.env,
@@ -119,7 +129,7 @@ export function asAgent(target: AgentTarget, argv: readonly string[]): string[] 
 }
 
 function toAgent(row: typeof agents.$inferSelect): Agent {
-  const { label, look, profile, parentId, parentConversationId, ...rest } = row;
+  const { label, look, profile, parentId, parentConversationId, modelId, ...rest } = row;
   return {
     ...rest,
     state: row.state as AgentState,
@@ -128,7 +138,13 @@ function toAgent(row: typeof agents.$inferSelect): Agent {
     ...(profile === null ? {} : { profile }),
     ...(parentId === null ? {} : { parentId }),
     ...(parentConversationId === null ? {} : { parentConversationId }),
+    ...(modelId === null ? {} : { modelId }),
   };
+}
+
+/** A worker with an Xvnc display of its own, on its parent's Linux user: a goal's screen helper. */
+export function hasOwnScreen(agent: Agent): boolean {
+  return agent.display <= MAX_DISPLAY;
 }
 
 /** A task worker is an agent row with a parent. Everything else here is a permanent agent. */
@@ -227,7 +243,7 @@ export function renameAgent(db: Db, agent: Agent, name: string): Agent {
  * not null, so its row takes the next number above the range a desktop can use. `nextDisplay`
  * stops at `MAX_DISPLAY`, so the two allocators can never hand out the same number.
  */
-function nextWorkerDisplay(db: Db): number {
+export function nextWorkerDisplay(db: Db): number {
   return Math.max(MAX_DISPLAY, ...listAgents(db).map((agent) => agent.display)) + 1;
 }
 
@@ -252,13 +268,14 @@ export function insertWorker(
   parent: Agent,
   name: string,
   parentConversationId: number,
+  display?: number,
 ): Agent {
   return toAgent(
     db
       .insert(agents)
       .values({
         name,
-        display: nextWorkerDisplay(db),
+        display: display ?? nextWorkerDisplay(db),
         parentId: parent.id,
         parentConversationId,
         createdAt: Date.now(),
@@ -294,6 +311,8 @@ export function deleteAgent(db: Db, agent: Agent): void {
     .all();
 
   db.delete(approvals).where(eq(approvals.agentId, agent.id)).run();
+  db.delete(forms).where(eq(forms.agentId, agent.id)).run();
+  db.delete(formVault).where(eq(formVault.agentId, agent.id)).run();
   db.delete(schedules).where(eq(schedules.agentId, agent.id)).run();
   db.delete(events).where(eq(events.agentId, agent.id)).run();
   db.delete(conversationParticipants).where(eq(conversationParticipants.agentId, agent.id)).run();

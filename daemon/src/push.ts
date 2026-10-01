@@ -1,7 +1,7 @@
 import { createPrivateKey, sign } from 'node:crypto';
 import { connect } from 'node:http2';
 import { eq } from 'drizzle-orm';
-import type { Device } from '@schermes/shared';
+import type { Device, NeedsYouItem, PushCategory } from '@schermes/shared';
 import type { Db } from './db.ts';
 import { log } from './log.ts';
 import { devices } from './schema.ts';
@@ -19,7 +19,21 @@ export type PushNotification = {
   /** Groups the phone's notifications per agent. */
   agent?: string;
   conversationId?: number;
+  /** The Needs you item it is about, so a button on it can answer without the app. */
+  needsYou?: string;
+  category?: PushCategory;
 };
+
+/** Mirrors the app's button words: a deletion's yes deletes, a password's yes means the owner
+ * does it, any other action's yes lets the agent go ahead. */
+export function pushCategory(item: NeedsYouItem): PushCategory {
+  const approval = item.approval;
+  if (approval !== undefined) {
+    if (approval.kind !== 'action') return 'needs.delete';
+    return approval.category === 'passwords_security' ? 'needs.yours' : 'needs.approval';
+  }
+  return item.kind === 'hand_over' ? 'needs.watch' : 'needs.open';
+}
 
 export type PushResponse = { status: number; body: string };
 
@@ -115,23 +129,21 @@ function unregistered(response: PushResponse): boolean {
   return response.status === 410;
 }
 
+/** One token APNs is asked to deliver to, and how to forget it once Apple says it is gone. */
+export type PushTarget = { token: string; label: string; drop: () => void };
+
 /**
- * The notification to every registered device. A token Apple says is gone is dropped; any
+ * One payload to every target over one session. A token Apple says is gone is dropped; any
  * other failure is a log line, because a push is a nudge and the thread holds the truth.
  */
-export async function sendPush(deps: PushDeps, notification: PushNotification): Promise<{ sent: number; error?: string }> {
-  const targets = listDevices(deps.db);
+export async function sendEach(
+  deps: PushDeps,
+  targets: PushTarget[],
+  headers: (target: PushTarget, authorization: string) => Record<string, string>,
+  payload: string,
+): Promise<{ sent: number; error?: string }> {
   if (targets.length === 0) return { sent: 0 };
   const host = apnsHost(deps.config);
-  const payload = JSON.stringify({
-    aps: {
-      alert: { title: notification.title, body: notification.body.slice(0, MAX_PUSH_BODY_CHARS) },
-      sound: 'default',
-      'thread-id': notification.agent ?? 'schermes',
-    },
-    ...(notification.agent === undefined ? {} : { agent: notification.agent }),
-    ...(notification.conversationId === undefined ? {} : { conversationId: notification.conversationId }),
-  });
   let token: string;
   try {
     token = providerToken(deps.config);
@@ -144,35 +156,60 @@ export async function sendPush(deps: PushDeps, notification: PushNotification): 
   let sent = 0;
   let error: string | undefined;
   try {
-    for (const device of targets) {
-      const headers = {
-        ':method': 'POST',
-        ':path': `/3/device/${device.token}`,
-        authorization: `bearer ${token}`,
-        'apns-topic': deps.config.bundleId,
-        'apns-push-type': 'alert',
-        'apns-priority': '10',
-        'apns-expiration': '0',
-        'content-type': 'application/json',
-      };
+    for (const target of targets) {
       try {
-        const response = await send(host, headers, payload);
+        const response = await send(host, headers(target, `bearer ${token}`), payload);
         if (response.status === 200) {
           sent += 1;
         } else if (unregistered(response)) {
-          deleteDevice(deps.db, device.token);
-          log.info('push device dropped', { platform: device.platform, status: response.status });
+          target.drop();
+          log.info('push token dropped', { target: target.label, status: response.status });
         } else {
           error = `apns answered ${response.status}: ${response.body.slice(0, 200)}`;
-          log.error('push failed', { platform: device.platform, status: response.status, body: response.body.slice(0, 200) });
+          log.error('push failed', { target: target.label, status: response.status, body: response.body.slice(0, 200) });
         }
       } catch (caught) {
         error = caught instanceof Error ? caught.message : String(caught);
-        log.error('push failed', { platform: device.platform, error: caught });
+        log.error('push failed', { target: target.label, error: caught });
       }
     }
   } finally {
     session?.close();
   }
   return { sent, ...(error === undefined ? {} : { error }) };
+}
+
+/** The notification to every registered device. */
+export function sendPush(deps: PushDeps, notification: PushNotification): Promise<{ sent: number; error?: string }> {
+  const payload = JSON.stringify({
+    aps: {
+      alert: { title: notification.title, body: notification.body.slice(0, MAX_PUSH_BODY_CHARS) },
+      sound: 'default',
+      'thread-id': notification.agent ?? 'schermes',
+      ...(notification.category === undefined ? {} : { category: notification.category }),
+    },
+    ...(notification.needsYou === undefined ? {} : { needsYou: notification.needsYou }),
+    ...(notification.agent === undefined ? {} : { agent: notification.agent }),
+    ...(notification.conversationId === undefined ? {} : { conversationId: notification.conversationId }),
+  });
+  const targets = listDevices(deps.db).map((device) => ({
+    token: device.token,
+    label: device.platform,
+    drop: () => deleteDevice(deps.db, device.token),
+  }));
+  return sendEach(
+    deps,
+    targets,
+    (target, authorization) => ({
+      ':method': 'POST',
+      ':path': `/3/device/${target.token}`,
+      authorization,
+      'apns-topic': deps.config.bundleId,
+      'apns-push-type': 'alert',
+      'apns-priority': '10',
+      'apns-expiration': '0',
+      'content-type': 'application/json',
+    }),
+    payload,
+  );
 }

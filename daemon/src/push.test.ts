@@ -8,6 +8,8 @@ import { openDb } from './db.ts';
 import { APNS_TOKEN_TTL_MS, listDevices, providerToken, sendPush, upsertDevice } from './push.ts';
 import type { PushSend } from './push.ts';
 import { pushConfig, readPushSettings, seedPushKey } from './settings.ts';
+import { activityAttributes, activityPayload } from './liveactivity.ts';
+import type { Agent, LiveActivityState } from '@schermes/shared';
 
 const MIGRATIONS = resolve(import.meta.dirname, '../migrations');
 const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
@@ -89,4 +91,36 @@ test('a mounted AuthKey_<KEYID>.p8 is stored at boot with its id read off the na
   assert.equal(seedPushKey(db, masterKey, empty), false);
   assert.equal(seedPushKey(db, masterKey, join(dir, 'missing.p8')), false);
   assert.equal(readPushSettings(db).keySet, true, 'a bad mount keeps what is stored');
+});
+
+/** Pinned against `LiveActivityTests.swift`, which decodes these very strings: a key the widget
+ * does not know is a Live Activity that silently shows nothing. */
+const ACTIVITY_STATE_JSON = '{"title":"Ship the site","stepsDone":1,"stepsTotal":3,"needsYou":2,"state":"thinking"}';
+const ACTIVITY_ATTRIBUTES_JSON = '{"agent":"alpha","label":"Alpha","look":"cloud:teal"}';
+
+test('a live activity payload carries the content state the widget decodes, and start and end their extras', () => {
+  const state = JSON.parse(ACTIVITY_STATE_JSON) as LiveActivityState;
+  const attributes = activityAttributes({ name: 'alpha', label: 'Alpha', look: 'cloud:teal' } as Agent);
+  assert.equal(JSON.stringify(attributes), ACTIVITY_ATTRIBUTES_JSON);
+  assert.equal(JSON.stringify({ title: 'Ship the site', stepsDone: 1, stepsTotal: 3, needsYou: 2, state: 'thinking' } satisfies LiveActivityState), ACTIVITY_STATE_JSON);
+
+  const start = activityPayload({ event: 'start', attributes, state }, 1_700_000_000).aps as Record<string, unknown>;
+  assert.equal(JSON.stringify(start['content-state']), ACTIVITY_STATE_JSON);
+  assert.deepEqual(start, {
+    timestamp: 1_700_000_000,
+    event: 'start',
+    'content-state': state,
+    'attributes-type': 'AgentActivityAttributes',
+    attributes,
+    'input-push-token': 1,
+    alert: { title: 'Alpha', body: 'Ship the site' },
+  });
+  assert.deepEqual(activityPayload({ event: 'update', state }, 5).aps, { timestamp: 5, event: 'update', 'content-state': state });
+  assert.deepEqual(activityPayload({ event: 'end', state, dismissAt: 900 }, 6).aps, {
+    timestamp: 6,
+    event: 'end',
+    'content-state': state,
+    'dismissal-date': 900,
+  });
+  assert.equal(JSON.stringify(activityAttributes({ name: 'beta' } as Agent)), '{"agent":"beta","label":"beta"}');
 });

@@ -10,15 +10,43 @@ import {
   AGENT_NAME,
   agentTarget,
   asAgent,
+  deleteAgent,
   findAgent,
   findAgentById,
+  forgetAgent,
+  hasOwnScreen,
+  insertAgent,
   insertWorker,
   isWorker,
   listAgents,
+  nextDisplay,
   nextWorkerName,
   setAgentCosmetics,
   setAgentState,
 } from './agents.ts';
+import type { DesktopOps } from './agents.ts';
+import {
+  ADD_HELPER,
+  MAX_HELPERS,
+  UPDATE_GOAL,
+  addHelperRow,
+  addHelperToolDef,
+  applyGoalUpdate,
+  describeGoal,
+  finishGoal,
+  goalPrompt,
+  helperCount,
+  helperGoal,
+  helperProfile,
+  inheritFromLead,
+  isHelper,
+  leadGoal,
+  nextHelperName,
+  parseAddHelper,
+  parseGoalUpdate,
+  updateGoalToolDef,
+} from './goals.ts';
+import type { HelperRequest } from './goals.ts';
 import {
   MAX_AGENT_CHAIN,
   agentChain,
@@ -26,11 +54,13 @@ import {
   appendSummary,
   conversationFor,
   conversationWith,
+  existingConversation,
   lastMessageBy,
   lastMessageId,
   latestSummary,
   listConversations,
   listMessages,
+  listMessagesWithoutImages,
   parseSendMessage,
   pendingConversation,
   participantAgents,
@@ -42,11 +72,15 @@ import {
   MAX_PENDING_APPROVALS,
   describeApproval,
   insertApproval,
+  parseApprovalRequest,
   parseDeletionRequest,
   pendingCount,
+  requestApprovalToolDef,
   requestDeletionToolDef,
 } from './approvals.ts';
+import type { ApprovalRequest } from './approvals.ts';
 import { browse, browserToolDef, cdpConnect, parseBrowserAction } from './browser.ts';
+import type { BrowserTimings, Connect } from './browser.ts';
 import { computerToolDef, parseComputerAction, performComputerAction } from './computer.ts';
 import { homePrompt, loadHome, parseRemember, remember, rememberToolDef } from './home.ts';
 import {
@@ -57,8 +91,9 @@ import {
   profilePrompt,
   setProfileToolDef,
 } from './interview.ts';
-import { CONTROL_HELD, CONTROL_REFUSAL } from './control.ts';
+import { askForHandsToolDef, CONTROL_HELD, CONTROL_REFUSAL, parseHandsReason } from './control.ts';
 import type { Control } from './control.ts';
+import { captureForm, redactSecrets, requestFormToolDef } from './forms.ts';
 import type { Screen } from './computer.ts';
 import {
   cancelScheduleToolDef,
@@ -67,6 +102,7 @@ import {
   insertSchedule,
   listSchedules,
   listSchedulesToolDef,
+  nextRun,
   parseSchedule,
   parseScheduleId,
   pauseScheduleToolDef,
@@ -77,6 +113,9 @@ import {
 import { MCP_PREFIX } from './mcp.ts';
 import type { McpSession } from './mcp.ts';
 import { commandToolDef, parseCommand, runCommand } from './terminal.ts';
+import { LEAVE_NOTE, addIdleOutput, idleCommandRefusal, leaveNoteToolDef, parseNote } from './idle.ts';
+import { PROPOSE_TRIGGER, parseTriggerProposal, proposeTrigger, proposeTriggerToolDef, triggerPrompt } from './triggers.ts';
+import { guardCommand, readRules, rulesPrompt } from './rules.ts';
 import {
   NO_SEARCH_KEY,
   fetchPage,
@@ -90,6 +129,7 @@ import {
 import type { SearchConfig } from './web.ts';
 import type { Db } from './db.ts';
 import type { AgentTarget } from './agents.ts';
+import { snapshotWorkspace } from './snapshots.ts';
 import type { Exec } from './exec.ts';
 import type { ChatReply, Image, Provider, ProviderMessage } from './provider.ts';
 import { log } from './log.ts';
@@ -245,6 +285,25 @@ async function compact(
 }
 
 /**
+ * How close the agent's own thread is to compaction, 0–100: the measure `compact` takes, against
+ * the budget it takes it against. The system text is left out; it is built from the home, which
+ * is too slow to read on every poll of the agent list, and is small beside the budget.
+ *
+ * ponytail: each call scans every participant row, so a poll is O(agents × rows). Build the
+ * participant map once per poll if accumulated workers ever make the list slow.
+ */
+export function contextFullness(db: Db, agent: Agent): number {
+  const conversationId = existingConversation(db, [agent.id]);
+  if (conversationId === undefined) return 0;
+  const summary = latestSummary(db, conversationId, agent.name);
+  const replay =
+    summary === undefined ? undefined : { text: summary.content, throughId: summary.throughMessageId };
+  const stored = listMessagesWithoutImages(db, conversationId, replay?.throughId ?? 0);
+  const chars = projectedChars(transcript(agent.name, '', stored, replay));
+  return Math.min(100, Math.round((chars / MAX_TRANSCRIPT_CHARS) * 100));
+}
+
+/**
  * Writes one summary row standing for `covered`, which must be the rows straight after the newest
  * summary — that is what lets the previous summary be carried forward as the story so far rather
  * than re-read. Undefined when the model would not write one.
@@ -356,9 +415,20 @@ export function canTransition(from: AgentState, to: AgentState): boolean {
   return from === to || (TRANSITIONS[from] as readonly AgentState[]).includes(to);
 }
 
+/** What makes a turn an idle pass: its limits, and who hears when it is over. */
+export type IdleTurn = {
+  passId: number;
+  modelId: number | null;
+  turnCap: number;
+  /** Tokens this pass may still spend today. */
+  tokenLimit: number;
+  /** Called once the turn is over with what it spent, or with undefined when it never ran. */
+  end: (tokens: number | undefined) => Promise<void>;
+};
+
 /** Starts turns. The loop needs it so `send_message` can put the agent it wrote to to work. */
 export type Runner = {
-  start(agent: Agent, conversationId: number): void;
+  start(agent: Agent, conversationId: number, idle?: IdleTurn): void;
   /**
    * Why no loop can start right now, or undefined when there is room. Naming the agent that
    * would run matters: one already running is not another loop, because its message is picked
@@ -388,16 +458,25 @@ export type LoopDeps = {
   runner: Runner;
   control: Control;
   maxWorkers: number;
+  /** How the browser tool reaches Chromium; tests hand in a fake page and short timeouts. */
+  connect?: Connect;
+  browserTimings?: BrowserTimings;
   /** Fires when the owner stops the turn. */
   signal?: AbortSignal;
+  /** Set when this turn is an idle pass: a narrower tool set, a guard and limits. */
+  idle?: IdleTurn;
   /** Moves an agent to the name it asked for with set_name, once its turn is over. */
   rename?: ((agent: Agent, name: string) => Promise<void>) | undefined;
+  /** Starts and stops a goal helper's desktop; without it add_helper is refused. */
+  desktop?: DesktopOps | undefined;
   /** Hears what a permanent agent said at the end of a turn, and why one failed: the seam a
    * messaging channel hangs off. The thread it happened in is passed so the channel can decide
    * whether it is one the owner reads there. */
   deliver?:
     | ((agent: Agent, conversationId: number, text: string, kind: 'reply' | 'failure' | 'approval') => void)
     | undefined;
+  /** Hears that an agent changed its goal mid-turn. */
+  progress?: ((agent: Agent) => void) | undefined;
 };
 
 /** Writes the transition the moment it happens; the row, not this process, is the truth. */
@@ -456,19 +535,24 @@ function systemPrompt(
 }
 
 /**
- * Memory, the skills index and the agent's own schedules, read once per turn rather than once
+ * The rules, memory, the skills index and the agent's own schedules, read once per turn rather than once
  * per step, so the system text every step of a turn is handed is byte-identical and the prompt
  * cache holds. A home that cannot be read costs the agent its memory for this turn, not the turn
- * itself; the schedules come from the database and are always there.
+ * itself; the rules and the schedules come from the database and are always there.
  */
 async function homeTail(deps: LoopDeps, agent: Agent): Promise<string> {
   const schedules = schedulePrompt(listSchedules(deps.db, agent));
+  const standing =
+    agent.parentId === undefined
+      ? `${schedules}\n\n${triggerPrompt(deps.db, agent)}\n\n${goalPrompt(deps.db, agent)}`
+      : schedules;
+  const rules = rulesPrompt(readRules(deps.db, agent));
   try {
     const home = await loadHome(deps.exec, await agentTarget(deps.exec, agent));
-    return `${homePrompt(home)}\n\n${schedules}`;
+    return `${rules}\n\n${homePrompt(home)}\n\n${standing}`;
   } catch (error) {
     log.error('home unreadable, running without memory', { agent: agent.name, error });
-    return `${homePrompt({ memory: '', skills: [] })}\n\n${schedules}`;
+    return `${rules}\n\n${homePrompt({ memory: '', skills: [] })}\n\n${standing}`;
   }
 }
 
@@ -621,7 +705,7 @@ async function toolTarget(deps: LoopDeps, agent: Agent): Promise<AgentTarget> {
   const parent = findAgentById(deps.db, agent.parentId);
   if (parent === undefined) throw new Error(`${agent.name} has no parent to run as`);
   const target = await agentTarget(deps.exec, parent);
-  return { ...target, cwd: workerDir(target.home, agent.name) };
+  return { ...target, cwd: workerDir(target.home, agent.name), ...(hasOwnScreen(agent) ? { display: agent.display } : {}) };
 }
 
 /** Why no more workers may be spawned right now, or undefined. Live means neither `completed`
@@ -641,6 +725,135 @@ function cappedChain(db: Db, conversationId: number): string | undefined {
     ? undefined
     : `${MAX_AGENT_CHAIN} messages have passed between agents in this thread since the owner ` +
         'last spoke. Answer the owner instead.';
+}
+
+const refusal = (error: string): Observation => ({ text: `error: ${error}`, event: { ok: false, error } });
+
+/** `helper` makes it a goal's screen worker: an Xvnc display of its own on the lead's user. */
+async function spawnWorker(
+  deps: LoopDeps,
+  agent: Agent,
+  conversationId: number,
+  brief: string,
+  helper?: { goalId: number; reason: string; desktop: DesktopOps },
+): Promise<Observation> {
+  const refused = (): string | undefined =>
+    cappedWorkers(deps) ?? cappedChain(deps.db, conversationId) ?? deps.runner.atCapacity();
+  const early = refused();
+  if (early !== undefined) return refusal(early);
+
+  // The directory comes first: a worker whose --chdir does not exist turns every command it
+  // runs into a confusing error, and a row created before the mkdir failed would outlive it.
+  const target = await agentTarget(deps.exec, agent);
+  const name = nextWorkerName(deps.db, agent);
+  if (name === undefined) return refusal(`no name is left for another worker of ${agent.name}`);
+  const dir = workerDir(target.home, name);
+  const made = await deps.exec('sudo', asAgent(target, ['mkdir', '-p', dir]));
+  if (made.code !== 0) {
+    const error = `could not create ${dir}: ${made.stderr.trim()}`;
+    return { text: `error: ${error}`, event: { ok: false, error: 'no working directory' } };
+  }
+
+  // Asked again, and synchronous from here to the start: two agents spawning in overlapping
+  // turns both passed the check above before either of them took a slot, and a worker that
+  // is created but refused a loop would wait for one forever.
+  const late = refused();
+  if (late !== undefined) return refusal(late);
+
+  const display = helper === undefined ? undefined : nextDisplay(listAgents(deps.db).map((other) => other.display));
+  const worker = insertWorker(deps.db, agent, name, conversationId, display);
+  if (helper !== undefined && display !== undefined) {
+    addHelperRow(deps.db, helper.goalId, worker, 'worker', helper.reason);
+    const undo = async (error: string): Promise<Observation> => {
+      await helper.desktop.stopDisplay(agent.name, display).catch(() => undefined);
+      forgetAgent(deps.db, worker.name);
+      return refusal(error);
+    };
+    try {
+      await helper.desktop.ensure(agent.name, display, worker.name);
+    } catch (error) {
+      log.error('helper screen did not start', { worker: worker.name, display, error });
+      return undo(`the helper's screen did not start: ${(error as Error).message}`);
+    }
+    // The await above let other turns take the last loop; a worker refused one would wait forever.
+    const full = deps.runner.atCapacity();
+    if (full !== undefined) return undo(full);
+  }
+  const thread = conversationFor(deps.db, worker.id);
+  appendMessage(deps.db, thread, {
+    role: 'user',
+    content: `${brief}\n\nYour working directory is ${dir}; every command you run starts there.`,
+    sender: agent.name,
+  });
+  deps.runner.start(worker, thread);
+  const screen = display === undefined ? '' : `, with its own screen :${display}`;
+  return {
+    text: `Task worker ${worker.name} is on it, in ${dir}${screen}. Its result arrives later as a message from it.`,
+    event: { ok: true, worker: worker.name, dir, ...(helper === undefined ? {} : { helper: 'worker' }) },
+  };
+}
+
+function updateGoal(deps: LoopDeps, agent: Agent, args: Record<string, unknown>): Observation | Promise<Observation> {
+  if (isHelper(deps.db, agent)) return refusal('you are a helper on a goal; its lead keeps the plan');
+  const update = parseGoalUpdate(args);
+  if ('error' in update) return refusal(update.error);
+  if (update.finish && deps.desktop === undefined) return refusal('goals cannot be finished here');
+  const goal = applyGoalUpdate(deps.db, agent, update);
+  if ('error' in goal) return refusal(goal.error);
+  if (!update.finish || deps.desktop === undefined) {
+    return { text: describeGoal(goal), event: { ok: true, goal: goal.id } };
+  }
+  return finishGoal({ db: deps.db, desktop: deps.desktop, runner: deps.runner }, goal.id).then((done) =>
+    'error' in done
+      ? refusal(`the rest is saved, but the goal is not finished: ${done.error}`)
+      : { text: describeGoal(done), event: { ok: true, goal: done.id, finished: true } },
+  );
+}
+
+async function addHelper(deps: LoopDeps, agent: Agent, conversationId: number, request: HelperRequest): Promise<Observation> {
+  if (isHelper(deps.db, agent)) return refusal('a helper does not bring in helpers of its own; ask your lead');
+  const goal = leadGoal(deps.db, agent, request.goal);
+  if ('error' in goal) return refusal(goal.error);
+  const desktop = deps.desktop;
+  if (desktop === undefined) return refusal('helpers cannot be started here');
+  if (helperCount(deps.db, goal.id) >= MAX_HELPERS) {
+    return refusal(`goal ${goal.id} already has ${MAX_HELPERS} helpers`);
+  }
+  if (request.kind === 'worker') {
+    return spawnWorker(deps, agent, conversationId, request.brief, { goalId: goal.id, reason: request.reason, desktop });
+  }
+
+  const capped = deps.runner.atCapacity();
+  if (capped !== undefined) return refusal(capped);
+  const name = nextHelperName(deps.db, agent, goal);
+  if (!AGENT_NAME.test(name)) return refusal(`no name is left for a helper of ${agent.name}`);
+  const helper = insertAgent(deps.db, name, agent.look === undefined ? {} : { look: agent.look });
+  if (helper === undefined) return refusal(`${name} already exists`);
+  setAgentCosmetics(deps.db, name, { profile: helperProfile(agent, goal, request.reason) });
+  inheritFromLead(deps.db, agent, helper);
+  addHelperRow(deps.db, goal.id, helper, 'agent', request.reason);
+  const undo = async (error: string): Promise<Observation> => {
+    await desktop.stop(helper.name).catch(() => undefined);
+    deleteAgent(deps.db, helper);
+    return refusal(error);
+  };
+  try {
+    await desktop.ensure(helper.name, helper.display);
+  } catch (error) {
+    log.error('helper desktop did not start', { helper: name, error });
+    return undo(`the helper's desktop did not start: ${(error as Error).message}`);
+  }
+  const full = deps.runner.atCapacity();
+  if (full !== undefined) return undo(full);
+  const thread = conversationWith(deps.db, [agent.id, helper.id]);
+  appendMessage(deps.db, thread, { role: 'user', content: request.brief, sender: agent.name });
+  deps.runner.start(helper, thread);
+  return {
+    text:
+      `Temporary agent ${name} is on it, with its own Linux user and desktop. Its reply arrives later as a message ` +
+      'from it; write to it with send_message.',
+    event: { ok: true, helper: 'agent', agent: name, conversationId: thread },
+  };
 }
 
 /**
@@ -696,6 +909,10 @@ async function dispatch(
     if ('error' in request) {
       return { text: `error: ${request.error}`, event: { ok: false, error: request.error } };
     }
+    const refused = guardCommand(deps.db, agent, request.command);
+    if (refused !== undefined) {
+      return { text: `error: ${refused}`, event: { ok: false, error: 'refused by the rules' } };
+    }
     const target = await toolTarget(deps, agent);
     // The one tool a stop reaches into: a command can run for minutes, and an owner who
     // pressed stop is not waiting that out.
@@ -747,45 +964,15 @@ async function dispatch(
     if ('error' in request) {
       return { text: `error: ${request.error}`, event: { ok: false, error: request.error } };
     }
+    return spawnWorker(deps, agent, conversationId, request.brief);
+  }
 
-    const refused = (): string | undefined =>
-      cappedWorkers(deps) ?? cappedChain(deps.db, conversationId) ?? deps.runner.atCapacity();
-    const early = refused();
-    if (early !== undefined) return { text: `error: ${early}`, event: { ok: false, error: early } };
+  if (call.name === UPDATE_GOAL) return updateGoal(deps, agent, args);
 
-    // The directory comes first: a worker whose --chdir does not exist turns every command it
-    // runs into a confusing error, and a row created before the mkdir failed would outlive it.
-    const target = await agentTarget(deps.exec, agent);
-    const name = nextWorkerName(deps.db, agent);
-    if (name === undefined) {
-      const error = `no name is left for another worker of ${agent.name}`;
-      return { text: `error: ${error}`, event: { ok: false, error } };
-    }
-    const dir = workerDir(target.home, name);
-    const made = await deps.exec('sudo', asAgent(target, ['mkdir', '-p', dir]));
-    if (made.code !== 0) {
-      const error = `could not create ${dir}: ${made.stderr.trim()}`;
-      return { text: `error: ${error}`, event: { ok: false, error: 'no working directory' } };
-    }
-
-    // Asked again, and synchronous from here to the start: two agents spawning in overlapping
-    // turns both passed the check above before either of them took a slot, and a worker that
-    // is created but refused a loop would wait for one forever.
-    const late = refused();
-    if (late !== undefined) return { text: `error: ${late}`, event: { ok: false, error: late } };
-
-    const worker = insertWorker(deps.db, agent, name, conversationId);
-    const thread = conversationFor(deps.db, worker.id);
-    appendMessage(deps.db, thread, {
-      role: 'user',
-      content: `${request.brief}\n\nYour working directory is ${dir}; every command you run starts there.`,
-      sender: agent.name,
-    });
-    deps.runner.start(worker, thread);
-    return {
-      text: `Task worker ${worker.name} is on it, in ${dir}. Its result arrives later as a message from it.`,
-      event: { ok: true, worker: worker.name, dir },
-    };
+  if (call.name === ADD_HELPER) {
+    const request = parseAddHelper(args);
+    if ('error' in request) return { text: `error: ${request.error}`, event: { ok: false, error: request.error } };
+    return addHelper(deps, agent, conversationId, request);
   }
 
   // The two web tools are the only ones a task worker shares with a permanent agent. Neither
@@ -836,9 +1023,14 @@ async function dispatch(
       return { text: `error: ${request.error}`, event: { ok: false, error: request.error } };
     }
     const target = await agentTarget(deps.exec, agent);
-    const page = await browse(deps.exec, target, cdpConnect, request, MAX_OBSERVATION_CHARS);
+    const page = await browse(deps.exec, target, deps.connect ?? cdpConnect, request, MAX_OBSERVATION_CHARS, deps.browserTimings);
+    const restarted = page.restarted === true ? { restarted: true } : {};
     if ('error' in page) {
-      return { text: `error: ${page.error}`, event: { ok: false, action: request.action, error: page.error } };
+      const hung = page.hung === true ? { hung: true } : {};
+      return {
+        text: page.hung === true ? `error: ${page.error}. The owner has been asked to look at it; stop here.` : `error: ${page.error}`,
+        event: { ok: false, action: request.action, error: page.error, ...restarted, ...hung },
+      };
     }
     return {
       text: page.text,
@@ -847,6 +1039,7 @@ async function dispatch(
         action: request.action,
         ...(page.url === '' ? {} : { host: new URL(page.url).host }),
         chars: page.text.length,
+        ...restarted,
       },
     };
   }
@@ -880,6 +1073,44 @@ async function dispatch(
         `Asked the owner ${questions.length} question${questions.length === 1 ? '' : 's'}. ` +
         'Your turn ends here; the answers arrive as their next message.',
       event: { ok: true, questions: questions.length },
+    };
+  }
+
+  // Like `ask_owner`, the reason travels in the call's own arguments; Needs you and the chat
+  // card read it from there, and giving the screen back is the owner's next message.
+  if (call.name === 'ask_for_hands' && agent.parentId === undefined) {
+    const reason = parseHandsReason(args);
+    if (typeof reason !== 'string') {
+      return { text: `error: ${reason.error}`, event: { ok: false, error: reason.error } };
+    }
+    return {
+      text: 'Asked the owner to take the screen. Your turn ends here; you hear from them when they give it back.',
+      event: { ok: true },
+    };
+  }
+
+  // The daemon reads the form, not the model, so the origin the owner is shown is the page's own.
+  if (call.name === 'request_form' && agent.parentId === undefined) {
+    const reason = parseHandsReason(args);
+    if (typeof reason !== 'string') {
+      return { text: `error: ${reason.error}`, event: { ok: false, error: reason.error } };
+    }
+    const form = await captureForm(
+      deps.db,
+      deps.connect ?? cdpConnect,
+      { agentId: agent.id, display: agent.display, conversationId, callId: call.id, reason },
+      deps.browserTimings,
+    );
+    if ('error' in form) return { text: `error: ${form.error}`, event: { ok: false, error: form.error } };
+    const fields = form.fields.map((f) => f.label).join(', ');
+    const screen = form.unfillable.map((f) => f.label).join(', ');
+    return {
+      text:
+        `Asked the owner to fill the form on ${form.origin}` +
+        (fields === '' ? '' : `: ${fields}`) +
+        (screen === '' ? '.' : `. They do these on your screen: ${screen}.`) +
+        ' Your turn ends here; you hear from them when it is filled.',
+      event: { ok: true, origin: form.origin, fields: form.fields.length, unfillable: form.unfillable.length },
     };
   }
 
@@ -918,32 +1149,37 @@ async function dispatch(
     };
   }
 
-  // A worker asking to delete something would be asking about a machine it knows nothing
-  // about: it has one brief and no view of the agents around it.
+  // A worker asking the owner would be asking about a machine it knows nothing about: it has
+  // one brief and no view of the agents around it.
   if (call.name === 'request_deletion' && agent.parentId === undefined) {
     const request = parseDeletionRequest(deps.db, agent, args);
     if ('error' in request) {
       return { text: `error: ${request.error}`, event: { ok: false, error: request.error } };
     }
-    if (pendingCount(deps.db) >= MAX_PENDING_APPROVALS) {
-      const error = `${MAX_PENDING_APPROVALS} requests are already waiting for the owner`;
-      return { text: `error: ${error}`, event: { ok: false, error } };
-    }
-    const asked = insertApproval(deps.db, agent, conversationId, {
+    return standingRequest(deps, agent, conversationId, {
       ...request,
       target: request.kind === 'conversation' ? String(conversationId) : request.target,
     });
-    recordEvent(deps.db, agent.id, 'approval', {
-      asked: asked.id,
-      kind: asked.kind,
-      target: asked.target,
-    });
-    deps.deliver?.(agent, conversationId, `Asks to ${describeApproval(asked)}: ${asked.reason}`, 'approval');
+  }
+
+  if (call.name === 'request_approval' && agent.parentId === undefined) {
+    const request = parseApprovalRequest(args);
+    if ('error' in request) {
+      return { text: `error: ${request.error}`, event: { ok: false, error: request.error } };
+    }
+    return standingRequest(deps, agent, conversationId, request);
+  }
+
+  if (call.name === PROPOSE_TRIGGER && agent.parentId === undefined) {
+    const proposal = parseTriggerProposal(args);
+    const created = 'error' in proposal ? proposal : proposeTrigger(deps.db, agent, proposal, Date.now());
+    if ('error' in created) return { text: `error: ${created.error}`, event: { ok: false, error: created.error } };
     return {
       text:
-        `Asked the owner to ${describeApproval(asked)}. Nothing has been deleted. The answer ` +
-        'arrives here as a message; carry on with the rest of your work, or end your turn.',
-      event: { ok: true, approval: asked.id, kind: asked.kind, target: asked.target },
+        `Proposed as trigger ${created.id}. ` +
+        (created.kind === 'imap' ? 'The owner enters the mailbox login in a form you never see. ' : '') +
+        'Nothing fires until the owner turns it on; ask them to, and once it is on, offer to test it together.',
+      event: { ok: true, trigger: created.id, kind: created.kind },
     };
   }
 
@@ -973,6 +1209,117 @@ async function dispatch(
   }
 
   return { text: `error: no tool named ${call.name}`, event: { ok: false, error: 'unknown tool' } };
+}
+
+/** What an idle pass may call. Everything that sends, spends, clicks or runs someone else's
+ * code (computer, browser, web, MCP, messages, workers) is withheld. */
+const IDLE_TOOLS = new Set([
+  'run_command',
+  'remember',
+  'schedule_task',
+  'list_schedules',
+  'request_deletion',
+  'request_approval',
+  LEAVE_NOTE,
+]);
+
+function idleToolDefs() {
+  return [
+    commandToolDef(),
+    rememberToolDef(),
+    scheduleTaskToolDef(),
+    listSchedulesToolDef(),
+    requestDeletionToolDef(),
+    requestApprovalToolDef(),
+    leaveNoteToolDef(),
+  ];
+}
+
+/** An idle pass's tool call: refused unless it is one of the four outputs or a read. */
+async function idleDispatch(
+  deps: LoopDeps,
+  agent: Agent,
+  call: ToolCall,
+  conversationId: number,
+  idle: IdleTurn,
+): Promise<Observation> {
+  const refuse = (error: string): Observation => ({
+    text: `error: ${error}`,
+    event: { ok: false, error: 'refused during idle work' },
+  });
+  if (!IDLE_TOOLS.has(call.name)) {
+    return refuse(`${call.name} is not available during idle work, which never sends, deletes, spends or installs`);
+  }
+  let args: Record<string, unknown>;
+  try {
+    args = JSON.parse(call.arguments) as Record<string, unknown>;
+    if (args === null || typeof args !== 'object' || Array.isArray(args)) throw new Error();
+  } catch {
+    return dispatch(deps, agent, call, conversationId, undefined);
+  }
+
+  if (call.name === LEAVE_NOTE) {
+    const text = parseNote(args);
+    if (typeof text !== 'string') return { text: `error: ${text.error}`, event: { ok: false, error: text.error } };
+    addIdleOutput(deps.db, idle.passId, { kind: 'note', text });
+    return { text: 'Left for the owner to read in the morning.', event: { ok: true } };
+  }
+  if (call.name === 'schedule_task') {
+    const request = parseSchedule(args);
+    const error =
+      'error' in request ? request.error : nextRun(request.cron, Date.now()) === undefined ? `${request.cron} has no next run` : undefined;
+    if (error !== undefined || 'error' in request) return { text: `error: ${error}`, event: { ok: false, error } };
+    addIdleOutput(deps.db, idle.passId, { kind: 'routine', cron: request.cron, prompt: request.prompt });
+    return {
+      text: 'Suggested to the owner. It is not scheduled: it runs only once they turn it on.',
+      event: { ok: true, suggested: true },
+    };
+  }
+  if (call.name === 'run_command') {
+    const command = args['command'];
+    const refused = typeof command === 'string' ? idleCommandRefusal(command) : undefined;
+    if (refused !== undefined) return refuse(refused);
+  }
+  if (call.name === 'remember' && args['scope'] !== 'lasting') {
+    return refuse('during idle work only lasting memory is written, so the owner can undo it');
+  }
+  if (call.name === 'request_approval' && args['category'] !== 'delete_files') {
+    return refuse('during idle work the only thing to ask for is a cleanup: category delete_files, or request_deletion');
+  }
+
+  const observation = await dispatch(deps, agent, call, conversationId, undefined);
+  const approval = observation.event['approval'];
+  if (observation.event['ok'] === true && typeof approval === 'number') {
+    addIdleOutput(deps.db, idle.passId, { kind: 'cleanup', approvalId: approval });
+  }
+  return observation;
+}
+
+function standingRequest(
+  deps: LoopDeps,
+  agent: Agent,
+  conversationId: number,
+  request: ApprovalRequest,
+): Observation {
+  if (pendingCount(deps.db) >= MAX_PENDING_APPROVALS) {
+    const error = `${MAX_PENDING_APPROVALS} requests are already waiting for the owner`;
+    return { text: `error: ${error}`, event: { ok: false, error } };
+  }
+  const asked = insertApproval(deps.db, agent, conversationId, request);
+  recordEvent(deps.db, agent.id, 'approval', {
+    asked: asked.id,
+    kind: asked.kind,
+    category: asked.category,
+    target: asked.target,
+  });
+  deps.deliver?.(agent, conversationId, `Asks to ${describeApproval(asked)}: ${asked.reason}`, 'approval');
+  const nothingYet = asked.kind === 'action' ? 'Do not do it yet.' : 'Nothing has been deleted.';
+  return {
+    text:
+      `Asked the owner to ${describeApproval(asked)}. ${nothingYet} The answer ` +
+      'arrives here as a message; carry on with the rest of your work, or end your turn.',
+    event: { ok: true, approval: asked.id, kind: asked.kind, category: asked.category, target: asked.target },
+  };
 }
 
 const SCHEDULE_TOOLS = new Set(['schedule_task', 'list_schedules', 'pause_schedule', 'cancel_schedule']);
@@ -1104,7 +1451,9 @@ export async function runAgent(
   // A worker shares its parent's X display, so giving it the computer tool would put two loops
   // on one mouse. It gets the terminal and nothing else, and it cannot spawn workers of its own.
   const builtin =
-    parent === undefined
+    deps.idle !== undefined
+      ? idleToolDefs()
+      : parent === undefined
       ? [
           computerToolDef(deps.screen),
           commandToolDef(),
@@ -1118,12 +1467,22 @@ export async function runAgent(
           webSearchToolDef(),
           webFetchToolDef(),
           browserToolDef(),
+          requestApprovalToolDef(),
           requestDeletionToolDef(),
           askOwnerToolDef(),
+          askForHandsToolDef(),
+          requestFormToolDef(),
+          proposeTriggerToolDef(),
+          updateGoalToolDef(),
+          addHelperToolDef(),
           setProfileToolDef(),
           setNameToolDef(),
         ]
+      : hasOwnScreen(agent)
+      ? [computerToolDef(deps.screen), commandToolDef(), webSearchToolDef(), webFetchToolDef()]
       : [commandToolDef(), webSearchToolDef(), webFetchToolDef()];
+  const snapshot =
+    parent === undefined ? snapshotWorkspace(deps.exec, agent, lastMessageId(db), Date.now(), deps.signal) : undefined;
   // The row, not the argument: the profile is written mid-turn by set_profile, and the next
   // turn's prompt has to carry it.
   const system =
@@ -1134,7 +1493,7 @@ export async function runAgent(
           others.map((other) => other.name),
           await homeTail(deps, agent),
         )
-      : workerPrompt(agent, parent.name);
+      : workerPrompt(agent, parent.name, helperGoal(db, agent));
   // Anything that lands after this belongs to the next turn. Splicing an arrival into a turn
   // already under way would answer it halfway through someone else's question; the runner
   // starts a fresh turn for it before it lets go of the agent.
@@ -1151,16 +1510,21 @@ export async function runAgent(
     system,
     history,
   );
+  // Before an MCP server starts: it runs as the agent and may write into the home.
+  await snapshot;
   // Connected here, with the system text and the replay, for the reason they are: every step of
   // this turn is handed the same tool list, so the request head the prompt cache keys on does
   // not change between steps. A worker gets none of them — it has no Linux user of its own, so a
   // stdio server would run as its parent, and it is one job that is never started again.
-  const mcp = parent === undefined ? await mcpSession(deps, agent) : undefined;
+  const mcp = parent === undefined && deps.idle === undefined ? await mcpSession(deps, agent) : undefined;
   const tools = mcp === undefined ? builtin : [...builtin, ...mcp.tools];
   let wrote = false;
   let spawned = false;
   let refused = false;
   let asked = false;
+  let stuck = false;
+  let hands: string | undefined;
+  let formOn: string | undefined;
   let rename: string | undefined;
   let steps = 0;
   const usage = { promptTokens: 0, completionTokens: 0 };
@@ -1238,22 +1602,35 @@ export async function runAgent(
         recordEvent(db, agent.id, 'tool_call', summarise(call));
         const acting = STATE_FOR_TOOL[call.name];
         if (acting !== undefined) transition(db, agent, acting);
-        const observation: Observation = await dispatch(deps, agent, call, conversationId, mcp).catch(
+        const observation: Observation = await (
+          deps.idle === undefined
+            ? dispatch(deps, agent, call, conversationId, mcp)
+            : idleDispatch(deps, agent, call, conversationId, deps.idle)
+        ).catch(
           (error: Error) => ({ text: `error: ${error.message}`, event: { ok: false, error: error.message } }),
         );
         if (observation.event['ok'] === true && call.name === 'send_message') wrote = true;
         if (observation.event['ok'] === true && call.name === 'spawn_task_worker') spawned = true;
+        if (observation.event['helper'] === 'worker') spawned = true;
+        if (observation.event['helper'] === 'agent') wrote = true;
         if (observation.event['ok'] === true && call.name === 'ask_owner') asked = true;
+        if (observation.event['hung'] === true && call.name === 'browser') stuck = true;
+        if (observation.event['ok'] === true && call.name === 'ask_for_hands') {
+          hands = parseHandsReason(JSON.parse(call.arguments) as Record<string, unknown>) as string;
+        }
+        if (observation.event['ok'] === true && call.name === 'request_form') formOn = String(observation.event['origin']);
         if (observation.event['ok'] === true && call.name === 'set_name') rename = String(observation.event['name']);
         if (observation.event['error'] === CONTROL_HELD) refused = true;
         appendMessage(db, conversationId, {
           role: 'tool',
-          content: observation.text,
+          // Whatever a tool reads back, a value the owner typed into a secret field is not in it.
+          content: redactSecrets((parent ?? agent).id, observation.text),
           sender: agent.name,
           toolCallId: call.id,
           ...(observation.image === undefined ? {} : { image: observation.image }),
         });
         recordEvent(db, agent.id, 'tool_result', { callId: call.id, ...observation.event });
+        if (call.name === UPDATE_GOAL && observation.event['ok'] === true) deps.progress?.(agent);
       }
 
       // A human took the mouse. Every call in this reply still got its result — a reply asking
@@ -1269,6 +1646,30 @@ export async function runAgent(
       if (asked && parent === undefined) {
         transition(db, agent, 'waiting_for_user');
         deps.deliver?.(agent, conversationId, reply.text.trim() || 'Has questions for you.', 'reply');
+        return;
+      }
+      if (hands !== undefined && parent === undefined) {
+        transition(db, agent, 'waiting_for_user');
+        deps.deliver?.(agent, conversationId, `Asks you to take the screen: ${hands}`, 'reply');
+        return;
+      }
+      if (formOn !== undefined && parent === undefined) {
+        transition(db, agent, 'waiting_for_user');
+        deps.deliver?.(agent, conversationId, `Asks you to fill a form on ${formOn}`, 'reply');
+        return;
+      }
+      // The browser did not come back after its restart: the owner's three ways out are on a
+      // card in the chat and in Needs you, and nothing the model tries next can reach the page.
+      if (stuck && parent === undefined) {
+        transition(db, agent, 'waiting_for_user');
+        deps.deliver?.(agent, conversationId, 'Its browser stopped answering.', 'reply');
+        return;
+      }
+      if (
+        deps.idle !== undefined &&
+        (steps >= deps.idle.turnCap || usage.promptTokens + usage.completionTokens >= deps.idle.tokenLimit)
+      ) {
+        transition(db, agent, 'waiting_for_user');
         return;
       }
       if (deps.signal?.aborted) return halt();
@@ -1295,6 +1696,7 @@ export async function runAgent(
     // What the turn cost, on every way out. The tokens are only what the endpoint reported;
     // one that reports nothing leaves the count of model calls, which is still a cost.
     recordEvent(db, agent.id, 'turn', { steps, ...(metered ? usage : {}) });
+    await deps.idle?.end(usage.promptTokens + usage.completionTokens);
     // Every way out of the turn, not only the last line of the happy one: a stdio session left
     // open is a child process that outlives the turn that started it.
     await mcp?.close();
@@ -1317,8 +1719,9 @@ export type RunnerDeps = {
   db: Db;
   exec: Exec;
   screen: Screen;
-  /** Undefined until the owner has stored a base url, a model and an api key. */
-  provider: () => Provider | undefined;
+  /** Undefined until the owner has stored a base url, a model and an api key. `modelId` picks a
+   * registry model other than the agent's own. */
+  provider: (agent: Agent, modelId?: number) => Provider | undefined;
   /** The web search endpoint and its key, or undefined while no key is stored. */
   search: () => SearchConfig | undefined;
   /** One turn's MCP tools, connected when the turn starts and dropped when it ends. */
@@ -1329,7 +1732,13 @@ export type RunnerDeps = {
   maxLoops: number;
   maxWorkers: number;
   deliver?: NonNullable<LoopDeps['deliver']> | undefined;
+  progress?: LoopDeps['progress'];
+  /** Hears a permanent agent's turns begin and end, idle passes left out. */
+  turn?: ((agent: Agent, phase: 'start' | 'end') => void) | undefined;
   rename?: LoopDeps['rename'];
+  desktop?: DesktopOps | undefined;
+  connect?: Connect;
+  browserTimings?: BrowserTimings;
 };
 
 // One agent piling up messages faster than it answers them still has to let go eventually.
@@ -1361,7 +1770,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       : `at most ${deps.maxLoops} agent loops can run at once; wait for one to finish`;
   }
 
-  function start(agent: Agent, conversationId: number): void {
+  function start(agent: Agent, conversationId: number, idle?: IdleTurn): void {
     // A busy agent is not refused. The message is already a row, and the drain below finds it.
     if (busy.has(agent.name)) return;
     const refusal = atCapacity(agent.name);
@@ -1372,10 +1781,15 @@ export function createRunner(deps: RunnerDeps): Runner {
       return;
     }
     busy.add(agent.name);
-    void drain(agent, conversationId);
+    const told = idle === undefined && agent.parentId === undefined;
+    if (told) deps.turn?.(agent, 'start');
+    void drain(agent, conversationId, idle).finally(() => {
+      if (told) deps.turn?.(agent, 'end');
+    });
   }
 
-  async function drain(agent: Agent, conversationId: number): Promise<void> {
+  /** `idle` shapes the first round only; what arrives meanwhile gets an ordinary turn. */
+  async function drain(agent: Agent, conversationId: number, idle?: IdleTurn): Promise<void> {
     // A round covers its own thread up to the moment it started, and nothing in any other:
     // measuring every round against the global maximum left a second thread written to during
     // the first round unanswered until the owner spoke again.
@@ -1383,18 +1797,27 @@ export function createRunner(deps: RunnerDeps): Runner {
     const covered = new Map<number, number>();
     for (let round = 0; round < MAX_ROUNDS; round += 1) {
       covered.set(conversationId, lastMessageId(deps.db));
-      const provider = deps.provider();
+      const turnIdle = round === 0 ? idle : undefined;
+      const provider = deps.provider(agent, turnIdle?.modelId ?? undefined);
       if (provider === undefined) {
         log.error('no provider configured, turn dropped', { agent: agent.name });
         busy.delete(agent.name);
+        void turnIdle?.end(undefined);
         return;
       }
 
       const controller = new AbortController();
       stops.set(agent.name, controller);
       try {
+        // An idle pass tells nobody anything: no push for its reply or its cleanup requests.
         await runAgent(
-          { ...deps, provider, runner, signal: controller.signal },
+          {
+            ...deps,
+            provider,
+            runner,
+            signal: controller.signal,
+            ...(turnIdle === undefined ? {} : { idle: turnIdle, deliver: undefined, progress: undefined }),
+          },
           agent,
           conversationId,
         );

@@ -44,19 +44,32 @@ func newestId(_ loaded: [Message]) -> Int? {
     loaded.last?.id
 }
 
+/// Every call on the page by its id, so the result rows that answer them are matched by lookup
+/// rather than by a scan of the page per row.
+func callIndex(_ loaded: [Message]) -> [String: ToolCall] {
+    var calls: [String: ToolCall] = [:]
+    for message in loaded {
+        for call in message.toolCalls ?? [] where calls[call.id] == nil { calls[call.id] = call }
+    }
+    return calls
+}
+
 /// A page is a window on the rows, not on the turns, so a boundary can hand a reader a tool
 /// result whose assistant message is on the page before it. It renders as itself with a note, and
 /// the missing half arrives when the reader walks back one more page.
-func isOrphanTool(_ message: Message, _ loaded: [Message]) -> Bool {
+func isOrphanTool(_ message: Message, calls: [String: ToolCall]) -> Bool {
     guard message.role == .tool, let callId = message.toolCallId else { return false }
-    return !loaded.contains { $0.toolCalls?.contains { $0.id == callId } == true }
+    return calls[callId] == nil
+}
+
+func isOrphanTool(_ message: Message, _ loaded: [Message]) -> Bool {
+    isOrphanTool(message, calls: callIndex(loaded))
 }
 
 /// The call a tool result answers, when the assistant half of the turn is on the page. A result
 /// row carries only the call's id, so an orphan has no call to find.
 func toolCall(for message: Message, in loaded: [Message]) -> ToolCall? {
-    guard let callId = message.toolCallId else { return nil }
-    return loaded.lazy.compactMap { $0.toolCalls?.first { $0.id == callId } }.first
+    message.toolCallId.flatMap { callIndex(loaded)[$0] }
 }
 
 func toolName(for message: Message, in loaded: [Message]) -> String? {
@@ -64,11 +77,15 @@ func toolName(for message: Message, in loaded: [Message]) -> String? {
 }
 
 /// A screenshot the agent took to show the owner, with `show: true`, rather than only to look.
-func isShown(_ message: Message, in loaded: [Message]) -> Bool {
-    guard message.image != nil, let call = toolCall(for: message, in: loaded),
+func isShown(_ message: Message, calls: [String: ToolCall]) -> Bool {
+    guard message.image != nil, let callId = message.toolCallId, let call = calls[callId],
           let arguments = try? JSONSerialization.jsonObject(with: Data(call.arguments.utf8)) as? [String: Any]
     else { return false }
     return arguments["show"] as? Bool == true
+}
+
+func isShown(_ message: Message, in loaded: [Message]) -> Bool {
+    isShown(message, calls: callIndex(loaded))
 }
 
 /// `AGENT_NAME` in `daemon/src/agents.ts`: `^[a-z0-9][a-z0-9-]{0,30}$` in words rather than as a
@@ -154,6 +171,12 @@ func groupAgents(_ agents: [Agent]) -> [AgentTree] {
         }
 }
 
+/// The workers still mid-task, which are the ones worth pinning in the parent's chat: finished
+/// ones accumulate forever and stay folded away in the list.
+func activeWorkers(of agent: Agent, in agents: [Agent]) -> [Agent] {
+    agents.filter { $0.parentId == agent.id && $0.state.busy }
+}
+
 /// The thread an agent shares with nobody but the owner is reached through the agent itself, so
 /// the list shows only the ones it shares with somebody.
 func sharedConversations(_ conversations: [Conversation], _ name: String) -> [Conversation] {
@@ -186,7 +209,7 @@ extension AgentState {
 /// says what it is, rather than loose in the fold.
 enum ChatItem: Identifiable {
     case message(Message, shown: [Base64Image] = [])
-    case tools([Message])
+    case tools([ToolStep])
 
     var id: String {
         switch self {
@@ -198,28 +221,201 @@ enum ChatItem: Identifiable {
     var first: Message {
         switch self {
         case .message(let message, _): message
-        case .tools(let run): run[0]
+        case .tools(let run): run[0].message
         }
     }
 }
 
+/// One row of a tool run, with the call it answers already looked up on the page.
+struct ToolStep: Hashable, Identifiable {
+    var message: Message
+    var name: String?
+    var orphaned: Bool
+    var id: Int { message.id }
+}
+
 /// `breaks` starts a fresh item at a row something has to be drawn above: a day, the unread mark.
 func chatItems(_ loaded: [Message], breaks: (Message) -> Bool = { _ in false }) -> [ChatItem] {
+    let calls = callIndex(loaded)
     var items: [ChatItem] = []
+    var run: [ToolStep] = []
     var shown: [Message] = []
+    func fold() {
+        if !run.isEmpty { items.append(.tools(run)) }
+        run = []
+    }
     for message in loaded {
-        if isShown(message, in: loaded) { shown.append(message) }
+        if isShown(message, calls: calls) { shown.append(message) }
         if message.hasBubble {
+            fold()
             let own = message.role == .assistant ? shown.filter { $0.sender == message.sender } : []
             items.append(.message(message, shown: own.compactMap(\.image)))
             shown.removeAll { $0.sender == message.sender }
-        } else if !breaks(message), case .tools(let run) = items.last {
-            items[items.count - 1] = .tools(run + [message])
         } else {
-            items.append(.tools([message]))
+            if breaks(message) { fold() }
+            run.append(ToolStep(
+                message: message,
+                name: message.toolCallId.flatMap { calls[$0]?.name },
+                orphaned: isOrphanTool(message, calls: calls)
+            ))
         }
     }
+    fold()
     return items
+}
+
+/// The rows a day starts at, by id.
+func dayStarts(_ loaded: [Message]) -> Set<Int> {
+    let calendar = Calendar.current
+    var starts: Set<Int> = []
+    var previous: Date?
+    for message in loaded {
+        let day = Date(timeIntervalSince1970: Double(message.createdAt) / 1000)
+        if previous.map({ !calendar.isDate($0, inSameDayAs: day) }) ?? true { starts.insert(message.id) }
+        previous = day
+    }
+    return starts
+}
+
+/// What the chat draws, worked out once when the rows or the reader's mark change rather than on
+/// every redraw: SwiftUI evaluates a body far more often than the rows change, and a thread of
+/// hundreds of rows cannot afford a walk of the page per row each time.
+struct ChatRows {
+    var items: [ChatItem] = []
+    var dayStarts: Set<Int> = []
+    var unreadId: Int?
+    /// By reply id: the row after the owner's message it answered, which is where a retry cuts.
+    var retryFrom: [Int: Int] = [:]
+    var interview: Interview?
+    /// The tool row that said the browser stayed hung after its restart, while the owner hasn't answered it.
+    var browserHang: Int?
+    /// The agent's unanswered `ask_for_hands`, by the rule Needs you uses.
+    var handOver: HandOver?
+    /// The agent's unanswered `request_form`, by the same rule.
+    var form: PendingForm?
+    /// The agent's newest trigger proposal, until the owner writes after it fired.
+    var trigger: PendingTrigger?
+
+    init() {}
+
+    init(_ loaded: [Message], mark: Int) {
+        let starts = Schermes.dayStarts(loaded)
+        let unread = firstUnread(in: loaded, after: mark)
+        dayStarts = starts
+        unreadId = unread
+        items = chatItems(loaded, breaks: { starts.contains($0.id) || $0.id == unread })
+        var prompt: Int?
+        for message in loaded {
+            if message.role == .user {
+                prompt = message.id
+            } else if message.role == .assistant, let prompt {
+                retryFrom[message.id] = prompt + 1
+            }
+        }
+        interview = pendingInterview(in: loaded)
+        browserHang = pendingBrowserHang(in: loaded)
+        handOver = pendingHandOver(in: loaded)
+        form = pendingForm(in: loaded)
+        trigger = pendingTrigger(in: loaded)
+    }
+}
+
+/// A `propose_trigger` the daemon stored, and how far its test has got in the transcript. The
+/// trigger itself (state, URL, login) comes from the triggers listing.
+struct PendingTrigger: Hashable {
+    let callId: String
+    let triggerId: Int
+    /// The daemon's "Trigger N is on" line, the newest one.
+    var turnedOn: Int?
+    /// The first "Trigger N fired" row after that line.
+    var firedAt: Int?
+}
+
+/// The newest trigger proposal. Once it fired after being turned on, the owner writing again ends the test.
+func pendingTrigger(in loaded: [Message]) -> PendingTrigger? {
+    guard let index = loaded.lastIndex(where: { $0.role == .assistant && $0.toolCalls?.contains { $0.name == "propose_trigger" } == true }),
+          let call = loaded[index].toolCalls?.last(where: { $0.name == "propose_trigger" }),
+          let result = loaded.first(where: { $0.role == .tool && $0.toolCallId == call.id }),
+          let match = result.content.firstMatch(of: /^Proposed as trigger (\d+)\./),
+          let id = Int(match.1)
+    else { return nil }
+    var pending = PendingTrigger(callId: call.id, triggerId: id)
+    for message in loaded[index...] {
+        if message.isTriggerLine, message.content.hasPrefix("Trigger \(id) is on:") {
+            pending.turnedOn = message.id
+            pending.firedAt = nil
+        } else if pending.turnedOn != nil, pending.firedAt == nil, message.isTriggerLine,
+                  message.content.hasPrefix("Trigger \(id) fired:") {
+            pending.firedAt = message.createdAt
+        } else if pending.firedAt != nil, message.isOwner {
+            return nil
+        }
+    }
+    return pending
+}
+
+struct HandOver: Hashable {
+    let callId: String
+    let reason: String
+}
+
+private struct AskForHandsArguments: Decodable {
+    var reason: String
+}
+
+/// The newest `ask_for_hands` call, unless it was refused or the owner wrote after it (giving the
+/// screen back writes that line).
+func pendingHandOver(in loaded: [Message]) -> HandOver? {
+    for message in loaded.reversed() {
+        if message.isOwner { return nil }
+        guard message.role == .assistant,
+              let call = message.toolCalls?.first(where: { $0.name == "ask_for_hands" })
+        else { continue }
+        guard let result = loaded.first(where: { $0.role == .tool && $0.toolCallId == call.id }),
+              !result.content.hasPrefix("error:"),
+              let data = call.arguments.data(using: .utf8),
+              let parsed = try? JSONDecoder().decode(AskForHandsArguments.self, from: data)
+        else { return nil }
+        let reason = parsed.reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return reason.isEmpty ? nil : HandOver(callId: call.id, reason: reason)
+    }
+    return nil
+}
+
+/// A `request_form` call still waiting. The fields aren't in the transcript: the Needs you item
+/// whose `messageId` is `messageId` carries them.
+struct PendingForm: Hashable {
+    let callId: String
+    let messageId: Int
+}
+
+/// The newest `request_form` call, unless it was refused or the owner wrote after it (the fill and
+/// giving the screen back both write a line).
+func pendingForm(in loaded: [Message]) -> PendingForm? {
+    for message in loaded.reversed() {
+        if message.isOwner { return nil }
+        guard message.role == .assistant,
+              let call = message.toolCalls?.first(where: { $0.name == "request_form" })
+        else { continue }
+        guard let result = loaded.first(where: { $0.role == .tool && $0.toolCallId == call.id }),
+              !result.content.hasPrefix("error:")
+        else { return nil }
+        return PendingForm(callId: call.id, messageId: message.id)
+    }
+    return nil
+}
+
+/// How the daemon's browser tool starts its answer when a restart did not bring the browser back
+/// (`BROWSER_HUNG` in `browser.ts`); Needs you finds the hang by the same words.
+let browserHungPrefix = "error: your browser stopped answering"
+
+/// The newest hung-browser tool row, unless the owner wrote after it (the restart routes write that line).
+func pendingBrowserHang(in loaded: [Message]) -> Int? {
+    for message in loaded.reversed() {
+        if message.isOwner { return nil }
+        if message.role == .tool, message.content.hasPrefix(browserHungPrefix) { return message.id }
+    }
+    return nil
 }
 
 struct InterviewOption: Decodable, Hashable {
@@ -311,6 +507,18 @@ func interviewAnswers(_ content: String) -> [InterviewAnswer]? {
 /// The owner's word for whoever wrote a row, for a thread where that is worth saying.
 func speaker(of message: Message, among members: [Agent]) -> String? {
     message.sender.map { titles(members)[$0] ?? $0 }
+}
+
+/// The name over a bubble. An agent's own rows in its own thread carry none. A `user` row with
+/// a sender in a two-agent thread is one writing to the other, and reads nothing like that
+/// agent's reply to the owner unless the label says so.
+func speakerLabel(of message: Message, own: String?, among members: [Agent]) -> String? {
+    guard let sender = message.sender, sender != own else { return nil }
+    let name = titles(members)[sender] ?? sender
+    if message.role == .user, members.count == 2, let other = members.first(where: { $0.name != sender }) {
+        return "\(name) to \(other.title)"
+    }
+    return name
 }
 
 /// "Ran 2 shell commands, called browser 3 times". Results are not counted: each answers a call.

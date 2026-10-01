@@ -20,9 +20,6 @@ private func body(_ value: some Encodable) throws -> [String: JSONValue] {
 
 @Test func theSettingsBodyDecodesAsBothHalves() throws {
     let settings = try stored()
-    #expect(settings.provider.baseUrl == "https://api.example.com/v1")
-    #expect(settings.provider.apiKeySet)
-    #expect(settings.provider.extraBody == #"{"reasoning":{"effort":"high"}}"#)
     #expect(settings.web.searchUrl.isEmpty)
     #expect(!settings.web.searchKeySet)
     #expect(settings.push.keyId == "K1" && settings.push.sandbox && !settings.push.keySet)
@@ -36,23 +33,15 @@ private func body(_ value: some Encodable) throws -> [String: JSONValue] {
 
 @Test func aPageSendsItsOwnFieldsAndNoOthers() throws {
     var form = SettingsForm(try stored())
-    #expect(form.apiKey.isEmpty && form.searchKey.isEmpty && form.pushKey.isEmpty)
+    #expect(form.searchKey.isEmpty && form.pushKey.isEmpty)
 
-    // An empty field still goes: that is how a search endpoint or extra body is cleared. A field
-    // another page owns must not, or saving here would overwrite what that page holds.
-    #expect(try body(form.modelUpdate) == [
-        "baseUrl": .string("https://api.example.com/v1"),
-        "model": .string("m"),
-        "extraBody": .string(#"{"reasoning":{"effort":"high"}}"#),
-    ])
+    // An empty field still goes: that is how a search endpoint is cleared. A field another page
+    // owns must not, or saving here would overwrite what that page holds.
     #expect(try body(form.webUpdate) == ["searchUrl": .string("")])
     #expect(try body(form.pushUpdate) == ["pushKeyId": .string("K1")])
 
-    form.apiKey = "sk-new"
     form.searchKey = "brave"
     form.pushKey = "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
-    #expect(try Set(body(form.modelUpdate).keys) == ["baseUrl", "model", "extraBody", "apiKey"])
-    #expect(try body(form.modelUpdate)["apiKey"] == .string("sk-new"))
     #expect(try Set(body(form.webUpdate).keys) == ["searchUrl", "searchKey"])
     #expect(try body(form.webUpdate)["searchKey"] == .string("brave"))
     #expect(try Set(body(form.pushUpdate).keys) == ["pushKeyId", "pushKey"])
@@ -66,9 +55,9 @@ private func body(_ value: some Encodable) throws -> [String: JSONValue] {
     #expect(typedJSON("{“a”:") == "{“a”:")
     #expect(typedJSON("") == "")
 
-    var form = SettingsForm(try stored())
-    form.extraBody = "{“reasoning”:{“effort”:“low”}}"
-    #expect(try body(form.modelUpdate)["extraBody"] == .string(#"{"reasoning":{"effort":"low"}}"#))
+    var draft = ModelDraft()
+    draft.extraBody = "{“reasoning”:{“effort”:“low”}}"
+    #expect(draft.update(from: nil).extraBody == #"{"reasoning":{"effort":"low"}}"#)
 
     #expect(try mcpServers(fromDraft: "[{“name”: “files”, “command”: “npx”}]") == [
         McpServerDraft(name: "files", transport: .stdio, command: "npx"),
@@ -178,3 +167,78 @@ private func body(_ value: some Encodable) throws -> [String: JSONValue] {
     #expect(McpTestResult(ok: false, tools: [], error: "spawn nope ENOENT").report == "spawn nope ENOENT")
     #expect(McpTestResult(ok: false, tools: []).report == "Could not be reached")
 }
+
+#if os(macOS)
+import AppKit
+import SwiftUI
+
+/// ⌘, has no `Settings` scene behind it: the app menu item posts `.showSettings` and the console's
+/// `settingsSheet` presents. A `Text` stands in for the pages, which would call the daemon.
+@MainActor
+@Suite(.serialized) struct SettingsCommandTests {
+    struct Host: View {
+        @State private var request: SettingsRequest?
+
+        var body: some View {
+            Color.clear.settingsSheet($request) { _ in Text("Settings").frame(width: 200, height: 100) }
+        }
+    }
+
+    @Test func appMenuHasSettingsWithCommandComma() throws {
+        let items = try #require(NSApp.mainMenu).items.flatMap { $0.submenu?.items ?? [] }
+        let settings = try #require(items.first { $0.title == "Settings…" })
+        #expect(settings.keyEquivalent == ",")
+        #expect(settings.keyEquivalentModifierMask == .command)
+    }
+
+    @Test func settingsCommandOpensTheSheet() async throws {
+        SettingsRequest.pending = false
+        let window = NSWindow(
+            contentRect: CGRect(x: -30000, y: -30000, width: 800, height: 600),
+            styleMask: [.borderless], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: Host())
+        window.orderFrontRegardless()
+        // A closed window keeps its host, which would still hear `.showSettings`.
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(window.attachedSheet == nil)
+        NotificationCenter.default.post(name: .showSettings, object: nil)
+        for _ in 0..<40 where window.attachedSheet == nil {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let sheet = try #require(window.attachedSheet)
+        window.endSheet(sheet)
+    }
+
+    @Test func settingsCommandWithTheConsoleClosedOpensItAndTheSheet() async throws {
+        var opened = false
+        SettingsRequest.ask(consoleWindow: nil) { opened = true }
+        #expect(opened)
+        #expect(SettingsRequest.pending)
+
+        let window = NSWindow(
+            contentRect: CGRect(x: -30000, y: -30000, width: 800, height: 600),
+            styleMask: [.borderless], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: Host())
+        window.orderFrontRegardless()
+        // A closed window keeps its host, which would still hear `.showSettings`.
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        for _ in 0..<40 where window.attachedSheet == nil {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let sheet = try #require(window.attachedSheet)
+        window.endSheet(sheet)
+        #expect(!SettingsRequest.pending)
+    }
+}
+#endif

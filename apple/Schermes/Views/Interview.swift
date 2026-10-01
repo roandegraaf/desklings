@@ -75,26 +75,25 @@ struct InterviewCard: View {
             HStack(spacing: 8) {
                 if step > 0 {
                     Button("Back") { move(-1) }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.pill(.secondary))
                 }
                 Spacer()
                 if last {
                     Button(sending ? "Sending…" : "Answer", action: answer)
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.pill(.primary))
                         .disabled(sending || !anyAnswer)
                 } else if answered(step) {
                     Button("Next") { move(1) }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.pill(.primary))
                 } else {
                     Button("Skip") { move(1) }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.pill(.secondary))
                 }
             }
             .controlSize(.small)
         }
-        .padding(14)
+        .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: .rect(cornerRadius: 16))
     }
 
     private func question(_ index: Int, _ question: InterviewQuestion) -> some View {

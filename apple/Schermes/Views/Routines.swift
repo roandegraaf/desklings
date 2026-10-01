@@ -18,11 +18,11 @@ struct RoutinesView: View {
     }
 
     var body: some View {
-        Form {
+        ThemedForm {
             Section {
                 if let schedules {
                     if schedules.isEmpty {
-                        Text("Nothing scheduled.").foregroundStyle(.secondary)
+                        Text("Nothing scheduled.").foregroundStyle(Theme.muted)
                     }
                     ForEach(schedules) { schedule in
                         RoutineRow(schedule: schedule) { pause(schedule, $0) }
@@ -42,6 +42,10 @@ struct RoutinesView: View {
                 Text("Each one starts a turn in \(agent.title)'s thread with you, with its prompt, whether or not anyone is awake. Resuming counts the next run from now rather than making up the runs it missed.")
             }
 
+            if agent.parentId == nil {
+                TriggersSection(session: session, agent: agent)
+            }
+
             Section {
                 TextField("Cron", text: $cron, prompt: Text("0 7 * * 1-5"))
                     .font(.body.monospaced())
@@ -50,10 +54,11 @@ struct RoutinesView: View {
                     .textInputAutocapitalization(.never)
                     .keyboardType(.numbersAndPunctuation)
                     #endif
+                    .formLabel("Cron")
                 if let words = cadence(cron) {
                     Text(words)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Theme.muted)
                 }
                 TextField(
                     "Prompt",
@@ -62,22 +67,22 @@ struct RoutinesView: View {
                     axis: .vertical
                 )
                 .lineLimit(2...6)
-                Button(adding ? "Adding…" : "Add routine", action: add)
+                Button(adding ? "Adding…" : "Add routine", systemImage: "plus", action: add)
+                    .buttonStyle(.pill(.primary))
                     .disabled(adding || !ready)
                 // Under the button rather than in a section of its own, which a phone draws below
                 // the fold: a cron the daemon refuses is an expected path and this is its only answer.
                 if let trouble {
                     Text(trouble)
                         .font(.footnote)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(Theme.failed)
                 }
             } header: {
-                Text("New routine")
+                Text("New routine").formHeader()
             } footer: {
                 Text("A cron is read on the daemon's clock. Next runs are shown on yours.")
             }
         }
-        .formStyle(.grouped)
         .task(id: agent.name) {
             while !Task.isCancelled {
                 if let rows = try? await session.run({ try await $0.schedules(agent: agent.name) }) {
@@ -150,7 +155,7 @@ struct RoutineRow: View {
                     Text(words).font(.headline)
                     Text(schedule.cron)
                         .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Theme.muted)
                 } else {
                     Text(schedule.cron).font(.headline.monospaced())
                 }
@@ -159,7 +164,7 @@ struct RoutineRow: View {
                     .lineLimit(3)
                 Text(timing)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Theme.muted)
             }
             .opacity(schedule.paused ? 0.55 : 1)
 
@@ -179,5 +184,130 @@ struct RoutineRow: View {
 
     private func moment(_ millis: Int) -> String {
         Date(timeIntervalSince1970: Double(millis) / 1000).formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
+/// Main's "Routines and triggers": the agent's schedules and triggers as small cards that open the
+/// routines page, and "Ask <agent> to set one up". The inspector shows it, and so does the settings page.
+struct RoutinesSummary: View {
+    let session: Session
+    let agent: Agent
+    /// What the cards sit in: white on the inspector's panel, the ground inside a white card.
+    var cardFill: Token = Theme.card
+
+    @Environment(AgentLooks.self) private var looks
+    @Environment(\.colorScheme) private var scheme
+    @State private var schedules: [Schedule]?
+    @State private var triggers: [Trigger]?
+    @State private var routinesOpen = false
+    @State private var asking = false
+    @State private var trouble: String?
+
+    var body: some View {
+        let palette = looks[agent.name].palette(dark: scheme == .dark)
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Routines and triggers").font(.sectionTitle)
+            if let schedules, let triggers {
+                ForEach(schedules) { schedule in
+                    routineCard(
+                        symbol: "clock",
+                        title: schedule.prompt,
+                        detail: [cadence(schedule.cron) ?? schedule.cron, schedule.paused ? "paused" : "next at " + clock(schedule.nextRunAt)]
+                            .joined(separator: " · "),
+                        palette: palette
+                    )
+                }
+                ForEach(triggers) { trigger in
+                    routineCard(
+                        symbol: trigger.kind.symbol,
+                        title: trigger.reason,
+                        detail: trigger.kindWord + " · " + state(trigger),
+                        palette: palette
+                    )
+                }
+                if schedules.isEmpty && triggers.isEmpty {
+                    Text("Nothing scheduled and nothing watched.")
+                        .font(.canvas(12, .caption))
+                        .foregroundStyle(Theme.muted)
+                }
+            } else {
+                ProgressView().frame(maxWidth: .infinity)
+            }
+            Button(action: askForRoutine) {
+                Label("Ask \(agent.title) to set one up", systemImage: "bolt")
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.pill(.soft(looks[agent.name].color)))
+            .disabled(asking)
+            if let trouble {
+                Text(trouble).font(.caption).foregroundStyle(Theme.failed)
+            }
+        }
+        .task(id: agent.name) {
+            while !Task.isCancelled {
+                async let polledSchedules = try? session.run { try await $0.schedules(agent: agent.name) }
+                async let polledTriggers = try? session.run { try await $0.triggers(agent: agent.name) }
+                if let rows = await polledSchedules { schedules = rows }
+                if let rows = await polledTriggers { triggers = rows }
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+        .sheet(isPresented: $routinesOpen) {
+            RoutinesAndActivity(session: session, agent: agent, page: .routines)
+        }
+    }
+
+    private func routineCard(symbol: String, title: String, detail: String, palette: AgentPalette) -> some View {
+        Button { routinesOpen = true } label: {
+            HStack(spacing: 10) {
+                Image(systemName: symbol)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(palette.softText.color)
+                    .frame(width: 30, height: 30)
+                    .background(palette.soft.color, in: .rect(cornerRadius: 9))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.canvas(13, .footnote, weight: .semibold))
+                    Text(detail).font(.canvas(12, .caption)).foregroundStyle(Theme.muted)
+                }
+                .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .background(cardFill, in: .rect(cornerRadius: 14))
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens routines and triggers")
+    }
+
+    private func state(_ trigger: Trigger) -> String {
+        switch trigger.state {
+        case .proposed: trigger.needsLogin ? "waiting for the login" : "proposed"
+        case .on: "on"
+        case .off: "off"
+        }
+    }
+
+    private func clock(_ millis: Int) -> String {
+        Date(timeIntervalSince1970: Double(millis) / 1000).formatted(date: .omitted, time: .shortened)
+    }
+
+    /// The same path as Profile's "Ask": a message in its thread, so the agent proposes the routine
+    /// or trigger in the chat, where the owner switches it on.
+    private func askForRoutine() {
+        guard !asking else { return }
+        asking = true
+        trouble = nil
+        Task {
+            do {
+                _ = try await session.run {
+                    try await $0.send(.agent(agent.name), text: "Is there a routine or a trigger that would help with what you do for me? Propose one I can switch on.")
+                }
+            } catch {
+                if !error.isCancellation { trouble = error.localizedDescription }
+            }
+            asking = false
+        }
     }
 }

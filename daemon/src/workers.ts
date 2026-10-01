@@ -1,5 +1,6 @@
-import type { Agent } from '@schermes/shared';
-import { isWorker, listAgents } from './agents.ts';
+import type { Agent, Goal } from '@schermes/shared';
+import { hasOwnScreen, isWorker, listAgents } from './agents.ts';
+import { describeGoal } from './goals.ts';
 import type { Db } from './db.ts';
 import type { ToolDef } from './provider.ts';
 
@@ -64,14 +65,19 @@ export function spawnWorkerToolDef(): ToolDef {
  * because that line is how the smoke run's scripted endpoint tells transcripts apart, and names
  * itself a task worker, which is how it tells the two kinds apart.
  */
-export function workerPrompt(worker: Agent, parentName: string): string {
-  return [
+export function workerPrompt(worker: Agent, parentName: string, goal?: Goal): string {
+  const screen = hasOwnScreen(worker)
+    ? [`The computer tool drives a screen of your own, display :${worker.display}, as its Linux user.`]
+    : ['You have no desktop.'];
+  const intro = [
     `You are ${worker.name}, a task worker on this machine.`,
     `${parentName} spawned you to do one job and report back to it.`,
     'run_command runs shell commands as its Linux user, starting in your own working directory',
-    'under its workspace; web_search finds pages and web_fetch reads one as text. You have no',
-    'desktop and no other tools, and nobody else can write to',
+    'under its workspace; web_search finds pages and web_fetch reads one as text.',
+    ...screen,
+    'You have no other tools, and nobody else can write to',
     'you. Do the job, then reply in plain text with the result: that reply is everything',
     `${parentName} will ever see of your work, so say what you did and how it went.`,
   ].join(' ');
+  return goal === undefined ? intro : `${intro}\n\nYou are a helper on this goal:\n${describeGoal(goal)}`;
 }

@@ -62,8 +62,13 @@ done
 exit 0
 `;
 
+// With a heading as `$3`, the line lands under it: the heading is written first unless it is
+// already the file's last one.
 const APPEND_SCRIPT = `set -eu
 mkdir -p "$1"
+if [ $# -ge 3 ] && [ "$(grep '^## ' "$1/$2" 2>/dev/null | tail -n 1)" != "$3" ]; then
+  { [ -s "$1/$2" ] && echo; printf '%s\\n' "$3"; } >> "$1/$2"
+fi
 cat >> "$1/$2"
 `;
 
@@ -239,12 +244,15 @@ export async function remember(
   exec: Exec,
   target: AgentTarget,
   request: RememberRequest,
+  heading?: string,
 ): Promise<{ path: string } | { error: string }> {
   const dir = `${target.home}/memory`;
   const file =
     request.scope === 'lasting' ? 'MEMORY.md' : dailyNote();
   // The line goes in on stdin. Nothing the model wrote is ever an argument, let alone a path.
-  const argv = asAgent(target, ['bash', '-c', APPEND_SCRIPT, HOME_APPEND, dir, file]);
+  const argv = asAgent(target, [
+    'bash', '-c', APPEND_SCRIPT, HOME_APPEND, dir, file, ...(heading === undefined ? [] : [heading]),
+  ]);
   const result = await exec('sudo', argv, { input: `- ${request.text}\n` });
   return result.code === 0
     ? { path: `${dir}/${file}` }

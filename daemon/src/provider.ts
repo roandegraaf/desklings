@@ -1,5 +1,5 @@
 import { setTimeout as sleep } from 'node:timers/promises';
-import type { LiveReply, ToolCall } from '@schermes/shared';
+import type { LiveReply, RetryState, ToolCall } from '@schermes/shared';
 import { log } from './log.ts';
 
 /**
@@ -8,17 +8,37 @@ import { log } from './log.ts';
  * stream that goes silent for this long is dead.
  */
 export const IDLE_TIMEOUT_MS = 120_000;
-const RETRY_DELAY_MS = 2_000;
+export const MAX_ATTEMPTS = 5;
+export const RETRY_BASE_MS = 2_000;
+const MAX_WAIT_MS = 120_000;
 const ERROR_BODY_CHARS = 500;
 
 /** A failure the endpoint reported, and whether asking once more can reasonably go differently. */
 export class ProviderError extends Error {
   readonly retryable: boolean;
+  readonly status: number | undefined;
+  readonly retryAfterMs: number | undefined;
 
-  constructor(message: string, retryable: boolean) {
+  constructor(message: string, retryable: boolean, status?: number, retryAfterMs?: number) {
     super(message);
     this.retryable = retryable;
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
   }
+}
+
+/** A key the endpoint refused. Asking again with the same key cannot go differently. */
+export function isAuthFailure(error: unknown): boolean {
+  return error instanceof ProviderError && (error.status === 401 || error.status === 403);
+}
+
+/** Seconds or an HTTP date, as RFC 9110 allows; anything else is no hint. */
+export function parseRetryAfter(value: string | null, now = Date.now()): number | undefined {
+  if (value === null || value.trim() === '') return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
 }
 
 function retryableStatus(status: number): boolean {
@@ -209,6 +229,7 @@ async function readStream(
       throw new ProviderError(
         `provider stream failed: ${detail.slice(0, ERROR_BODY_CHARS)}`,
         typeof code === 'number' && retryableStatus(code),
+        typeof code === 'number' ? code : undefined,
       );
     }
     const choices = field(chunk, 'choices');
@@ -242,7 +263,7 @@ async function readStream(
 export function openAiProvider(settings: ProviderConfig): Provider {
   const url = `${settings.baseUrl.replace(/\/+$/, '')}/chat/completions`;
 
-  const request: Provider = async (messages, tools, onDelta, signal) => {
+  return async (messages, tools, onDelta, signal) => {
     const controller = new AbortController();
     const stop = () => controller.abort(signal?.reason);
     if (signal?.aborted) stop();
@@ -287,6 +308,8 @@ export function openAiProvider(settings: ProviderConfig): Provider {
         throw new ProviderError(
           `provider returned HTTP ${status}: ${detail.slice(0, ERROR_BODY_CHARS)}`,
           retryableStatus(status),
+          status,
+          parseRetryAfter(response.headers.get('retry-after')),
         );
       }
 
@@ -305,24 +328,99 @@ export function openAiProvider(settings: ProviderConfig): Provider {
         toolCalls: parseToolCalls(field(message, 'tool_calls')),
         ...(usage === undefined ? {} : { usage }),
       };
+    } catch (error) {
+      // A timeout or a dropped socket is the endpoint's moment, not the request; a call the
+      // owner stopped is neither and goes out as it came in.
+      if (error instanceof ProviderError || signal?.aborted) throw error;
+      throw new ProviderError(error instanceof Error ? error.message : String(error), true);
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', stop);
     }
   };
+}
 
-  // One retry, for the failures that are the endpoint's moment rather than the request: a
-  // timeout, a dropped socket, a 429 or a 5xx. A request the endpoint rejected outright is
-  // going to be rejected again, and a call the owner stopped is not asked again either.
-  return async (messages, tools, onDelta, signal) => {
+/** One model a turn can call: the provider, and which registry entry it came from. */
+export type ModelCall = { provider: Provider; modelId: number | undefined; name: string };
+
+/** The owner's two levers over a call that is waiting: only while it waits do they do anything. */
+export type RetryControl = { now(): boolean; useBackup(): boolean };
+
+export type RetryOptions = {
+  primary: ModelCall;
+  /** Offered while waiting, never switched to on its own and never for a refused key. */
+  backup?: ModelCall | undefined;
+  /** The wait being shown, or undefined once there is none. */
+  onWait?: (state: RetryState | undefined) => void;
+  onAuthFailure?: (call: ModelCall, error: ProviderError) => void;
+  onSuccess?: (call: ModelCall) => void;
+  baseMs?: number;
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+};
+
+/**
+ * Up to `MAX_ATTEMPTS` calls for the failures that are the endpoint's moment rather than the
+ * request: a timeout, a dropped socket, a 429 or a 5xx. The wait doubles from `baseMs` unless the
+ * endpoint said how long with `Retry-After`. A stop cuts the wait; so does "Retry now", and "Use
+ * backup model" moves the rest of this turn onto the backup. Anything else fails at once.
+ */
+export function withRetries(options: RetryOptions): { provider: Provider; control: RetryControl } {
+  const { primary, backup, baseMs = RETRY_BASE_MS } = options;
+  const pause = options.sleep ?? ((ms, signal) => sleep(ms, undefined, { signal }));
+  let current = primary;
+  let wake: AbortController | undefined;
+  const control: RetryControl = {
+    now: () => {
+      if (wake === undefined) return false;
+      wake.abort();
+      return true;
+    },
+    useBackup: () => {
+      if (wake === undefined || backup === undefined || current === backup) return false;
+      current = backup;
+      wake.abort();
+      return true;
+    },
+  };
+
+  const provider: Provider = async (messages, tools, onDelta, signal) => {
     try {
-      return await request(messages, tools, onDelta, signal);
-    } catch (error) {
-      if (signal?.aborted) throw error;
-      if (error instanceof ProviderError && !error.retryable) throw error;
-      log.info('provider call failed, retrying once', { error });
-      await sleep(RETRY_DELAY_MS);
-      return request(messages, tools, onDelta, signal);
+      for (let attempt = 1; ; attempt += 1) {
+        const using = current;
+        try {
+          const reply = await using.provider(messages, tools, onDelta, signal);
+          options.onSuccess?.(using);
+          return reply;
+        } catch (error) {
+          if (signal?.aborted || !(error instanceof ProviderError)) throw error;
+          if (isAuthFailure(error)) options.onAuthFailure?.(using, error);
+          if (!error.retryable) throw error;
+          if (attempt >= MAX_ATTEMPTS) {
+            throw new ProviderError(`after ${attempt} attempts, ${error.message}`, true, error.status);
+          }
+          const wait = Math.min(error.retryAfterMs ?? baseMs * 2 ** (attempt - 1), MAX_WAIT_MS);
+          wake = new AbortController();
+          options.onWait?.({
+            attempt: attempt + 1,
+            of: MAX_ATTEMPTS,
+            retryAt: Date.now() + wait,
+            error: error.message,
+            model: using.name,
+            ...(backup === undefined || current === backup ? {} : { backup: backup.name }),
+          });
+          log.info('provider call failed, retrying', { attempt, wait, error });
+          try {
+            await pause(wait, signal === undefined ? wake.signal : AbortSignal.any([signal, wake.signal]));
+          } catch (stopped) {
+            if (signal?.aborted) throw signal.reason ?? stopped;
+          } finally {
+            wake = undefined;
+          }
+        }
+      }
+    } finally {
+      options.onWait?.(undefined);
     }
   };
+  return { provider, control };
 }
