@@ -613,6 +613,15 @@ test('the command classifier finds deletes and installs in command position only
   }
 });
 
+test('the command classifier treats Object.prototype names as plain commands', () => {
+  for (const name of Object.getOwnPropertyNames(Object.prototype)) {
+    assert.deepEqual(classifyCommand(name), [], name);
+    assert.deepEqual(classifyCommand(`${name} install x -g`), [], name);
+  }
+  assert.deepEqual(classifyCommand('brew install jq').map((found) => found.target), ['jq']);
+  assert.deepEqual(classifyCommand('pnpm add -g tsx').map((found) => found.target), ['tsx']);
+});
+
 test('the rules guard follows the ladder, spends a grant only when the whole command may run, and speaks to workers', () => {
   const db = openDb(':memory:', resolve(import.meta.dirname, '../migrations'));
   const alpha = insertAgent(db, 'alpha') as Agent;

@@ -458,6 +458,19 @@ test('a tool that refuses becomes an observation, not the end of the run', async
   assert.deepEqual(tooling(f.ran), [], 'neither call reached a shell');
 });
 
+test('a tool named after an Object.prototype member is an unknown tool, not a crash', async () => {
+  const names = Object.getOwnPropertyNames(Object.prototype);
+  const f = fixture([
+    { toolCalls: names.map((name, i) => ({ id: `p${i}`, name, arguments: '{}' })) },
+    { text: 'done' },
+  ]);
+  f.ask('go');
+  await runAgent(f.deps, f.agent, f.conversationId);
+
+  assert.equal(f.state(), 'waiting_for_user');
+  assert.equal(f.messages().filter((m) => m.role === 'tool').length, names.length, 'every call is answered');
+});
+
 test('the owner holding control refuses the agent the display and ends its turn', async () => {
   const f = fixture([
     { toolCalls: [screenshotCall, commandCall] },

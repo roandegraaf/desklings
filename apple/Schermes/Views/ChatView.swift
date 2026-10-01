@@ -69,6 +69,8 @@ struct ChatView: View {
     /// The bubbles the live row has shown, so the stored reply does not show them arriving twice.
     @State private var liveSent: [String] = []
     @State private var thinkingOpen = false
+    /// The thinking panel is folding before the reply lands; the other poll must not land it first.
+    @State private var folding = false
     @State private var draft = ""
     @State private var trouble: String?
     @State private var sending = false
@@ -1237,9 +1239,12 @@ struct ChatView: View {
         let newest = newestId(loaded) ?? 0
         let fresh = rows.filter { $0.id > newest }
         let answer = fresh.last { $0.role == .assistant && $0.hasBubble && $0.sender == thread.only?.name }
+        if folding { return }
         if answer != nil, thinkingOpen {
+            folding = true
             withAnimation(.snappy(duration: 0.25)) { thinkingOpen = false }
             try? await Task.sleep(for: .milliseconds(260))
+            folding = false
         }
         if following {
             for row in fresh {
@@ -1315,7 +1320,7 @@ struct ChatView: View {
         if next.isEmpty {
             if live != nil {
                 await catchUp()
-                live = nil
+                if !folding { live = nil }
             }
         } else if live != next {
             live = next
@@ -1655,8 +1660,9 @@ struct MessageRow: View, Equatable {
     @Environment(Forwarder.self) private var forwarder: Forwarder?
     @State private var hovering = false
     @State private var copied = false
-    @State private var landed = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var selecting = false
+
+    private var canSelect: Bool { !isOwner && !message.content.isEmpty }
     @Environment(\.arrivals) private var arrivals
 
     private var canForward: Bool { forwarder != nil && !message.content.isEmpty }
@@ -1688,15 +1694,18 @@ struct MessageRow: View, Equatable {
             if isOwner { ownerBubble } else { reply }
             meta
         }
+        .modifier(SendEntrance(active: isOwner && enterFrom != nil))
         .frame(maxWidth: .infinity, alignment: isOwner ? .trailing : .leading)
         .contentShape(.rect)
         .onHover { hovering = $0 }
         .onAppear { arrivals?.from[message.id] = nil }
+        .sheet(isPresented: $selecting) { SelectTextSheet(content: message.content) }
         .environment(\.forwardedMessage, message.id)
         .contextMenu {
             if !message.content.isEmpty {
                 Button("Copy", systemImage: "doc.on.doc") { copyToPasteboard(message.content) }
             }
+            if canSelect { Button("Select Text", systemImage: "selection.pin.in.out") { selecting = true } }
             if canForward { Button("Send to…", systemImage: "arrowshape.turn.up.right") { forward() } }
             if let onRetry { Button("Retry", systemImage: "arrow.clockwise", action: onRetry) }
             if let onRestore { Button("Restore to this message", systemImage: "arrow.uturn.backward", action: onRestore) }
@@ -1761,6 +1770,7 @@ struct MessageRow: View, Equatable {
             if !message.content.isEmpty {
                 action(copied ? "Copied" : "Copy", copied ? "checkmark" : "doc.on.doc") { copy() }
             }
+            if canSelect { action("Select Text", "selection.pin.in.out") { selecting = true } }
             if canForward { action("Send to…", "arrowshape.turn.up.right") { forward() } }
             if let onRetry { action("Retry", "arrow.clockwise", onRetry) }
             if let onRestore { action("Restore to this message", "arrow.uturn.backward", onRestore) }
@@ -1811,13 +1821,6 @@ struct MessageRow: View, Equatable {
         .padding(.vertical, 10)
         .background(bubble, in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 20, bottomTrailingRadius: 6, topTrailingRadius: 20))
         .padding(.leading, 48)
-        .scaleEffect(landed || enterFrom == nil || reduceMotion ? 1 : 0.6, anchor: .bottomTrailing)
-        .offset(y: landed || enterFrom == nil || reduceMotion ? 0 : 24)
-        .opacity(landed || enterFrom == nil ? 1 : 0)
-        .onAppear {
-            guard enterFrom != nil, !landed else { return }
-            withAnimation(.spring(duration: 0.4, bounce: 0.3)) { landed = true }
-        }
     }
 
     private var reply: some View {
@@ -1856,6 +1859,16 @@ struct ReplyBubbles: View {
     @State private var revealed: Int?
     @State private var played = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(chunks: [String], enterFrom: Int? = nil, files: FileSource? = nil, fill: Color, link: Color) {
+        self.chunks = chunks
+        self.enterFrom = enterFrom
+        self.files = files
+        self.fill = fill
+        self.link = link
+        // Set before the first frame: from `.task` the first bubble is already drawn by the time it runs.
+        _revealed = State(initialValue: enterFrom)
+    }
 
     private var shown: Int { min(revealed ?? chunks.count, chunks.count) }
 
@@ -1900,6 +1913,7 @@ struct ReplyBubbles: View {
 
 struct TypingBubble: View {
     let fill: Color
+    @State private var appeared = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -1919,8 +1933,82 @@ struct TypingBubble: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 13)
         .background(fill, in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 6, bottomTrailingRadius: 20, topTrailingRadius: 20))
-        .transition(.scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
+        .scaleEffect(appeared || reduceMotion ? 1 : 0.6, anchor: .bottomLeading)
+        .opacity(appeared ? 1 : 0)
+        .onAppear { withAnimation(.spring(duration: 0.4, bounce: 0.3)) { appeared = true } }
         .accessibilityLabel("Writing")
+    }
+}
+
+/// A selection cannot cross from one bubble's text into the next, so the whole reply goes in one.
+struct SelectTextSheet: View {
+    let content: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Text(selectable(content))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(20)
+            }
+            .navigationTitle("Select Text")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Copy All", systemImage: "doc.on.doc") {
+                        copyToPasteboard(content)
+                        dismiss()
+                    }
+                }
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 520, idealWidth: 640, minHeight: 420, idealHeight: 560)
+        #endif
+    }
+}
+
+/// The reply as one text: prose with its inline styling, code exactly as written.
+func selectable(_ content: String) -> AttributedString {
+    var out = AttributedString()
+    for (index, block) in markdownBlocks(content).enumerated() {
+        if index > 0 { out += AttributedString("\n\n") }
+        switch block {
+        case .prose(let text):
+            out += (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+                ?? AttributedString(text)
+        case .code(_, let text):
+            var code = AttributedString(text)
+            code.font = .body.monospaced()
+            out += code
+        case .file(let path):
+            out += AttributedString(path)
+        }
+    }
+    return out
+}
+
+/// Fixed when the bubble is made: the row is redrawn with its arrival cleared while the spring still runs.
+struct SendEntrance: ViewModifier {
+    @State private var landed: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(active: Bool) { _landed = State(initialValue: !active) }
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(landed || reduceMotion ? 1 : 0.6, anchor: .bottomTrailing)
+            .offset(y: landed || reduceMotion ? 0 : 24)
+            .opacity(landed ? 1 : 0)
+            .onAppear {
+                guard !landed else { return }
+                withAnimation(.spring(duration: 0.4, bounce: 0.3)) { landed = true }
+            }
     }
 }
 
@@ -2150,7 +2238,8 @@ struct LiveRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if !sent.isEmpty {
-                ReplyBubbles(chunks: sent, fill: bubble, link: link)
+                ReplyBubbles(chunks: sent, enterFrom: 0, fill: bubble, link: link)
+                    .zIndex(1)
             }
             if let retry = reply.retry {
                 RetryCard(retry: retry, onRetry: onRetry)
@@ -2181,6 +2270,7 @@ struct LiveRow: View {
                     .transition(.scale(scale: 0.9, anchor: .topLeading).combined(with: .opacity))
             }
         }
+        .animation(.spring(duration: 0.4, bounce: 0.3), value: sent.count)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

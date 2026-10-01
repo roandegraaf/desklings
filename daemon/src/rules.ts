@@ -277,11 +277,11 @@ function classifySegment(segment: string): Found | undefined {
   }
   const sub = plain(args)[0] ?? '';
   const subAt = args.indexOf(sub);
-  if (INSTALLERS[command]?.includes(sub) || (command === 'uv' && sub === 'install')) {
+  if ((Object.hasOwn(INSTALLERS, command) && INSTALLERS[command]?.includes(sub)) || (command === 'uv' && sub === 'install')) {
     return found('install_software', plain(args.slice(subAt + 1)));
   }
   const global = args.includes('-g') || args.includes('--global');
-  if (GLOBAL_INSTALLERS[command]?.includes(sub) && global) {
+  if (Object.hasOwn(GLOBAL_INSTALLERS, command) && GLOBAL_INSTALLERS[command]?.includes(sub) && global) {
     return found('install_software', plain(args.slice(subAt + 1)));
   }
   if (command === 'yarn' && sub === 'global' && args[subAt + 1] === 'add') {

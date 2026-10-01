@@ -55,11 +55,13 @@ func markdownBlocks(_ content: String) -> [MarkdownBlock] {
     return blocks
 }
 
-/// One text per blank-line paragraph; fences, loose lists, tables, quotes and a heading with its body stay whole.
+/// One text per blank-line paragraph; fences, loose lists, tables, quotes, a heading with its body
+/// and whatever sits between two --- lines stay whole, the lines themselves dropped.
 func bubbleChunks(_ content: String) -> [String] {
     var chunks: [[Substring]] = []
     var current: [Substring] = []
     var inCode = false
+    var inPiece = false
 
     func isBlockLine(_ line: Substring) -> Bool {
         line.first?.isWhitespace == true || line.hasPrefix("|") || line.hasPrefix(">")
@@ -68,6 +70,7 @@ func bubbleChunks(_ content: String) -> [String] {
     }
 
     func flush() {
+        while current.last?.allSatisfy(\.isWhitespace) == true { current.removeLast() }
         guard !current.isEmpty else { return }
         if let previous = chunks.last, let last = previous.last,
            (previous.count == 1 && last.hasPrefix("#")) || (isBlockLine(last) && isBlockLine(current[0])) {
@@ -80,14 +83,22 @@ func bubbleChunks(_ content: String) -> [String] {
 
     for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
         if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") { inCode.toggle() }
-        if !inCode, line.allSatisfy(\.isWhitespace) {
+        if !inCode, isRule(line) {
             flush()
+            inPiece.toggle()
+        } else if !inCode, line.allSatisfy(\.isWhitespace) {
+            if inPiece { if !current.isEmpty { current.append(line) } } else { flush() }
         } else {
             current.append(line)
         }
     }
     flush()
     return chunks.map { $0.joined(separator: "\n") }
+}
+
+private func isRule(_ line: Substring) -> Bool {
+    let marks = line.filter { !$0.isWhitespace }
+    return marks.count >= 3 && ["-", "*", "_"].contains { mark in marks.allSatisfy { $0 == mark } }
 }
 
 func sharedLead(_ a: [String], _ b: [String]) -> Int {

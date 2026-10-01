@@ -207,3 +207,17 @@ private func text(_ string: AttributedString) -> String { String(string.characte
     #expect(sharedLead(["Checking the site."], ["Done: €89."]) == 0)
     #expect(sharedLead([], ["Hi"]) == 0)
 }
+
+@Test func whatSitsBetweenTwoDividersIsOneBubble() {
+    #expect(bubbleChunks("Hier komt 'ie.\n\n---\n\n**Titel**\n\nEr was eens.\n\nEinde.\n\n---\n\nNog een?") == [
+        "Hier komt 'ie.", "**Titel**\n\nEr was eens.\n\nEinde.", "Nog een?",
+    ])
+    #expect(bubbleChunks("Daar gaat ie\n\n---\n\nEr was\n\neens") == ["Daar gaat ie", "Er was\n\neens"])
+    #expect(bubbleChunks("```\n---\n```") == ["```\n---\n```"])
+    #expect(bubbleChunks("- a\n- b") == ["- a\n- b"])
+}
+
+@Test func selectableTextKeepsCodeLinesAndDropsMarkup() {
+    let text = String(selectable("**De fout:** `x`\n\n```\nhello   ok\nvalueOf THROWS\n```\n\n- een").characters)
+    #expect(text == "De fout: x\n\nhello   ok\nvalueOf THROWS\n\n- een")
+}

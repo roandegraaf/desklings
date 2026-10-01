@@ -522,7 +522,9 @@ function systemPrompt(
     'The owner reads your reply in a chat app, where each paragraph shows as its own message.',
     'Write the way a person texts: short, casual messages of one thought each, separated by a',
     'blank line, two or three for most replies and a single one when that is all it takes. No',
-    'preamble, no closing offer of more help. Keep a list, a table or a code block whole.',
+    'preamble, no closing offer of more help, no headings. A list, a table or a code block stays',
+    'one message. So does anything between two lines of ---: put those around something meant',
+    'to be read as one piece, such as a story, a poem or a draft.',
     'The owner cannot reach your machine, so hand them every file you made for them as a card:',
     'write its path starting with ~/ alone on a line of its own, such as ~/workspace/report.xlsx,',
     'with no label, sentence or other path on that line, and one line per file. That line shows as',
@@ -1604,7 +1606,7 @@ export async function runAgent(
 
       for (const call of reply.toolCalls) {
         recordEvent(db, agent.id, 'tool_call', summarise(call));
-        const acting = STATE_FOR_TOOL[call.name];
+        const acting = Object.hasOwn(STATE_FOR_TOOL, call.name) ? STATE_FOR_TOOL[call.name] : undefined;
         if (acting !== undefined) transition(db, agent, acting);
         const observation: Observation = await (
           deps.idle === undefined
