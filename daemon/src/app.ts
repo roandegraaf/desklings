@@ -449,6 +449,7 @@ export function createApp({
     db,
     config: () => pushConfig(db, masterKey),
     send: pushSend,
+    quiet: attended,
     ...(activityThrottleMs === undefined ? {} : { throttleMs: activityThrottleMs }),
   });
   const buildProvider = makeProvider ?? openAiProvider;

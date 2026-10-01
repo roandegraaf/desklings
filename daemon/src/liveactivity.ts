@@ -96,6 +96,8 @@ export type LiveActivityDeps = {
   db: Db;
   config: () => PushConfig | undefined;
   send?: PushSend | undefined;
+  /** The owner is at a screen that already shows the turn, so no phone activity is started. */
+  quiet?: () => boolean;
   throttleMs?: number;
   now?: () => number;
 };
@@ -208,7 +210,7 @@ export function createLiveActivities(deps: LiveActivityDeps): LiveActivities {
       const item = entry(agent.name);
       item.running = true;
       if (tokens(deps.db, 'update', agent.name).length > 0) return update(agent.name);
-      if (item.startSent) return;
+      if (item.startSent || deps.quiet?.() === true) return;
       const fresh = current(agent);
       const starts = tokens(deps.db, 'start');
       if (starts.length === 0 || deps.config() === undefined) return;

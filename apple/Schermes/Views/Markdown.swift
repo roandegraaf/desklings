@@ -90,6 +90,10 @@ func bubbleChunks(_ content: String) -> [String] {
     return chunks.map { $0.joined(separator: "\n") }
 }
 
+func sharedLead(_ a: [String], _ b: [String]) -> Int {
+    zip(a, b).prefix { $0 == $1 }.count
+}
+
 private let quotedFilePath = Regex { ChoiceOf { Regex { "`"; Capture { filePath }; "`" }; Capture { filePath } } }
 
 /// With `linkingFiles`, a path in a sentence becomes a link named after the file, the way a chat

@@ -65,6 +65,10 @@ struct ChatView: View {
     @State private var rows = ChatRows()
     @State private var more = false
     @State private var live: LiveReply?
+    @State private var arrivals = Arrivals()
+    /// The bubbles the live row has shown, so the stored reply does not show them arriving twice.
+    @State private var liveSent: [String] = []
+    @State private var thinkingOpen = false
     @State private var draft = ""
     @State private var trouble: String?
     @State private var sending = false
@@ -225,6 +229,7 @@ struct ChatView: View {
                             bubbleText: bubbleText,
                             replyBubble: replyBubble,
                             replyLink: replyLink,
+                            enterFrom: arrivals.from[message.id],
                             onRestore: rewindable(restoring: message).map { request in { ask(request) } },
                             onRetry: rewindable(retrying: message).map { request in { ask(request) } },
                             onFeedback: message.role == .assistant ? { rating in rate(message, rating) } : nil
@@ -237,7 +242,7 @@ struct ChatView: View {
                 }
 
                 if let live, let agent = thread.only {
-                    LiveRow(reply: live, agent: agent.title, bubble: replyBubble, link: replyLink) { useBackup in
+                    LiveRow(reply: live, agent: agent.title, bubble: replyBubble, link: replyLink, thinkingOpen: $thinkingOpen) { useBackup in
                         await retryModel(agent.name, useBackup: useBackup)
                     }
                     .id("live")
@@ -248,6 +253,7 @@ struct ChatView: View {
             .frame(maxWidth: readingWidth)
             .frame(maxWidth: .infinity)
             .environment(\.holdScroll, scrollHold)
+            .environment(\.arrivals, arrivals)
             .environment(forwarder)
         }
         .defaultScrollAnchor(.bottom, for: .initialOffset)
@@ -480,8 +486,8 @@ struct ChatView: View {
             // to ask every participant, so it shows none — the web UI makes the same call.
             guard let agent = thread.only, agent.state.busy else {
                 if live != nil {
-                    live = nil
                     await catchUp()
+                    live = nil
                 }
                 return
             }
@@ -1228,7 +1234,23 @@ struct ChatView: View {
         guard let rows = try? await session.run({
             try await $0.messages(thread.source, window: catchUpWindow(after: cursor))
         }), !rows.isEmpty else { return }
+        let newest = newestId(loaded) ?? 0
+        let fresh = rows.filter { $0.id > newest }
+        let answer = fresh.last { $0.role == .assistant && $0.hasBubble && $0.sender == thread.only?.name }
+        if answer != nil, thinkingOpen {
+            withAnimation(.snappy(duration: 0.25)) { thinkingOpen = false }
+            try? await Task.sleep(for: .milliseconds(260))
+        }
+        if following {
+            for row in fresh {
+                arrivals.from[row.id] = row.id == answer?.id ? sharedLead(liveSent, bubbleChunks(row.content)) : 0
+            }
+        }
         loaded = merge(loaded, rows)
+        if answer != nil {
+            live = nil
+            liveSent = []
+        }
     }
 
     private func older() async {
@@ -1292,11 +1314,12 @@ struct ChatView: View {
         guard let next = try? await session.run({ try await $0.live(agent: name) }) else { return }
         if next.isEmpty {
             if live != nil {
-                live = nil
                 await catchUp()
+                live = nil
             }
         } else if live != next {
             live = next
+            liveSent = Array(bubbleChunks(next.text).dropLast())
         }
     }
 
@@ -1404,6 +1427,7 @@ struct ChatView: View {
             draft = ""
             attachments = []
             mark = Int.max
+            for message in sent { arrivals.from[message.id] = 0 }
             loaded = merge(loaded, sent)
             jumpPending = true
             await catchUp(after: cursor)
@@ -1620,6 +1644,8 @@ struct MessageRow: View, Equatable {
     let bubbleText: Color
     let replyBubble: Color
     let replyLink: Color
+    /// The first bubble to animate in, for a row that arrived while the thread was open.
+    var enterFrom: Int? = nil
     var onRestore: (() -> Void)?
     var onRetry: (() -> Void)?
     /// The rating the owner picked, `nil` when they tapped the one already chosen.
@@ -1629,6 +1655,9 @@ struct MessageRow: View, Equatable {
     @Environment(Forwarder.self) private var forwarder: Forwarder?
     @State private var hovering = false
     @State private var copied = false
+    @State private var landed = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.arrivals) private var arrivals
 
     private var canForward: Bool { forwarder != nil && !message.content.isEmpty }
 
@@ -1643,6 +1672,7 @@ struct MessageRow: View, Equatable {
         lhs.message == rhs.message && lhs.shown == rhs.shown && lhs.speaker == rhs.speaker
             && lhs.bubble == rhs.bubble && lhs.bubbleText == rhs.bubbleText
             && lhs.replyBubble == rhs.replyBubble && lhs.replyLink == rhs.replyLink
+            && lhs.enterFrom == rhs.enterFrom
             && (lhs.onRestore == nil) == (rhs.onRestore == nil)
             && (lhs.onRetry == nil) == (rhs.onRetry == nil)
             && (lhs.onFeedback == nil) == (rhs.onFeedback == nil)
@@ -1661,6 +1691,7 @@ struct MessageRow: View, Equatable {
         .frame(maxWidth: .infinity, alignment: isOwner ? .trailing : .leading)
         .contentShape(.rect)
         .onHover { hovering = $0 }
+        .onAppear { arrivals?.from[message.id] = nil }
         .environment(\.forwardedMessage, message.id)
         .contextMenu {
             if !message.content.isEmpty {
@@ -1780,6 +1811,13 @@ struct MessageRow: View, Equatable {
         .padding(.vertical, 10)
         .background(bubble, in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 20, bottomTrailingRadius: 6, topTrailingRadius: 20))
         .padding(.leading, 48)
+        .scaleEffect(landed || enterFrom == nil || reduceMotion ? 1 : 0.6, anchor: .bottomTrailing)
+        .offset(y: landed || enterFrom == nil || reduceMotion ? 0 : 24)
+        .opacity(landed || enterFrom == nil ? 1 : 0)
+        .onAppear {
+            guard enterFrom != nil, !landed else { return }
+            withAnimation(.spring(duration: 0.4, bounce: 0.3)) { landed = true }
+        }
     }
 
     private var reply: some View {
@@ -1796,7 +1834,8 @@ struct MessageRow: View, Equatable {
             }
             if !message.content.isEmpty {
                 ReplyBubbles(
-                    content: message.content,
+                    chunks: bubbleChunks(message.content),
+                    enterFrom: enterFrom,
                     files: message.role == .assistant ? message.sender.map { FileSource(session: session, agent: $0) } : nil,
                     fill: replyBubble,
                     link: replyLink
@@ -1807,14 +1846,22 @@ struct MessageRow: View, Equatable {
 }
 
 struct ReplyBubbles: View {
-    let content: String
+    let chunks: [String]
+    /// From this bubble on, they come in one at a time with the typing bubble between them.
+    var enterFrom: Int? = nil
     var files: FileSource?
     let fill: Color
     let link: Color
 
+    @State private var revealed: Int?
+    @State private var played = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var shown: Int { min(revealed ?? chunks.count, chunks.count) }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            ForEach(Array(bubbleChunks(content).enumerated()), id: \.offset) { index, chunk in
+            ForEach(Array(chunks.prefix(shown).enumerated()), id: \.offset) { index, chunk in
                 MarkdownText(content: chunk, files: files)
                     .equatable()
                     .foregroundStyle(Theme.ink)
@@ -1827,10 +1874,59 @@ struct ReplyBubbles: View {
                         bottomTrailingRadius: 20,
                         topTrailingRadius: 20
                     ))
+                    .transition(reduceMotion ? .opacity : .scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
+            }
+            if shown < chunks.count {
+                TypingBubble(fill: fill).padding(.top, 5)
             }
         }
         .padding(.trailing, 48)
+        .animation(.spring(duration: 0.4, bounce: 0.3), value: shown)
+        .task {
+            guard let start = enterFrom, !played, start < chunks.count else { return }
+            played = true
+            revealed = start
+            for chunk in chunks.dropFirst(start) {
+                if revealed != start {
+                    // ponytail: pause scales with length, a real typing speed model if it reads wrong
+                    try? await Task.sleep(for: .seconds(0.35 + min(Double(chunk.count) / 300, 0.9)))
+                }
+                revealed = (revealed ?? 0) + 1
+            }
+            revealed = nil
+        }
     }
+}
+
+struct TypingBubble: View {
+    let fill: Color
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { context in
+            let time = context.date.timeIntervalSinceReferenceDate
+            HStack(spacing: 4) {
+                ForEach(0..<3) { dot in
+                    let wave = reduceMotion ? 0 : max(0, sin((time * 2 * .pi / 1.2) - Double(dot) * 0.7))
+                    Circle()
+                        .frame(width: 7, height: 7)
+                        .opacity(0.35 + 0.5 * wave)
+                        .offset(y: -3 * wave)
+                }
+            }
+        }
+        .foregroundStyle(Theme.ink)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 13)
+        .background(fill, in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 6, bottomTrailingRadius: 20, topTrailingRadius: 20))
+        .transition(.scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
+        .accessibilityLabel("Writing")
+    }
+}
+
+/// Not observed: a row reads its entry once, and taking it out must not redraw the chat.
+final class Arrivals {
+    var from: [Int: Int] = [:]
 }
 
 /// A stretch of tool traffic folded into one chip, screenshots included. Open, the steps hang
@@ -1903,6 +1999,7 @@ final class ScrollHold {
 
 extension EnvironmentValues {
     @Entry var holdScroll: ScrollHold?
+    @Entry var arrivals: Arrivals?
     /// The message a file card sits in, so forwarding the file brings the message along.
     @Entry var forwardedMessage: Int?
 }
@@ -2044,28 +2141,44 @@ struct LiveRow: View {
     let agent: String
     let bubble: Color
     let link: Color
+    @Binding var thinkingOpen: Bool
     var onRetry: (_ useBackup: Bool) async -> Void = { _ in }
+
+    /// The paragraph still being written is held back, as a chat app shows a message only once it is sent.
+    private var sent: [String] { Array(bubbleChunks(reply.text).dropLast()) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if !sent.isEmpty {
+                ReplyBubbles(chunks: sent, fill: bubble, link: link)
+            }
             if let retry = reply.retry {
                 RetryCard(retry: retry, onRetry: onRetry)
             } else {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.mini)
-                    Text("\(agent) is writing…")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
+                Button {
+                    guard !reply.reasoning.isEmpty else { return }
+                    withAnimation(.snappy(duration: 0.25)) { thinkingOpen.toggle() }
+                } label: {
+                    TypingBubble(fill: bubble)
                 }
+                .buttonStyle(.plain)
+                .help(thinkingOpen ? "Hide thinking" : "Show thinking")
+                .accessibilityLabel("\(agent) is writing")
+                .accessibilityHint(reply.reasoning.isEmpty ? "" : "Shows what it is thinking")
             }
-            if !reply.reasoning.isEmpty {
+            if thinkingOpen, !reply.reasoning.isEmpty {
+                // The tail only, at a fixed height, so the thinking never pushes the thread around.
                 Text(reply.reasoning)
                     .font(.callout.italic())
                     .foregroundStyle(.secondary)
-            }
-            if !reply.text.isEmpty {
-                ReplyBubbles(content: reply.text, fill: bubble, link: link)
+                    .lineLimit(5, reservesSpace: true)
+                    .truncationMode(.head)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(bubble.opacity(0.5), in: .rect(cornerRadius: 14))
+                    .padding(.trailing, 48)
+                    .transition(.scale(scale: 0.9, anchor: .topLeading).combined(with: .opacity))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

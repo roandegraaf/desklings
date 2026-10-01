@@ -2447,13 +2447,17 @@ test('a turn starts, updates and ends its Live Activity through the tokens the p
 
 test('a reply waits while the owner is at a screen and reaches the phone only once they leave', async () => {
   const pushed: string[] = [];
-  const pushSend: PushSend = (_host, _headers, body) => {
-    pushed.push(((JSON.parse(body) as { aps: { alert: { body: string } } }).aps.alert.body));
+  const activities: string[] = [];
+  const pushSend: PushSend = (_host, headers, body) => {
+    const aps = (JSON.parse(body) as { aps: { alert?: { body: string }; event?: string } }).aps;
+    if (headers['apns-push-type'] === 'liveactivity') activities.push(aps.event ?? '');
+    else pushed.push(aps.alert?.body ?? '');
     return Promise.resolve({ status: 200, body: '' });
   };
   const { f, cookie } = await configured({ pushSend, presence: { attendedMs: 20, holdMs: 60 } });
   await put(f.app, '/api/settings', { pushKeyId: 'K1', pushTeamId: 'T1', pushBundleId: 'dev.x.App', pushKey: P8 }, cookie);
   await post(f.app, '/api/devices', { token: 'ab'.repeat(32), platform: 'ios' }, cookie);
+  await post(f.app, '/api/live-activities', { token: 'cd'.repeat(32), kind: 'start' }, cookie);
   const attend = () => f.app.request('/api/agents', { headers: { cookie, [ATTENDING_HEADER]: '1' } });
   const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
   const reply = async (text: string) => {
@@ -2465,6 +2469,7 @@ test('a reply waits while the owner is at a screen and reaches the phone only on
   await reply('Away.');
   await sleep(5);
   assert.deepEqual(pushed, ['Away.'], 'nobody attending: straight out');
+  assert.deepEqual(activities, ['start'], 'and the turn shows on the lock screen');
 
   await attend();
   await reply('Still here.');
@@ -2473,6 +2478,7 @@ test('a reply waits while the owner is at a screen and reaches the phone only on
     await attend();
   }
   assert.deepEqual(pushed, ['Away.'], 'the owner was at a screen through the hold: dropped');
+  assert.deepEqual(activities, ['start'], 'no lock screen activity for a turn the owner is watching');
 
   await attend();
   await reply('Walked off.');

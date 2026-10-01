@@ -201,3 +201,9 @@ private func text(_ string: AttributedString) -> String { String(string.characte
     #expect(bubbleChunks("\n\n") == [])
     #expect(bubbleChunks("open\n\n```\npartial\n\nstill code") == ["open", "```\npartial\n\nstill code"])
 }
+
+@Test func onlyTheBubblesTheLiveRowShowedSkipTheirEntrance() {
+    #expect(sharedLead(["Hey!", "Found it."], ["Hey!", "Found it.", "Book it?"]) == 2)
+    #expect(sharedLead(["Checking the site."], ["Done: €89."]) == 0)
+    #expect(sharedLead([], ["Hi"]) == 0)
+}
