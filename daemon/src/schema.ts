@@ -19,15 +19,27 @@ export const settings = sqliteTable('settings', {
   encrypted: integer('encrypted', { mode: 'boolean' }).notNull().default(false),
 });
 
-/** The owner's model endpoints. Which one is the default and which the backup are two settings
- * keys, `models.default` and `models.backup`, holding an id. */
-export const models = sqliteTable('models', {
+/** An endpoint and the key it takes, shared by every model served from it. */
+export const providers = sqliteTable('providers', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   name: text('name').notNull(),
   baseUrl: text('base_url').notNull(),
-  model: text('model').notNull(),
   // Encrypted with the master key, like every other secret in `settings`.
   apiKey: text('api_key'),
+  createdAt: integer('created_at').notNull(),
+});
+
+/** The owner's models. Which one is the default and which the backup are two settings keys,
+ * `models.default` and `models.backup`, holding an id. */
+export const models = sqliteTable('models', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull(),
+  providerId: integer('provider_id').references(() => providers.id),
+  // From before providers: moved into one by `migrateModelProviders` at boot and blank after.
+  // Kept until a later migration drops them, so that move runs after the SQL migrations.
+  legacyBaseUrl: text('base_url').notNull(),
+  legacyApiKey: text('api_key'),
+  model: text('model').notNull(),
   // A JSON object merged under every request body, or empty.
   extraBody: text('extra_body').notNull().default(''),
   createdAt: integer('created_at').notNull(),

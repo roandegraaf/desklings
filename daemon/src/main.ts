@@ -8,7 +8,7 @@ import { log } from './log.ts';
 import { openDb } from './db.ts';
 import { reconcileDesktops, systemDesktop } from './agents.ts';
 import { reconcileAgents } from './loop.ts';
-import { migrateProviderSettings } from './models.ts';
+import { migrateModelProviders, migrateProviderSettings } from './models.ts';
 import { systemExec } from './exec.ts';
 import { attachVncProxy } from './vnc.ts';
 import { startScheduler } from './schedules.ts';
@@ -25,6 +25,7 @@ migrateProviderSettings(db);
 // process is doing, and transcripts a strict model endpoint would reject.
 reconcileAgents(db);
 const masterKey = loadMasterKey(config.masterKeyPath);
+migrateModelProviders(db, masterKey);
 if (config.apnsKeyFile !== undefined && seedPushKey(db, masterKey, config.apnsKeyFile, config.apnsKeyId)) {
   log.info('push key loaded', { file: config.apnsKeyFile });
 }

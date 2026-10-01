@@ -124,6 +124,7 @@ private func encode(_ value: some Encodable) throws -> String {
     """)
     #expect(models.first?.name == "Fast")
     #expect(models.first?.isDefault == true && models.first?.isBackup == false)
+    #expect(models.first?.providerId == nil, "a daemon from before providers still decodes")
 }
 
 @Test func anAgentsModelIsAbsentForTheDefault() throws {
@@ -138,10 +139,10 @@ private func encode(_ value: some Encodable) throws -> String {
     #expect(try encode(modelPick(3)) == #"{"id":3}"#)
 }
 
-@Test func aModelEditSendsOnlyWhatChangedAndNeverABlankKey() throws {
+@Test func aModelEditSendsOnlyWhatChanged() throws {
     let entry = ModelEntry(
-        id: 1, name: "Fast", baseUrl: "https://x/v1", model: "m", apiKeySet: true,
-        extraBody: #"{"a":1}"#, isDefault: true, isBackup: false, createdAt: 0
+        id: 1, name: "Fast", providerId: 2, providerName: "Acme", baseUrl: "https://x/v1", model: "m",
+        apiKeySet: true, extraBody: #"{"a":1}"#, isDefault: true, isBackup: false, createdAt: 0
     )
     var draft = ModelDraft(entry)
     #expect(draft.update(from: entry) == ModelUpdate())
@@ -152,14 +153,27 @@ private func encode(_ value: some Encodable) throws -> String {
     draft.extraBody = ""
     #expect(draft.update(from: entry) == ModelUpdate(name: "Quick", extraBody: ""))
 
-    draft.apiKey = "sk-new"
-    #expect(draft.update(from: entry).apiKey == "sk-new")
+    draft.providerId = 3
+    #expect(draft.update(from: entry).providerId == 3)
 
-    var fresh = ModelDraft()
+    var fresh = ModelDraft(providerId: 2)
     fresh.name = "Local"
-    fresh.baseUrl = "http://localhost:11434/v1"
     fresh.model = "qwen"
-    #expect(fresh.update(from: nil) == ModelUpdate(name: "Local", baseUrl: "http://localhost:11434/v1", model: "qwen"))
+    #expect(fresh.update(from: nil) == ModelUpdate(name: "Local", providerId: 2, model: "qwen"))
+}
+
+@Test func aProviderEditSendsOnlyWhatChangedAndNeverABlankKey() throws {
+    let entry = ProviderEntry(id: 2, name: "Acme", baseUrl: "https://x/v1", apiKeySet: true, createdAt: 0)
+    var draft = ProviderDraft(entry)
+    #expect(draft.update(from: entry) == ProviderUpdate())
+
+    draft.apiKey = "sk-new"
+    #expect(try encode(draft.update(from: entry)) == #"{"apiKey":"sk-new"}"#)
+
+    var fresh = ProviderDraft()
+    fresh.name = "Local"
+    fresh.baseUrl = " http://localhost:11434/v1 "
+    #expect(fresh.update(from: nil) == ProviderUpdate(name: "Local", baseUrl: "http://localhost:11434/v1"))
 }
 
 @Test func anMcpSummaryDecodesForBothTransports() throws {

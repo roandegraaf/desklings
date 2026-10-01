@@ -113,7 +113,19 @@ struct ConsoleView: View {
     @Environment(PushRegistration.self) private var registration
     @Environment(\.scenePhase) private var scenePhase
 
-    private var awake: Bool { scenePhase == .active }
+    /// A Mac window stays `.active` behind other apps, so there it also takes the app being in front.
+    @State private var frontmost = true
+    private var awake: Bool { scenePhase == .active && frontmost }
+
+    /// The owner is at this device: the app in front on a phone, any input in the last two
+    /// minutes on a Mac, whose banners then stand in for the phone's pushes.
+    private var attending: Bool {
+        #if os(macOS)
+        awake || CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!) < 120
+        #else
+        awake
+        #endif
+    }
 
     enum SidebarPick: Hashable {
         case needsYou
@@ -201,6 +213,10 @@ struct ConsoleView: View {
                 try? await Task.sleep(for: .seconds(awake ? 2 : 10))
             }
         }
+        #if os(macOS)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in frontmost = true }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in frontmost = false }
+        #endif
         .onChange(of: query) { _, now in
             if now.trimmingCharacters(in: .whitespaces).isEmpty {
                 answer = nil
@@ -999,13 +1015,13 @@ struct ConsoleView: View {
         }
         guard !lastStates.isEmpty else { return }
         for agent in rows where agent.parentId == nil {
-            guard let before = lastStates[agent.name], before.busy, !agent.state.busy, !awake else { continue }
+            guard let before = lastStates[agent.name], before.busy, !agent.state.busy, !awake, attending else { continue }
             let body = agent.state == .failed
                 ? "The turn failed."
                 : previews[ThreadSource.agent(agent.name).key]?.content.prefix(120).description ?? "Finished."
             Notifier.post(id: "turn:\(agent.name):\(agent.state.rawValue)", title: agent.title, body: body)
         }
-        for item in pending where !lastNeedIds.contains(item.id) && !awake {
+        for item in pending where !lastNeedIds.contains(item.id) && !awake && attending {
             let body = item.approval.map { "\($0.kind == .action ? "Asks first" : "Asks to delete something"): \($0.reason)" } ?? item.title
             Notifier.post(
                 id: item.id, title: titles(rows)[item.agent] ?? item.agent, body: body,
@@ -1030,7 +1046,8 @@ struct ConsoleView: View {
     /// machine runs; a `lastMessage` on `GET /api/agents` is the upgrade path if it ever hurts.
     private func refresh() async {
         do {
-            let rows = try await session.run { try await $0.agents() }
+            let attending = attending
+            let rows = try await session.run { try await $0.agents(attending: attending) }
             if agents != rows { agents = rows }
             looks.adopt(rows)
             let pending = (try? await session.run { try await $0.needsYou() }) ?? needs

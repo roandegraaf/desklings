@@ -1,8 +1,7 @@
 name: image
 
+# Pushes to master build on the owner's Mac (infra/push-image.sh); this is the manual fallback.
 on:
-  push:
-    branches: [master]
   workflow_dispatch:
 
 permissions:

@@ -55,6 +55,41 @@ func markdownBlocks(_ content: String) -> [MarkdownBlock] {
     return blocks
 }
 
+/// One text per blank-line paragraph; fences, loose lists, tables, quotes and a heading with its body stay whole.
+func bubbleChunks(_ content: String) -> [String] {
+    var chunks: [[Substring]] = []
+    var current: [Substring] = []
+    var inCode = false
+
+    func isBlockLine(_ line: Substring) -> Bool {
+        line.first?.isWhitespace == true || line.hasPrefix("|") || line.hasPrefix(">")
+            || ["- ", "* ", "+ "].contains { line.hasPrefix($0) }
+            || line.drop(while: \.isNumber).prefix(2).allSatisfy { ".) ".contains($0) } && line.first?.isNumber == true
+    }
+
+    func flush() {
+        guard !current.isEmpty else { return }
+        if let previous = chunks.last, let last = previous.last,
+           (previous.count == 1 && last.hasPrefix("#")) || (isBlockLine(last) && isBlockLine(current[0])) {
+            chunks[chunks.count - 1] += [""] + current
+        } else {
+            chunks.append(current)
+        }
+        current = []
+    }
+
+    for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
+        if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") { inCode.toggle() }
+        if !inCode, line.allSatisfy(\.isWhitespace) {
+            flush()
+        } else {
+            current.append(line)
+        }
+    }
+    flush()
+    return chunks.map { $0.joined(separator: "\n") }
+}
+
 private let quotedFilePath = Regex { ChoiceOf { Regex { "`"; Capture { filePath }; "`" }; Capture { filePath } } }
 
 /// With `linkingFiles`, a path in a sentence becomes a link named after the file, the way a chat

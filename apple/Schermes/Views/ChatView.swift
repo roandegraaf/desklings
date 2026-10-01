@@ -138,6 +138,8 @@ struct ChatView: View {
     private var accent: Color { palette?.accentText.color ?? Theme.ink.rgb(dark: scheme == .dark).color }
     private var bubble: Color { palette?.bubble.color ?? Theme.ink.rgb(dark: scheme == .dark).color }
     private var bubbleText: Color { palette?.bubbleText.color ?? Theme.onInk.rgb(dark: scheme == .dark).color }
+    private var replyBubble: Color { palette?.soft.color ?? Theme.card.rgb(dark: scheme == .dark).color }
+    private var replyLink: Color { palette?.softText.color ?? accent }
 
     /// By id rather than `scrollTo(edge:)`: in a lazy stack the edge is an estimate, and landing on
     /// it left the view scrolled past rows that were never laid out.
@@ -221,6 +223,8 @@ struct ChatView: View {
                             speaker: speakerLabel(of: message, own: thread.only?.name, among: thread.members),
                             bubble: bubble,
                             bubbleText: bubbleText,
+                            replyBubble: replyBubble,
+                            replyLink: replyLink,
                             onRestore: rewindable(restoring: message).map { request in { ask(request) } },
                             onRetry: rewindable(retrying: message).map { request in { ask(request) } },
                             onFeedback: message.role == .assistant ? { rating in rate(message, rating) } : nil
@@ -233,7 +237,7 @@ struct ChatView: View {
                 }
 
                 if let live, let agent = thread.only {
-                    LiveRow(reply: live, agent: agent.title) { useBackup in
+                    LiveRow(reply: live, agent: agent.title, bubble: replyBubble, link: replyLink) { useBackup in
                         await retryModel(agent.name, useBackup: useBackup)
                     }
                     .id("live")
@@ -1614,6 +1618,8 @@ struct MessageRow: View, Equatable {
     /// The owner's bubble, flat in the agent's colour, and the text that reads on it.
     let bubble: Color
     let bubbleText: Color
+    let replyBubble: Color
+    let replyLink: Color
     var onRestore: (() -> Void)?
     var onRetry: (() -> Void)?
     /// The rating the owner picked, `nil` when they tapped the one already chosen.
@@ -1636,14 +1642,14 @@ struct MessageRow: View, Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message && lhs.shown == rhs.shown && lhs.speaker == rhs.speaker
             && lhs.bubble == rhs.bubble && lhs.bubbleText == rhs.bubbleText
+            && lhs.replyBubble == rhs.replyBubble && lhs.replyLink == rhs.replyLink
             && (lhs.onRestore == nil) == (rhs.onRestore == nil)
             && (lhs.onRetry == nil) == (rhs.onRetry == nil)
             && (lhs.onFeedback == nil) == (rhs.onFeedback == nil)
     }
 
-    /// The owner's words sit in a bubble on the right, as every chat app has them. A reply is
-    /// prose across the column: it is the long side of the conversation, and a box around three
-    /// paragraphs of Markdown is a box around the page.
+    /// The owner's words sit in a bubble on the right, the agent's on the left, as every chat app
+    /// has them. A reply is as many bubbles as it has paragraphs, the way a person texts.
     var body: some View {
         VStack(alignment: isOwner ? .trailing : .leading, spacing: 4) {
             ForEach(Array(([message.image].compactMap { $0 } + shown).enumerated()), id: \.offset) { _, image in
@@ -1789,15 +1795,41 @@ struct MessageRow: View, Equatable {
                 .fontDesign(.rounded)
             }
             if !message.content.isEmpty {
-                MarkdownText(
+                ReplyBubbles(
                     content: message.content,
-                    files: message.role == .assistant ? message.sender.map { FileSource(session: session, agent: $0) } : nil
+                    files: message.role == .assistant ? message.sender.map { FileSource(session: session, agent: $0) } : nil,
+                    fill: replyBubble,
+                    link: replyLink
                 )
-                .equatable()
             }
         }
-        .padding(.horizontal, 4)
-        .padding(.trailing, 24)
+    }
+}
+
+struct ReplyBubbles: View {
+    let content: String
+    var files: FileSource?
+    let fill: Color
+    let link: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(Array(bubbleChunks(content).enumerated()), id: \.offset) { index, chunk in
+                MarkdownText(content: chunk, files: files)
+                    .equatable()
+                    .foregroundStyle(Theme.ink)
+                    .tint(link)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(fill, in: UnevenRoundedRectangle(
+                        topLeadingRadius: index == 0 ? 20 : 6,
+                        bottomLeadingRadius: 6,
+                        bottomTrailingRadius: 20,
+                        topTrailingRadius: 20
+                    ))
+            }
+        }
+        .padding(.trailing, 48)
     }
 }
 
@@ -2010,6 +2042,8 @@ struct ToolRow: View {
 struct LiveRow: View {
     let reply: LiveReply
     let agent: String
+    let bubble: Color
+    let link: Color
     var onRetry: (_ useBackup: Bool) async -> Void = { _ in }
 
     var body: some View {
@@ -2031,11 +2065,9 @@ struct LiveRow: View {
                     .foregroundStyle(.secondary)
             }
             if !reply.text.isEmpty {
-                MarkdownText(content: reply.text).equatable()
+                ReplyBubbles(content: reply.text, fill: bubble, link: link)
             }
         }
-        .padding(.horizontal, 4)
-        .padding(.trailing, 24)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

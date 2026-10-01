@@ -192,3 +192,12 @@ private func text(_ string: AttributedString) -> String { String(string.characte
     #expect(artifactKind("~/data.csv") == nil)
     #expect(artifactKind("~/photo.png") == nil)
 }
+
+@Test func bubbleChunksSplitOnBlankLinesButKeepBlocksWhole() {
+    #expect(bubbleChunks("Hey!\n\nFijn je te zien.\nWat kan ik doen?") == ["Hey!", "Fijn je te zien.\nWat kan ik doen?"])
+    #expect(bubbleChunks("Run:\n\n```sh\nls\n\npwd\n```\n\nDone") == ["Run:", "```sh\nls\n\npwd\n```", "Done"])
+    #expect(bubbleChunks("Options:\n\n- one\n\n- two\n  more\n\n1. three\n\nThat's it") == ["Options:", "- one\n\n- two\n  more\n\n1. three", "That's it"])
+    #expect(bubbleChunks("## Plan\n\nFirst this\n\n| a |\n\n| b |") == ["## Plan\n\nFirst this", "| a |\n\n| b |"])
+    #expect(bubbleChunks("\n\n") == [])
+    #expect(bubbleChunks("open\n\n```\npartial\n\nstill code") == ["open", "```\npartial\n\nstill code"])
+}

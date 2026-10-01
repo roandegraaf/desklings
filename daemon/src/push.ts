@@ -13,6 +13,14 @@ export const APNS_TOKEN_TTL_MS = 50 * 60 * 1000;
 export const MAX_PUSH_BODY_CHARS = 200;
 const REQUEST_TIMEOUT_MS = 10_000;
 
+/** How the daemon tells the owner is at a screen: an app polls at most every 10s and says so on
+ * each poll while they are there. A push that lands then waits `holdMs` and goes out only if
+ * nobody is attending anymore, so walking away from the Mac right after a reply still reaches
+ * the phone. */
+export type Presence = { attendedMs: number; holdMs: number };
+export const PRESENCE: Presence = { attendedMs: 30_000, holdMs: 120_000 };
+export const ATTENDING_HEADER = 'x-schermes-attending';
+
 export type PushNotification = {
   title: string;
   body: string;

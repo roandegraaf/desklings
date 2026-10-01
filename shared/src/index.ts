@@ -121,12 +121,32 @@ export type ApiError = {
 
 /** What one model call against the stored provider settings came back with. An endpoint that
  * could not be reached is a successful test with `ok` false, like an MCP test. */
-/** One entry of the model registry. The key is reported as present or absent, never echoed. At
- * most one entry is the default (what an agent without its own model runs on) and one the
- * backup. `PUT /api/settings` provider fields read and write the default entry. */
+/** An endpoint and its key, shared by every model on it. The key is reported as present or
+ * absent, never echoed. */
+export type ProviderEntry = {
+  id: number;
+  name: string;
+  baseUrl: string;
+  apiKeySet: boolean;
+  createdAt: number;
+};
+
+/** `POST /api/providers` needs name and baseUrl; `PUT /api/providers/:id` takes any of them.
+ * An empty `apiKey` removes the key. */
+export type ProviderUpdate = {
+  name?: string;
+  baseUrl?: string;
+  apiKey?: string;
+};
+
+/** One entry of the model registry. `baseUrl` and `apiKeySet` are its provider's. At most one
+ * entry is the default (what an agent without its own model runs on) and one the backup.
+ * `PUT /api/settings` provider fields read and write the default entry and its provider. */
 export type ModelEntry = {
   id: number;
   name: string;
+  providerId: number | null;
+  providerName: string;
   baseUrl: string;
   model: string;
   apiKeySet: boolean;
@@ -137,13 +157,11 @@ export type ModelEntry = {
   createdAt: number;
 };
 
-/** `POST /api/models` needs name, baseUrl and model; `PUT /api/models/:id` takes any of them.
- * An empty `apiKey` removes the key. */
+/** `POST /api/models` needs name, providerId and model; `PUT /api/models/:id` takes any of them. */
 export type ModelUpdate = {
   name?: string;
-  baseUrl?: string;
+  providerId?: number;
   model?: string;
-  apiKey?: string;
   extraBody?: string;
 };
 

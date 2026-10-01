@@ -1,9 +1,9 @@
-import { eq, inArray, like } from 'drizzle-orm';
-import type { Agent, ModelEntry, ProviderSettings } from '@schermes/shared';
+import { and, eq, inArray, isNull, like } from 'drizzle-orm';
+import type { Agent, ModelEntry, ProviderEntry, ProviderSettings } from '@schermes/shared';
 import { findAgentById } from './agents.ts';
 import type { Db } from './db.ts';
 import type { ProviderConfig } from './provider.ts';
-import { agents, models, settings } from './schema.ts';
+import { agents, models, providers, settings } from './schema.ts';
 import { decrypt, encrypt } from './secrets.ts';
 
 const DEFAULT = 'models.default';
@@ -18,14 +18,20 @@ const LEGACY = {
 
 export type ModelFields = {
   name?: string | undefined;
-  baseUrl?: string | undefined;
+  providerId?: number | undefined;
   model?: string | undefined;
-  /** Plain text in, encrypted at rest; empty removes the key. */
-  apiKey?: string | undefined;
   extraBody?: string | undefined;
 };
 
+export type ProviderFields = {
+  name?: string | undefined;
+  baseUrl?: string | undefined;
+  /** Plain text in, encrypted at rest; empty removes the key. */
+  apiKey?: string | undefined;
+};
+
 type Row = typeof models.$inferSelect;
+type ProviderRow = typeof providers.$inferSelect;
 
 function readSetting(db: Db, key: string): string | undefined {
   return db.select().from(settings).where(eq(settings.key, key)).get()?.value;
@@ -54,13 +60,20 @@ function row(db: Db, id: number): Row | undefined {
   return db.select().from(models).where(eq(models.id, id)).get();
 }
 
+function providerRow(db: Db, id: number | null): ProviderRow | undefined {
+  return id === null ? undefined : db.select().from(providers).where(eq(providers.id, id)).get();
+}
+
 function toEntry(db: Db, entry: Row): ModelEntry {
+  const provider = providerRow(db, entry.providerId);
   return {
     id: entry.id,
     name: entry.name,
-    baseUrl: entry.baseUrl,
+    providerId: entry.providerId,
+    providerName: provider?.name ?? '',
+    baseUrl: provider?.baseUrl ?? '',
     model: entry.model,
-    apiKeySet: entry.apiKey !== null,
+    apiKeySet: provider !== undefined && provider.apiKey !== null,
     extraBody: entry.extraBody,
     isDefault: defaultModelId(db) === entry.id,
     isBackup: backupModelId(db) === entry.id,
@@ -77,38 +90,91 @@ export function findModel(db: Db, id: number): ModelEntry | undefined {
   return entry === undefined ? undefined : toEntry(db, entry);
 }
 
-function columns(masterKey: Buffer, fields: ModelFields) {
+function columns(fields: ModelFields) {
   return {
     ...(fields.name === undefined ? {} : { name: fields.name }),
-    ...(fields.baseUrl === undefined ? {} : { baseUrl: fields.baseUrl }),
+    ...(fields.providerId === undefined ? {} : { providerId: fields.providerId }),
     ...(fields.model === undefined ? {} : { model: fields.model }),
     ...(fields.extraBody === undefined ? {} : { extraBody: fields.extraBody }),
-    ...(fields.apiKey === undefined ? {} : { apiKey: fields.apiKey === '' ? null : encrypt(masterKey, fields.apiKey) }),
   };
 }
 
 /** The first model there is becomes the default: with none, no agent could run at all. */
-export function createModel(db: Db, masterKey: Buffer, fields: ModelFields): ModelEntry {
+export function createModel(db: Db, fields: ModelFields): ModelEntry {
   const created = db
     .insert(models)
-    .values({
-      name: fields.name ?? '',
-      baseUrl: fields.baseUrl ?? '',
-      model: fields.model ?? '',
-      createdAt: Date.now(),
-      ...columns(masterKey, fields),
-    })
+    .values({ name: '', model: '', legacyBaseUrl: '', createdAt: Date.now(), ...columns(fields) })
     .returning()
     .get();
   if (defaultModelId(db) === undefined) writeSetting(db, DEFAULT, created.id);
   return toEntry(db, created);
 }
 
-export function updateModel(db: Db, masterKey: Buffer, id: number, fields: ModelFields): ModelEntry | undefined {
-  const set = columns(masterKey, fields);
-  if (fields.apiKey !== undefined) clearAuthFailure(db, id);
+export function updateModel(db: Db, id: number, fields: ModelFields): ModelEntry | undefined {
+  const set = columns(fields);
+  if (fields.providerId !== undefined && fields.providerId !== row(db, id)?.providerId) clearAuthFailure(db, id);
   if (Object.keys(set).length > 0) db.update(models).set(set).where(eq(models.id, id)).run();
   return findModel(db, id);
+}
+
+function toProviderEntry(entry: ProviderRow): ProviderEntry {
+  return {
+    id: entry.id,
+    name: entry.name,
+    baseUrl: entry.baseUrl,
+    apiKeySet: entry.apiKey !== null,
+    createdAt: entry.createdAt,
+  };
+}
+
+export function listProviders(db: Db): ProviderEntry[] {
+  return db.select().from(providers).orderBy(providers.id).all().map(toProviderEntry);
+}
+
+export function findProvider(db: Db, id: number): ProviderEntry | undefined {
+  const entry = providerRow(db, id);
+  return entry === undefined ? undefined : toProviderEntry(entry);
+}
+
+function providerColumns(masterKey: Buffer, fields: ProviderFields) {
+  return {
+    ...(fields.name === undefined ? {} : { name: fields.name }),
+    ...(fields.baseUrl === undefined ? {} : { baseUrl: fields.baseUrl }),
+    ...(fields.apiKey === undefined ? {} : { apiKey: fields.apiKey === '' ? null : encrypt(masterKey, fields.apiKey) }),
+  };
+}
+
+export function createProvider(db: Db, masterKey: Buffer, fields: ProviderFields): ProviderEntry {
+  return toProviderEntry(
+    db
+      .insert(providers)
+      .values({ name: '', baseUrl: '', createdAt: Date.now(), ...providerColumns(masterKey, fields) })
+      .returning()
+      .get(),
+  );
+}
+
+/** A new key or endpoint is a fresh chance for every model on it, so their refusals go. */
+export function updateProvider(db: Db, masterKey: Buffer, id: number, fields: ProviderFields): ProviderEntry | undefined {
+  const set = providerColumns(masterKey, fields);
+  if (fields.apiKey !== undefined || fields.baseUrl !== undefined) {
+    for (const model of db.select({ id: models.id }).from(models).where(eq(models.providerId, id)).all()) {
+      clearAuthFailure(db, model.id);
+    }
+  }
+  if (Object.keys(set).length > 0) db.update(providers).set(set).where(eq(providers.id, id)).run();
+  return findProvider(db, id);
+}
+
+/** Refused while a model still runs on it. */
+export function deleteProvider(db: Db, id: number): { ok: true } | { error: string; status: 404 | 409 } {
+  if (providerRow(db, id) === undefined) return { error: 'no such provider', status: 404 };
+  const using = db.select({ name: models.name }).from(models).where(eq(models.providerId, id)).all();
+  if (using.length > 0) {
+    return { error: `${using.map((model) => model.name).join(', ')} still use this provider`, status: 409 };
+  }
+  db.delete(providers).where(eq(providers.id, id)).run();
+  return { ok: true };
 }
 
 /** Refused while an agent is assigned to it, and for the default while another model could take
@@ -147,16 +213,19 @@ export function assignModel(db: Db, agentName: string, id: number | null): boole
   return true;
 }
 
-function config(masterKey: Buffer, entry: Row | undefined): ProviderConfig | undefined {
-  if (entry === undefined || !entry.baseUrl || !entry.model || entry.apiKey === null) return undefined;
-  const apiKey = decrypt(masterKey, entry.apiKey);
+function config(db: Db, masterKey: Buffer, entry: Row | undefined): ProviderConfig | undefined {
+  const provider = entry === undefined ? undefined : providerRow(db, entry.providerId);
+  if (entry === undefined || provider === undefined || !provider.baseUrl || !entry.model || provider.apiKey === null) {
+    return undefined;
+  }
+  const apiKey = decrypt(masterKey, provider.apiKey);
   if (apiKey === '') return undefined;
   const extraBody = parseExtraBody(entry.extraBody);
-  return { baseUrl: entry.baseUrl, model: entry.model, apiKey, ...(extraBody === undefined ? {} : { extraBody }) };
+  return { baseUrl: provider.baseUrl, model: entry.model, apiKey, ...(extraBody === undefined ? {} : { extraBody }) };
 }
 
 export function modelConfig(db: Db, masterKey: Buffer, id: number): ProviderConfig | undefined {
-  return config(masterKey, row(db, id));
+  return config(db, masterKey, row(db, id));
 }
 
 /**
@@ -182,7 +251,7 @@ export function backupConfig(
   const id = backupModelId(db);
   if (id === undefined || id === activeId) return undefined;
   const entry = row(db, id);
-  const resolved = config(masterKey, entry);
+  const resolved = config(db, masterKey, entry);
   return entry === undefined || resolved === undefined ? undefined : { id, name: entry.name, config: resolved };
 }
 
@@ -243,24 +312,91 @@ export function parseExtraBody(text: string | undefined): Record<string, unknown
   }
 }
 
-/** The old single-provider settings, now the default entry, for the settings screen that still
- * reads and writes them. */
+/** The old single-provider settings, now the default entry and its provider, for the settings
+ * screen that still reads and writes them. */
 export function readProviderSettings(db: Db): ProviderSettings {
   const id = defaultModelId(db);
-  const entry = id === undefined ? undefined : row(db, id);
+  const entry = id === undefined ? undefined : findModel(db, id);
   return {
     baseUrl: entry?.baseUrl ?? '',
     model: entry?.model ?? '',
-    apiKeySet: entry !== undefined && entry.apiKey !== null,
+    apiKeySet: entry?.apiKeySet ?? false,
     extraBody: entry?.extraBody ?? '',
   };
 }
 
-export function writeProviderSettings(db: Db, masterKey: Buffer, fields: Omit<ModelFields, 'name'>): void {
+export function writeProviderSettings(
+  db: Db,
+  masterKey: Buffer,
+  fields: Omit<ModelFields, 'name' | 'providerId'> & Omit<ProviderFields, 'name'>,
+): void {
   if (Object.values(fields).every((value) => value === undefined)) return;
+  const { baseUrl, apiKey, ...modelFields } = fields;
   const id = defaultModelId(db);
-  if (id === undefined) createModel(db, masterKey, { name: fields.model || 'Default', ...fields });
-  else updateModel(db, masterKey, id, fields);
+  const providerId = id === undefined ? null : (row(db, id)?.providerId ?? null);
+  const provider =
+    providerId === null
+      ? createProvider(db, masterKey, { name: providerName(baseUrl ?? ''), baseUrl, apiKey })
+      : updateProvider(db, masterKey, providerId, { baseUrl, apiKey });
+  if (id === undefined) createModel(db, { name: fields.model || 'Default', providerId: provider?.id, ...modelFields });
+  else updateModel(db, id, { providerId: provider?.id, ...modelFields });
+}
+
+function providerName(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).host || 'Provider';
+  } catch {
+    return 'Provider';
+  }
+}
+
+/**
+ * Boot step, after the master key is loaded: every model still carrying its own endpoint and key
+ * gets a provider instead. Models with the same endpoint and the same key share one, which takes
+ * comparing the keys decrypted; the ciphertext moves as it is. A key that will not decrypt gets a
+ * provider of its own rather than stopping the boot. Touches only models without a provider.
+ */
+export function migrateModelProviders(db: Db, masterKey: Buffer): void {
+  const pending = db
+    .select()
+    .from(models)
+    .where(isNull(models.providerId))
+    .orderBy(models.id)
+    .all()
+    .filter((entry) => entry.legacyBaseUrl !== '' || entry.legacyApiKey !== null);
+  if (pending.length === 0) return;
+  const plain = (blob: string | null): string | undefined => {
+    if (blob === null) return '';
+    try {
+      return decrypt(masterKey, blob);
+    } catch {
+      return undefined;
+    }
+  };
+  db.transaction((tx) => {
+    const made: { id: number; baseUrl: string; key: string }[] = [];
+    for (const entry of pending) {
+      const key = plain(entry.legacyApiKey);
+      let id = key === undefined ? undefined : made.find((p) => p.baseUrl === entry.legacyBaseUrl && p.key === key)?.id;
+      if (id === undefined) {
+        id = tx
+          .insert(providers)
+          .values({
+            name: providerName(entry.legacyBaseUrl),
+            baseUrl: entry.legacyBaseUrl,
+            apiKey: entry.legacyApiKey,
+            createdAt: Date.now(),
+          })
+          .returning()
+          .get().id;
+        if (key !== undefined) made.push({ id, baseUrl: entry.legacyBaseUrl, key });
+      }
+      tx.update(models)
+        .set({ providerId: id, legacyBaseUrl: '', legacyApiKey: null })
+        .where(and(eq(models.id, entry.id), isNull(models.providerId)))
+        .run();
+    }
+  });
 }
 
 /**
@@ -280,9 +416,9 @@ export function migrateProviderSettings(db: Db): void {
         .insert(models)
         .values({
           name: legacy.model || 'Default',
-          baseUrl: legacy.baseUrl ?? '',
+          legacyBaseUrl: legacy.baseUrl ?? '',
           model: legacy.model ?? '',
-          apiKey: legacy.apiKey ?? null,
+          legacyApiKey: legacy.apiKey ?? null,
           extraBody: legacy.extraBody ?? '',
           createdAt: Date.now(),
         })

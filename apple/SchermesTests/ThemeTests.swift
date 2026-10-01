@@ -120,3 +120,9 @@ func pillTextReadsOnItsFill(dark: Bool) {
     #expect(AgentPalette.contrast(Theme.onInk.rgb(dark: dark), Theme.ink.rgb(dark: dark)) >= 4.5)
     #expect(AgentPalette.contrast(Theme.onInk.rgb(dark: dark), Theme.failed.rgb(dark: dark)) >= 4.5)
 }
+
+@Test(arguments: BloubColorId.allCases, [false, true])
+func replyBubbleTextReadsAtAA(color: BloubColorId, dark: Bool) {
+    let palette = AgentPalette(color, dark: dark)
+    #expect(AgentPalette.contrast(Theme.ink.rgb(dark: dark), palette.soft) >= 4.5)
+}

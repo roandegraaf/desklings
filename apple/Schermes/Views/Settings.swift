@@ -321,20 +321,20 @@ private struct FieldPage<Fields: View>: View {
     }
 }
 
-/// What the models sheet edits. The key starts blank and goes out only when something is typed:
-/// an empty key would remove the stored one.
+/// What the models sheet edits.
 struct ModelDraft: Equatable {
     var name = ""
-    var baseUrl = ""
+    var providerId: Int?
     var model = ""
-    var apiKey = ""
     var extraBody = ""
 
-    init() {}
+    init(providerId: Int? = nil) {
+        self.providerId = providerId
+    }
 
     init(_ entry: ModelEntry) {
         name = entry.name
-        baseUrl = entry.baseUrl
+        providerId = entry.providerId
         model = entry.model
         extraBody = entry.extraBody
     }
@@ -342,15 +342,38 @@ struct ModelDraft: Equatable {
     /// Everything for a new entry, only what changed for an existing one.
     func update(from existing: ModelEntry?) -> ModelUpdate {
         let name = name.trimmingCharacters(in: .whitespaces)
-        let baseUrl = baseUrl.trimmingCharacters(in: .whitespaces)
         let model = model.trimmingCharacters(in: .whitespaces)
         let extraBody = typedJSON(extraBody)
         return ModelUpdate(
             name: name == existing?.name ? nil : name,
-            baseUrl: baseUrl == existing?.baseUrl ? nil : baseUrl,
+            providerId: providerId == existing?.providerId ? nil : providerId,
             model: model == existing?.model ? nil : model,
-            apiKey: apiKey.isEmpty ? nil : apiKey,
             extraBody: extraBody == (existing?.extraBody ?? "") ? nil : extraBody
+        )
+    }
+}
+
+/// What the providers sheet edits. The key starts blank and goes out only when something is
+/// typed: an empty key would remove the stored one.
+struct ProviderDraft: Equatable {
+    var name = ""
+    var baseUrl = ""
+    var apiKey = ""
+
+    init() {}
+
+    init(_ entry: ProviderEntry) {
+        name = entry.name
+        baseUrl = entry.baseUrl
+    }
+
+    func update(from existing: ProviderEntry?) -> ProviderUpdate {
+        let name = name.trimmingCharacters(in: .whitespaces)
+        let baseUrl = baseUrl.trimmingCharacters(in: .whitespaces)
+        return ProviderUpdate(
+            name: name == existing?.name ? nil : name,
+            baseUrl: baseUrl == existing?.baseUrl ? nil : baseUrl,
+            apiKey: apiKey.isEmpty ? nil : apiKey
         )
     }
 }
@@ -361,6 +384,11 @@ private struct ModelEdit: Identifiable {
     var entry: ModelEntry? = nil
 }
 
+private struct ProviderEdit: Identifiable {
+    let id = UUID()
+    var entry: ProviderEntry? = nil
+}
+
 /// The model registry: any number of endpoints, one default for agents with none of their own and
 /// an optional backup. The list is fetched again after every change, because the daemon moves the
 /// badges itself (the first entry becomes the default, deleting the backup clears it).
@@ -368,18 +396,68 @@ private struct ModelPage: View {
     let session: Session
 
     @State private var models: [ModelEntry]?
+    @State private var providers: [ProviderEntry]?
     @State private var results: [Int: ProviderTestResult] = [:]
     @State private var testing: Set<Int> = []
     @State private var editing: ModelEdit?
+    @State private var editingProvider: ProviderEdit?
     @State private var removing: ModelEntry?
+    @State private var removingProvider: ProviderEntry?
     @State private var trouble: String?
 
     var body: some View {
         ThemedForm {
             Section {
+                if let providers {
+                    ForEach(providers) { provider in
+                        ProviderRow(
+                            provider: provider,
+                            onEdit: { editingProvider = ProviderEdit(entry: provider) },
+                            onDelete: { removingProvider = provider }
+                        )
+                        #if os(iOS)
+                        .swipeActions {
+                            Button("Delete", systemImage: "trash", role: .destructive) { removingProvider = provider }
+                        }
+                        #endif
+                    }
+                }
+
+                Button("Add provider", systemImage: "plus") { editingProvider = ProviderEdit() }
+                    .buttonStyle(.pill(.secondary))
+                    .disabled(providers == nil)
+            } header: {
+                Text("Providers").formHeader()
+            } footer: {
+                Text("An endpoint and its key, shared by every model you add on it.")
+            }
+            .sheet(item: $editingProvider) { edit in
+                ProviderSheet(session: session, existing: edit.entry) {
+                    results = [:]
+                    Task { await load() }
+                }
+            }
+            .confirmationDialog(
+                removingProvider.map { "Delete \($0.name)?" } ?? "",
+                isPresented: Binding(get: { removingProvider != nil }, set: { if !$0 { removingProvider = nil } }),
+                titleVisibility: .visible,
+                presenting: removingProvider
+            ) { provider in
+                Button("Delete", role: .destructive) {
+                    change { try await $0.deleteProvider(id: provider.id) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { _ in
+                Text("Its endpoint and key are deleted with it.")
+            }
+
+            Section {
                 if let models {
                     if models.isEmpty {
-                        Text("No models yet. Agents cannot think until one is added.").foregroundStyle(Theme.muted)
+                        Text(providers?.isEmpty == false
+                            ? "No models yet. Agents cannot think until one is added."
+                            : "Add a provider first, then the models it serves.")
+                            .foregroundStyle(Theme.muted)
                     }
                     ForEach(models) { entry in
                         ModelRow(
@@ -404,7 +482,7 @@ private struct ModelPage: View {
 
                 Button("Add model", systemImage: "plus") { editing = ModelEdit() }
                     .buttonStyle(.pill(.secondary))
-                    .disabled(models == nil)
+                    .disabled(models == nil || providers?.isEmpty != false)
 
                 if let trouble {
                     Text(trouble)
@@ -412,6 +490,8 @@ private struct ModelPage: View {
                         .foregroundStyle(Theme.failed)
                         .textSelection(.enabled)
                 }
+            } header: {
+                Text("Models").formHeader()
             } footer: {
                 Text("OpenAI-compatible endpoints with tool calling and vision. An agent runs on its own model when it has one, else on the default. The backup stands in when the default is rate-limited or down.")
             }
@@ -422,7 +502,7 @@ private struct ModelPage: View {
         #endif
         .task { await load() }
         .sheet(item: $editing) { edit in
-            ModelSheet(session: session, existing: edit.entry) {
+            ModelSheet(session: session, existing: edit.entry, providers: providers ?? []) {
                 results = [:]
                 Task { await load() }
             }
@@ -439,13 +519,15 @@ private struct ModelPage: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: { _ in
-            Text("Its endpoint and key are deleted with it.")
+            Text("Its provider and key stay.")
         }
     }
 
     private func load() async {
         do {
-            models = try await session.run { try await $0.models() }
+            async let fetchedProviders = session.run { try await $0.providers() }
+            async let fetchedModels = session.run { try await $0.models() }
+            (providers, models) = try await (fetchedProviders, fetchedModels)
         } catch {
             if !error.isCancellation { trouble = error.localizedDescription }
         }
@@ -481,14 +563,14 @@ private struct ModelPage: View {
     }
 }
 
-private struct ModelRow: View {
-    /// The Mac draws it in a round pill beside Test, so the circle would be drawn twice.
-    #if os(macOS)
-    private let moreSymbol = "ellipsis"
-    #else
-    private let moreSymbol = "ellipsis.circle"
-    #endif
+/// The Mac draws it in a round pill, so the circle would be drawn twice.
+#if os(macOS)
+private let moreSymbol = "ellipsis"
+#else
+private let moreSymbol = "ellipsis.circle"
+#endif
 
+private struct ModelRow: View {
     let entry: ModelEntry
     let result: ProviderTestResult?
     let testing: Bool
@@ -536,7 +618,7 @@ private struct ModelRow: View {
             Text(entry.model)
                 .font(.caption.monospaced())
                 .lineLimit(1)
-            Text(entry.baseUrl + (entry.apiKeySet ? "" : " · no key"))
+            Text((entry.providerName ?? entry.baseUrl) + (entry.apiKeySet ? "" : " · no key"))
                 .font(.caption.monospaced())
                 .foregroundStyle(Theme.muted)
                 .lineLimit(1)
@@ -556,6 +638,134 @@ private struct ModelRow: View {
     }
 }
 
+private struct ProviderRow: View {
+    let provider: ProviderEntry
+    let onEdit: () -> Void
+    let onDelete: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(provider.name).font(.headline).lineLimit(1)
+                Text(provider.baseUrl + (provider.apiKeySet ? "" : " · no key"))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Menu("More", systemImage: moreSymbol) {
+                Button("Edit…", systemImage: "pencil", action: onEdit)
+                Divider()
+                Button("Delete…", systemImage: "trash", role: .destructive, action: onDelete)
+            }
+            .labelStyle(.iconOnly)
+            .menuIndicator(.hidden)
+            #if os(macOS)
+            .menuStyle(.button)
+            .buttonStyle(.pill(.secondary, round: true))
+            #endif
+            .fixedSize()
+        }
+        .buttonStyle(.borderless)
+        .controlSize(.small)
+        .padding(.vertical, 2)
+    }
+}
+
+/// Adding or changing one provider. The key is write-only: a stored one shows as set, never as
+/// itself, and a blank field keeps it.
+private struct ProviderSheet: View {
+    let session: Session
+    let existing: ProviderEntry?
+    let onSaved: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var draft: ProviderDraft
+    @State private var trouble: String?
+    @State private var saving = false
+
+    init(session: Session, existing: ProviderEntry?, onSaved: @escaping () -> Void) {
+        self.session = session
+        self.existing = existing
+        self.onSaved = onSaved
+        _draft = State(initialValue: existing.map(ProviderDraft.init) ?? ProviderDraft())
+    }
+
+    var body: some View {
+        ThemedForm {
+            Section {
+                LabeledContent("Name") {
+                    TextField("Name", text: $draft.name, prompt: Text("OpenAI, OpenRouter, Local…"))
+                        .rowField()
+                }
+                LabeledContent("Base URL") {
+                    TextField("Base URL", text: $draft.baseUrl, prompt: Text(verbatim: "https://api.example.com/v1"))
+                        #if os(iOS)
+                        .keyboardType(.URL)
+                        #endif
+                        .rowField()
+                }
+                LabeledContent("API key") {
+                    SecureField("API key", text: $draft.apiKey, prompt: Text(existing?.apiKeySet == true ? "Set" : "Not set"))
+                        .rowField()
+                }
+            } footer: {
+                Text("The key is encrypted on the daemon and never comes back out. Leave it blank to keep the one stored. Every model on this provider uses it.")
+            }
+
+            if let trouble {
+                Section {
+                    Text(trouble)
+                        .font(.footnote)
+                        .foregroundStyle(Theme.failed)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .autocorrectionDisabled()
+        #if os(iOS)
+        .textInputAutocapitalization(.never)
+        #endif
+        .sheetChrome(
+            existing?.name ?? "Add provider",
+            confirm: saving ? "Saving…" : "Save",
+            confirmDisabled: saving,
+            cancel: { dismiss() },
+            onConfirm: save
+        )
+        .presentationBackground(Theme.ground)
+        #if os(macOS)
+        .frame(minWidth: 480, minHeight: 280)
+        #endif
+    }
+
+    private func save() {
+        guard !saving else { return }
+        let update = draft.update(from: existing)
+        guard existing == nil || update != ProviderUpdate() else {
+            dismiss()
+            return
+        }
+        saving = true
+        trouble = nil
+        Task {
+            do {
+                if let existing {
+                    _ = try await session.run { try await $0.updateProvider(id: existing.id, update) }
+                } else {
+                    _ = try await session.run { try await $0.createProvider(update) }
+                }
+                onSaved()
+                dismiss()
+            } catch {
+                if !error.isCancellation { trouble = error.localizedDescription }
+            }
+            saving = false
+        }
+    }
+}
+
 private struct ModelBadge: View {
     let word: String
     let symbol: String
@@ -570,11 +780,11 @@ private struct ModelBadge: View {
     }
 }
 
-/// Adding or changing one model. The key is write-only: a stored one shows as set, never as
-/// itself, and a blank field keeps it.
+/// Adding or changing one model on one of the providers.
 private struct ModelSheet: View {
     let session: Session
     let existing: ModelEntry?
+    let providers: [ProviderEntry]
     let onSaved: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -583,11 +793,12 @@ private struct ModelSheet: View {
     @State private var trouble: String?
     @State private var saving = false
 
-    init(session: Session, existing: ModelEntry?, onSaved: @escaping () -> Void) {
+    init(session: Session, existing: ModelEntry?, providers: [ProviderEntry], onSaved: @escaping () -> Void) {
         self.session = session
         self.existing = existing
+        self.providers = providers
         self.onSaved = onSaved
-        _draft = State(initialValue: existing.map(ModelDraft.init) ?? ModelDraft())
+        _draft = State(initialValue: existing.map(ModelDraft.init) ?? ModelDraft(providerId: providers.first?.id))
     }
 
     var body: some View {
@@ -597,24 +808,21 @@ private struct ModelSheet: View {
                     TextField("Name", text: $draft.name, prompt: Text("Fast, Smart, Local…"))
                         .rowField()
                 }
-                LabeledContent("Base URL") {
-                    TextField("Base URL", text: $draft.baseUrl, prompt: Text(verbatim: "https://api.example.com/v1"))
-                        #if os(iOS)
-                        .keyboardType(.URL)
-                        #endif
-                        .rowField()
+                Picker("Provider", selection: $draft.providerId) {
+                    if draft.providerId == nil {
+                        Text("None").tag(Int?.none)
+                    }
+                    ForEach(providers) { provider in
+                        Text(provider.name).tag(Optional(provider.id))
+                    }
                 }
                 LabeledContent("Model") {
                     TextField("Model", text: $draft.model, prompt: Text(verbatim: "gpt-5"))
                         .font(.body.monospaced())
                         .rowField()
                 }
-                LabeledContent("API key") {
-                    SecureField("API key", text: $draft.apiKey, prompt: Text(existing?.apiKeySet == true ? "Set" : "Not set"))
-                        .rowField()
-                }
             } footer: {
-                Text("The key is encrypted on the daemon and never comes back out. Leave it blank to keep the one stored.")
+                Text("The provider holds the endpoint and the key.")
             }
 
             Section {

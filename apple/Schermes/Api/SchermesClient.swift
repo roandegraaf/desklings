@@ -314,9 +314,12 @@ struct SchermesClient: Sendable {
         name.addingPercentEncoding(withAllowedCharacters: segment) ?? name
     }
 
-    private func send<T: Decodable>(_ method: String, _ url: URL, body: (any Encodable)? = nil) async throws -> T {
+    private func send<T: Decodable>(
+        _ method: String, _ url: URL, body: (any Encodable)? = nil, headers: [String: String] = [:]
+    ) async throws -> T {
         var request = URLRequest(url: url)
         request.httpMethod = method
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         if let body {
             request.httpBody = try JSONEncoder().encode(body)
             request.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -357,8 +360,9 @@ struct SchermesClient: Sendable {
         let _: Empty = try await send("POST", url("/api/auth/logout"), body: Empty())
     }
 
-    func agents() async throws -> [Agent] {
-        try await send("GET", url("/api/agents"))
+    /// `attending` tells the daemon the owner is at this screen, so their phone stays quiet.
+    func agents(attending: Bool = false) async throws -> [Agent] {
+        try await send("GET", url("/api/agents"), headers: attending ? ["x-schermes-attending": "1"] : [:])
     }
 
     func createAgent(_ request: AgentCreate) async throws -> Agent {
@@ -424,6 +428,22 @@ struct SchermesClient: Sendable {
     /// A question over every thread, every agent's files and the text in their screenshots.
     func ask(_ question: String) async throws -> SearchAnswer {
         try await send("POST", url("/api/search"), body: ["q": question])
+    }
+
+    func providers() async throws -> [ProviderEntry] {
+        try await send("GET", url("/api/providers"))
+    }
+
+    func createProvider(_ update: ProviderUpdate) async throws -> ProviderEntry {
+        try await send("POST", url("/api/providers"), body: update)
+    }
+
+    func updateProvider(id: Int, _ update: ProviderUpdate) async throws -> ProviderEntry {
+        try await send("PUT", url("/api/providers/\(id)"), body: update)
+    }
+
+    func deleteProvider(id: Int) async throws {
+        let _: Empty = try await send("DELETE", url("/api/providers/\(id)"))
     }
 
     func models() async throws -> [ModelEntry] {

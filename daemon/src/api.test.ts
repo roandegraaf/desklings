@@ -13,7 +13,7 @@ import { openDb } from './db.ts';
 import { hashPassword, verifyPassword } from './auth.ts';
 import { encrypt as encryptForTest, loadMasterKey } from './secrets.ts';
 import { mcpServers, searchConfig } from './settings.ts';
-import { migrateProviderSettings, providerConfig } from './models.ts';
+import { migrateModelProviders, migrateProviderSettings, modelConfig, providerConfig } from './models.ts';
 import { MAX_MCP_SERVERS } from './mcp.ts';
 import type { Exec, ExecOptions, ExecResult } from './exec.ts';
 import { openAiProvider } from './provider.ts';
@@ -31,6 +31,7 @@ import {
   liveActivityTokens,
   messages as messagesTable,
   models as modelsTable,
+  providers as providersTable,
   settings as settingsTable,
   triggers as triggersTable,
 } from './schema.ts';
@@ -61,7 +62,7 @@ import {
 } from './conversations.ts';
 import { listNeedsYou } from './needs.ts';
 import { APPROVED, GO_AHEAD, describeApproval, insertApproval, listApprovals } from './approvals.ts';
-import { pushCategory } from './push.ts';
+import { ATTENDING_HEADER, pushCategory } from './push.ts';
 import type { PushSend } from './push.ts';
 import { KEEP_SNAPSHOTS_MS, SNAPSHOTS, diffManifests, pruneSnapshots } from './snapshots.ts';
 import { guardCommand, readRules } from './rules.ts';
@@ -77,14 +78,14 @@ import {
   windowOpenedAt,
   DEFAULT_IDLE,
 } from './idle.ts';
-import type { Agent, AgentRules, IdlePass, IdleSettings, Approval, LiveReply, Message, ModelEntry, NeedsYouItem, RewindPreview, SearchAnswer, AgentSuggestion, LiveActivityState } from '@schermes/shared';
+import type { Agent, AgentRules, IdlePass, IdleSettings, Approval, LiveReply, Message, ModelEntry, NeedsYouItem, ProviderEntry, RewindPreview, SearchAnswer, AgentSuggestion, LiveActivityState } from '@schermes/shared';
 
 const MIGRATIONS = resolve(import.meta.dirname, '../migrations');
 const PASSWORD = 'correct-horse-battery';
 /** An agent created with a profile is not interviewed, so a test's scripted replies are its. */
 const PROFILED = 'A test agent.';
 
-function fixture(caps: Partial<Pick<AppDeps, 'maxLoops' | 'retryBaseMs' | 'makeProvider' | 'connect' | 'pushSend' | 'activityThrottleMs'>> = {}) {
+function fixture(caps: Partial<Pick<AppDeps, 'maxLoops' | 'retryBaseMs' | 'makeProvider' | 'connect' | 'pushSend' | 'presence' | 'activityThrottleMs'>> = {}) {
   const db = openDb(':memory:', MIGRATIONS);
   const masterKey = loadMasterKey(join(mkdtempSync(join(tmpdir(), 'schermes-api-')), 'master.key'));
   const spawned: string[] = [];
@@ -618,7 +619,7 @@ test('an unknown agent is refused before the daemon shells out at all', async ()
 });
 
 async function configured(
-  caps: Partial<Pick<AppDeps, 'maxLoops' | 'connect' | 'pushSend' | 'activityThrottleMs'>> = {},
+  caps: Partial<Pick<AppDeps, 'maxLoops' | 'connect' | 'pushSend' | 'presence' | 'activityThrottleMs'>> = {},
 ): Promise<{ f: ReturnType<typeof fixture>; cookie: string }> {
   const f = fixture(caps);
   const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
@@ -2444,6 +2445,41 @@ test('a turn starts, updates and ends its Live Activity through the tokens the p
   assert.deepEqual(events(), ['end:ef']);
 });
 
+test('a reply waits while the owner is at a screen and reaches the phone only once they leave', async () => {
+  const pushed: string[] = [];
+  const pushSend: PushSend = (_host, _headers, body) => {
+    pushed.push(((JSON.parse(body) as { aps: { alert: { body: string } } }).aps.alert.body));
+    return Promise.resolve({ status: 200, body: '' });
+  };
+  const { f, cookie } = await configured({ pushSend, presence: { attendedMs: 20, holdMs: 60 } });
+  await put(f.app, '/api/settings', { pushKeyId: 'K1', pushTeamId: 'T1', pushBundleId: 'dev.x.App', pushKey: P8 }, cookie);
+  await post(f.app, '/api/devices', { token: 'ab'.repeat(32), platform: 'ios' }, cookie);
+  const attend = () => f.app.request('/api/agents', { headers: { cookie, [ATTENDING_HEADER]: '1' } });
+  const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
+  const reply = async (text: string) => {
+    f.replies.push({ text });
+    await post(f.app, '/api/agents/alpha/messages', { text: 'go' }, cookie);
+    await f.settled('alpha');
+  };
+
+  await reply('Away.');
+  await sleep(5);
+  assert.deepEqual(pushed, ['Away.'], 'nobody attending: straight out');
+
+  await attend();
+  await reply('Still here.');
+  for (let i = 0; i < 10; i += 1) {
+    await sleep(10);
+    await attend();
+  }
+  assert.deepEqual(pushed, ['Away.'], 'the owner was at a screen through the hold: dropped');
+
+  await attend();
+  await reply('Walked off.');
+  await sleep(120);
+  assert.deepEqual(pushed, ['Away.', 'Walked off.'], 'the attending went stale before the hold ended');
+});
+
 test('a push about a Needs you item names it and its category, and its buttons answer through the action route', async () => {
   const pushed: Record<string, unknown>[] = [];
   const pushSend: PushSend = (_host, _headers, body) => {
@@ -2557,34 +2593,66 @@ test('the owner fetches a file an agent mentions, only from inside its home', as
   assert.equal(f.ran.at(-1)?.at(-2), '/home/agent-alpha/out.csv', "a worker's files are in its parent's home");
 });
 
-test('models are created, listed, updated, made default or backup and deleted; keys never come back', async () => {
+/** A provider and one model on it, the way the settings screen adds them. */
+async function addModel(
+  app: App,
+  cookie: string,
+  fields: { name: string; baseUrl: string; model: string; apiKey: string },
+): Promise<ModelEntry> {
+  const provider = (await (await post(app, '/api/providers', { name: fields.name, baseUrl: fields.baseUrl, apiKey: fields.apiKey }, cookie)).json()) as ProviderEntry;
+  return (await (await post(app, '/api/models', { name: fields.name, providerId: provider.id, model: fields.model }, cookie)).json()) as ModelEntry;
+}
+
+test('providers hold one key for many models; keys never come back', async () => {
+  const { app, db, masterKey } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  assert.deepEqual(await getJson(app, '/api/providers', cookie), []);
+
+  assert.equal((await post(app, '/api/providers', { name: 'x', baseUrl: 'ftp://x' }, cookie)).status, 400);
+  assert.equal((await post(app, '/api/providers', { baseUrl: 'https://x' }, cookie)).status, 400);
+  const made = await post(app, '/api/providers', { name: 'Acme', baseUrl: 'https://a.example/v1', apiKey: 'sk-first-secret' }, cookie);
+  assert.equal(made.status, 201);
+  const acme = (await made.json()) as ProviderEntry;
+  assert.equal(acme.apiKeySet, true);
+
+  assert.equal((await post(app, '/api/models', { name: 'x', model: 'm' }, cookie)).status, 400, 'a model needs a provider');
+  assert.equal((await post(app, '/api/models', { name: 'x', providerId: 999, model: 'm' }, cookie)).status, 400);
+  const big = (await (await post(app, '/api/models', { name: 'Big', providerId: acme.id, model: 'big' }, cookie)).json()) as ModelEntry;
+  const small = (await (await post(app, '/api/models', { name: 'Small', providerId: acme.id, model: 'small' }, cookie)).json()) as ModelEntry;
+  assert.deepEqual([big.providerName, big.baseUrl, big.apiKeySet], ['Acme', 'https://a.example/v1', true]);
+
+  assert.equal((await put(app, `/api/providers/${acme.id}`, { apiKey: 'sk-second-secret' }, cookie)).status, 200);
+  assert.equal(providerConfig(db, masterKey)?.apiKey, 'sk-second-secret');
+  await put(app, '/api/models/default', { id: small.id }, cookie);
+  assert.deepEqual(providerConfig(db, masterKey), { baseUrl: 'https://a.example/v1', model: 'small', apiKey: 'sk-second-secret' });
+
+  assert.doesNotMatch(await (await app.request('/api/providers', { headers: { cookie } })).text(), /secret/);
+  assert.doesNotMatch(JSON.stringify(db.$client.prepare('select api_key from providers').all()), /secret/);
+
+  assert.equal((await app.request(`/api/providers/${acme.id}`, { method: 'DELETE', headers: { cookie } })).status, 409);
+  const other = (await (await post(app, '/api/providers', { name: 'Other', baseUrl: 'https://b.example/v1' }, cookie)).json()) as ProviderEntry;
+  const moved = (await (await put(app, `/api/models/${big.id}`, { providerId: other.id }, cookie)).json()) as ModelEntry;
+  assert.deepEqual([moved.providerName, moved.apiKeySet], ['Other', false]);
+  assert.equal((await put(app, '/api/providers/999', { name: 'y' }, cookie)).status, 404);
+});
+
+test('models are created, listed, updated, made default or backup and deleted', async () => {
   const { app, db, masterKey } = fixture();
   const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
   assert.deepEqual(await getJson(app, '/api/models', cookie), []);
+  const provider = (await (await post(app, '/api/providers', { name: 'P', baseUrl: 'https://x/v1', apiKey: 'k' }, cookie)).json()) as ProviderEntry;
 
-  assert.equal((await post(app, '/api/models', { name: 'x', baseUrl: 'ftp://x', model: 'm' }, cookie)).status, 400);
-  assert.equal((await post(app, '/api/models', { name: 'x', baseUrl: 'https://x' }, cookie)).status, 400);
-  assert.equal((await post(app, '/api/models', { name: 'x', baseUrl: 'https://x', model: 'm', extraBody: '[1]' }, cookie)).status, 400);
+  assert.equal((await post(app, '/api/models', { name: 'x', providerId: provider.id }, cookie)).status, 400);
+  assert.equal((await post(app, '/api/models', { name: 'x', providerId: provider.id, model: 'm', extraBody: '[1]' }, cookie)).status, 400);
 
-  const first = await post(app, '/api/models', { name: 'Main', baseUrl: 'https://a.example/v1', model: 'big', apiKey: 'sk-first-secret' }, cookie);
-  assert.equal(first.status, 201);
-  const main = (await first.json()) as ModelEntry;
+  const main = await addModel(app, cookie, { name: 'Main', baseUrl: 'https://a.example/v1', model: 'big', apiKey: 'sk-first' });
   assert.equal(main.isDefault, true, 'the first model becomes the default');
-  assert.equal(main.apiKeySet, true);
-  const second = (await (
-    await post(app, '/api/models', { name: 'Spare', baseUrl: 'https://b.example/v1', model: 'small', apiKey: 'sk-second-secret' }, cookie)
-  ).json()) as ModelEntry;
+  const second = await addModel(app, cookie, { name: 'Spare', baseUrl: 'https://b.example/v1', model: 'small', apiKey: 'sk-second' });
   assert.equal(second.isDefault, false);
 
-  const listed = await app.request('/api/models', { headers: { cookie } });
-  assert.doesNotMatch(await listed.text(), /secret/);
-  assert.doesNotMatch(JSON.stringify(db.$client.prepare('select api_key from models').all()), /secret/);
-
-  const renamed = await put(app, `/api/models/${second.id}`, { name: 'Backup', apiKey: 'sk-third-secret' }, cookie);
+  const renamed = await put(app, `/api/models/${second.id}`, { name: 'Backup' }, cookie);
   assert.equal(renamed.status, 200);
-  const renamedText = await renamed.text();
-  assert.doesNotMatch(renamedText, /secret/);
-  assert.equal((JSON.parse(renamedText) as ModelEntry).name, 'Backup');
+  assert.equal(((await renamed.json()) as ModelEntry).name, 'Backup');
   assert.equal((await put(app, '/api/models/999', { name: 'y' }, cookie)).status, 404);
 
   assert.equal((await put(app, '/api/models/backup', { id: second.id }, cookie)).status, 200);
@@ -2596,7 +2664,7 @@ test('models are created, listed, updated, made default or backup and deleted; k
 
   assert.equal((await app.request(`/api/models/${main.id}`, { method: 'DELETE', headers: { cookie } })).status, 409);
   assert.equal((await put(app, '/api/models/default', { id: second.id }, cookie)).status, 200);
-  assert.equal(providerConfig(db, masterKey)?.apiKey, 'sk-third-secret');
+  assert.equal(providerConfig(db, masterKey)?.apiKey, 'sk-second');
   assert.equal((await put(app, '/api/models/default', { id: 999 }, cookie)).status, 404);
 
   assert.equal((await app.request(`/api/models/${main.id}`, { method: 'DELETE', headers: { cookie } })).status, 200);
@@ -2605,11 +2673,40 @@ test('models are created, listed, updated, made default or backup and deleted; k
   assert.deepEqual(entries.map((entry) => [entry.name, entry.isDefault, entry.isBackup]), [['Backup', true, false]]);
 });
 
+test('models carrying their own endpoint and key move onto shared providers once', () => {
+  const masterKey = loadMasterKey(join(mkdtempSync(join(tmpdir(), 'schermes-api-')), 'master.key'));
+  const db = openDb(':memory:', MIGRATIONS);
+  const insert = db.$client.prepare('insert into models (name, base_url, model, api_key, created_at) values (?, ?, ?, ?, 0)');
+  insert.run('a', 'https://one.example/v1', 'm1', encryptForTest(masterKey, 'sk-same'));
+  insert.run('b', 'https://one.example/v1', 'm2', encryptForTest(masterKey, 'sk-same'));
+  insert.run('c', 'https://one.example/v1', 'm3', encryptForTest(masterKey, 'sk-other'));
+  insert.run('d', 'https://two.example/v1', 'm4', encryptForTest(masterKey, 'sk-same'));
+  insert.run('e', 'https://one.example/v1', 'm5', 'not a ciphertext');
+  migrateModelProviders(db, masterKey);
+  const after = JSON.stringify(db.$client.prepare('select * from models').all());
+  migrateModelProviders(db, masterKey);
+  assert.equal(JSON.stringify(db.$client.prepare('select * from models').all()), after, 'a second run changes nothing');
+
+  const rows = db.$client.prepare('select name, provider_id as p, base_url, api_key from models order by id').all() as {
+    name: string;
+    p: number;
+    base_url: string;
+    api_key: string | null;
+  }[];
+  const [a, b, c, d, e] = rows.map((row) => row.p);
+  assert.equal(a, b, 'same endpoint and key share a provider');
+  assert.equal(new Set([a, c, d, e]).size, 4);
+  assert.ok(rows.every((row) => row.base_url === '' && row.api_key === null), 'the old columns are blank');
+  assert.deepEqual(db.$client.prepare('select count(*) as n from providers').get(), { n: 4 });
+  for (const [id, key] of [[1, 'sk-same'], [3, 'sk-other'], [4, 'sk-same']] as const) {
+    assert.equal(modelConfig(db, masterKey, id)?.apiKey, key);
+  }
+  assert.deepEqual(db.$client.prepare('select api_key from providers where id = ?').get(e), { api_key: 'not a ciphertext' });
+});
+
 test('an agent assigned a model runs its turns there; others and its workers use theirs', async () => {
   const { f, cookie } = await configured();
-  const own = (await (
-    await post(f.app, '/api/models', { name: 'Own', baseUrl: 'https://own.example/v1', model: 'own-model', apiKey: 'sk-own' }, cookie)
-  ).json()) as ModelEntry;
+  const own = await addModel(f.app, cookie, { name: 'Own', baseUrl: 'https://own.example/v1', model: 'own-model', apiKey: 'sk-own' });
 
   assert.equal((await put(f.app, '/api/agents/alpha/model', { id: 999 }, cookie)).status, 404);
   assert.equal((await put(f.app, '/api/agents/nobody/model', { id: own.id }, cookie)).status, 404);
@@ -2652,6 +2749,7 @@ test('the old provider settings become the default model once, and a fresh datab
   insert.run('provider.extraBody', '{"reasoning":{"effort":"low"}}', 0);
   migrateProviderSettings(db);
   migrateProviderSettings(db);
+  migrateModelProviders(db, masterKey);
 
   assert.deepEqual(db.$client.prepare("select key from settings where key like 'provider.%'").all(), []);
   assert.deepEqual(providerConfig(db, masterKey), {
@@ -2693,9 +2791,9 @@ async function onStub(retryBaseMs: number, keys: { main: string; backup?: string
   const stub = await troubleStub();
   const f = fixture({ retryBaseMs, makeProvider: openAiProvider });
   const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
-  const main = (await json(await post(f.app, '/api/models', { name: 'Main', baseUrl: stub.baseUrl, model: 'm', apiKey: keys.main }, cookie))) as unknown as ModelEntry;
+  const main = await addModel(f.app, cookie, { name: 'Main', baseUrl: stub.baseUrl, model: 'm', apiKey: keys.main });
   if (keys.backup !== undefined) {
-    const spare = (await json(await post(f.app, '/api/models', { name: 'Spare', baseUrl: stub.baseUrl, model: 'm', apiKey: keys.backup }, cookie))) as unknown as ModelEntry;
+    const spare = await addModel(f.app, cookie, { name: 'Spare', baseUrl: stub.baseUrl, model: 'm', apiKey: keys.backup });
     await f.app.request('/api/models/backup', { method: 'PUT', body: JSON.stringify({ id: spare.id }), headers: { 'content-type': 'application/json', cookie } });
   }
   await post(f.app, '/api/agents', { name: 'alpha', profile: PROFILED }, cookie);
@@ -2774,7 +2872,7 @@ test('a refused key is not retried and shows once for every agent on it, until t
     assert.deepEqual(needs[0]?.actions, ['settings']);
     assert.match(String(needs[0]?.title), /Main/);
 
-    await f.app.request(`/api/models/${main.id}`, {
+    await f.app.request(`/api/providers/${main.providerId}`, {
       method: 'PUT',
       body: JSON.stringify({ apiKey: 'fixed' }),
       headers: { 'content-type': 'application/json', cookie },
@@ -2792,7 +2890,7 @@ test('a call that answers on a refused model clears its item', async () => {
     await post(f.app, '/api/agents/alpha/messages', { text: 'hi' }, cookie);
     assert.equal(await f.settled('alpha'), 'failed');
     assert.equal(((await getJson(f.app, '/api/needs-you', cookie)) as NeedsYouItem[])[0]?.kind, 'provider_auth');
-    f.db.update(modelsTable).set({ apiKey: encryptForTest(f.masterKey, 'good') }).where(eq(modelsTable.id, main.id)).run();
+    f.db.update(providersTable).set({ apiKey: encryptForTest(f.masterKey, 'good') }).where(eq(providersTable.id, main.providerId!)).run();
     await post(f.app, '/api/agents/alpha/messages', { text: 'again' }, cookie);
     assert.equal(await f.settled('alpha'), 'waiting_for_user');
     assert.deepEqual(await getJson(f.app, '/api/needs-you', cookie), []);

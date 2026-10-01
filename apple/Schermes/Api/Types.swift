@@ -10,10 +10,30 @@ struct HealthResponse: Codable, Sendable {
     var setupRequired: Bool
 }
 
-/// One entry of the model registry. The key is only ever reported as set or not.
+/// An endpoint and its key, shared by every model on it. The key is only ever reported as set or not.
+struct ProviderEntry: Codable, Sendable, Identifiable, Equatable {
+    var id: Int
+    var name: String
+    var baseUrl: String
+    var apiKeySet: Bool
+    var createdAt: Int
+}
+
+/// `POST /api/providers` needs name and baseUrl; `PUT /api/providers/:id` keeps what is left out.
+/// An empty `apiKey` removes the stored key, so a blank key field is sent as nothing.
+struct ProviderUpdate: Encodable, Sendable, Equatable {
+    var name: String? = nil
+    var baseUrl: String? = nil
+    var apiKey: String? = nil
+}
+
+/// One entry of the model registry. `baseUrl` and `apiKeySet` are its provider's. The provider
+/// fields are optional so a daemon from before providers still decodes.
 struct ModelEntry: Codable, Sendable, Identifiable, Equatable {
     var id: Int
     var name: String
+    var providerId: Int?
+    var providerName: String?
     var baseUrl: String
     var model: String
     var apiKeySet: Bool
@@ -23,13 +43,11 @@ struct ModelEntry: Codable, Sendable, Identifiable, Equatable {
     var createdAt: Int
 }
 
-/// `POST /api/models` needs name, baseUrl and model; `PUT /api/models/:id` keeps what is left
-/// out. An empty `apiKey` removes the stored key, so a blank key field is sent as nothing.
+/// `POST /api/models` needs name, providerId and model; `PUT /api/models/:id` keeps what is left out.
 struct ModelUpdate: Encodable, Sendable, Equatable {
     var name: String? = nil
-    var baseUrl: String? = nil
+    var providerId: Int? = nil
     var model: String? = nil
-    var apiKey: String? = nil
     var extraBody: String? = nil
 }
 

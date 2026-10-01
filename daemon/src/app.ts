@@ -14,6 +14,7 @@ import type {
   McpTestResult,
   Message,
   ModelEntry,
+  ProviderEntry,
   ProviderTestResult,
   PushTestResult,
   RetryState,
@@ -56,9 +57,13 @@ import {
   backupConfig,
   clearAuthFailure,
   createModel,
+  createProvider,
   deleteModel,
+  deleteProvider,
   findModel,
+  findProvider,
   listModels,
+  listProviders,
   modelConfig,
   modelIdFor,
   parseExtraBody,
@@ -68,16 +73,17 @@ import {
   setBackupModel,
   setDefaultModel,
   updateModel,
+  updateProvider,
   writeProviderSettings,
 } from './models.ts';
-import type { ModelFields } from './models.ts';
+import type { ModelFields, ProviderFields } from './models.ts';
 import { MAX_QUESTION_CHARS, answerSearch } from './search.ts';
 import { MAX_DESCRIPTION_CHARS, suggestAgent } from './suggest.ts';
 import { alwaysAllow, alwaysAllowable, grantOnce, parseLevels, readRules, updateRules } from './rules.ts';
 import { listIdlePasses, readIdle, resolveIdleOutput, updateIdle } from './idle.ts';
 import { MAX_HOOK_BYTES, SECRET_HEADER, actOnTrigger, fireWebhook, listTriggers, loginRequests, saveLogin } from './triggers.ts';
-import { MAX_PUSH_BODY_CHARS, deleteDevice, listDevices, pushCategory, sendPush, upsertDevice } from './push.ts';
-import type { PushSend } from './push.ts';
+import { ATTENDING_HEADER, MAX_PUSH_BODY_CHARS, PRESENCE, deleteDevice, listDevices, pushCategory, sendPush, upsertDevice } from './push.ts';
+import type { Presence, PushSend } from './push.ts';
 import { createLiveActivities } from './liveactivity.ts';
 import {
   AGENT_NAME,
@@ -416,6 +422,8 @@ export type AppDeps = {
   connect?: Connect;
   /** How a push reaches APNs; tests capture it instead. */
   pushSend?: PushSend;
+  /** When the owner counts as at a screen and how long a push waits for them; tests shrink it. */
+  presence?: Presence;
   /** The Live Activity update throttle; tests shrink it. */
   activityThrottleMs?: number;
 };
@@ -431,9 +439,12 @@ export function createApp({
   retryBaseMs = RETRY_BASE_MS,
   connect = cdpConnect,
   pushSend,
+  presence = PRESENCE,
   activityThrottleMs,
 }: AppDeps) {
   const app = new Hono();
+  let attendedAt = -Infinity;
+  const attended = () => Date.now() - attendedAt < presence.attendedMs;
   const activities = createLiveActivities({
     db,
     config: () => pushConfig(db, masterKey),
@@ -517,16 +528,25 @@ export function createApp({
         const push = pushConfig(db, masterKey);
         if (push === undefined) return;
         const item = pushedItem(db, agent.name, conversationId, kind);
-        sendPush(
-          { db, config: push, ...(pushSend === undefined ? {} : { send: pushSend }) },
-          {
-            title: agent.label ?? agent.name,
-            body: text,
-            agent: agent.name,
-            conversationId,
-            ...(item === undefined ? {} : { needsYou: item.id, category: pushCategory(item) }),
-          },
-        ).catch((error: unknown) => log.error('push failed', { agent: agent.name, error }));
+        const send = () =>
+          sendPush(
+            { db, config: push, ...(pushSend === undefined ? {} : { send: pushSend }) },
+            {
+              title: agent.label ?? agent.name,
+              body: text,
+              agent: agent.name,
+              conversationId,
+              ...(item === undefined ? {} : { needsYou: item.id, category: pushCategory(item) }),
+            },
+          ).catch((error: unknown) => log.error('push failed', { agent: agent.name, error }));
+        if (!attended()) {
+          void send();
+          return;
+        }
+        // ponytail: dropped if still attended at the deadline, read or not; server-side read state would let an unread reply follow the owner away later
+        setTimeout(() => {
+          if (!attended()) void send();
+        }, presence.holdMs).unref();
       } catch (error) {
         log.error('push failed', { agent: agent.name, error });
       }
@@ -724,19 +744,38 @@ export function createApp({
 
   function modelFields(body: Record<string, unknown>, creating: boolean): ModelFields | { error: string } {
     const fields: ModelFields = {};
-    for (const name of ['name', 'baseUrl', 'model', 'apiKey', 'extraBody'] as const) {
+    for (const name of ['name', 'model', 'extraBody'] as const) {
       const value = body[name];
       if (value === undefined) continue;
       if (typeof value !== 'string') return { error: `${name} must be a string` };
-      fields[name] = name === 'apiKey' || name === 'extraBody' ? value : value.trim();
+      fields[name] = name === 'extraBody' ? value : value.trim();
     }
-    for (const name of ['name', 'baseUrl', 'model'] as const) {
+    for (const name of ['name', 'model'] as const) {
       if ((creating || fields[name] !== undefined) && !fields[name]) return { error: `${name} is required` };
     }
-    if (fields.baseUrl !== undefined && !validBaseUrl(fields.baseUrl)) return { error: 'baseUrl must be an http(s) URL' };
+    if (body['providerId'] !== undefined || creating) {
+      const providerId = modelId(body['providerId']);
+      if (providerId === undefined || findProvider(db, providerId) === undefined) return { error: 'no such provider' };
+      fields.providerId = providerId;
+    }
     if (fields.extraBody !== undefined && fields.extraBody.trim() !== '' && parseExtraBody(fields.extraBody) === undefined) {
       return { error: 'extraBody must be a JSON object' };
     }
+    return fields;
+  }
+
+  function providerFields(body: Record<string, unknown>, creating: boolean): ProviderFields | { error: string } {
+    const fields: ProviderFields = {};
+    for (const name of ['name', 'baseUrl', 'apiKey'] as const) {
+      const value = body[name];
+      if (value === undefined) continue;
+      if (typeof value !== 'string') return { error: `${name} must be a string` };
+      fields[name] = name === 'apiKey' ? value : value.trim();
+    }
+    for (const name of ['name', 'baseUrl'] as const) {
+      if ((creating || fields[name] !== undefined) && !fields[name]) return { error: `${name} is required` };
+    }
+    if (fields.baseUrl !== undefined && !validBaseUrl(fields.baseUrl)) return { error: 'baseUrl must be an http(s) URL' };
     return fields;
   }
 
@@ -744,12 +783,34 @@ export function createApp({
     return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
   }
 
+  app.get('/api/providers', (c) => c.json<ProviderEntry[]>(listProviders(db)));
+
+  app.post('/api/providers', async (c) => {
+    const fields = providerFields(await jsonBody(c), true);
+    if ('error' in fields) return c.json({ error: fields.error }, 400);
+    return c.json<ProviderEntry>(createProvider(db, masterKey, fields), 201);
+  });
+
+  app.put('/api/providers/:id', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (findProvider(db, id) === undefined) return c.json({ error: 'no such provider' }, 404);
+    const fields = providerFields(await jsonBody(c), false);
+    if ('error' in fields) return c.json({ error: fields.error }, 400);
+    return c.json<ProviderEntry | undefined>(updateProvider(db, masterKey, id, fields));
+  });
+
+  app.delete('/api/providers/:id', (c) => {
+    const result = deleteProvider(db, Number(c.req.param('id')));
+    if ('error' in result) return c.json({ error: result.error }, result.status);
+    return c.json({ ok: true });
+  });
+
   app.get('/api/models', (c) => c.json<ModelEntry[]>(listModels(db)));
 
   app.post('/api/models', async (c) => {
     const fields = modelFields(await jsonBody(c), true);
     if ('error' in fields) return c.json({ error: fields.error }, 400);
-    return c.json<ModelEntry>(createModel(db, masterKey, fields), 201);
+    return c.json<ModelEntry>(createModel(db, fields), 201);
   });
 
   app.put('/api/models/default', async (c) => {
@@ -771,7 +832,7 @@ export function createApp({
     if (findModel(db, id) === undefined) return c.json({ error: 'no such model' }, 404);
     const fields = modelFields(await jsonBody(c), false);
     if ('error' in fields) return c.json({ error: fields.error }, 400);
-    return c.json<ModelEntry | undefined>(updateModel(db, masterKey, id, fields));
+    return c.json<ModelEntry | undefined>(updateModel(db, id, fields));
   });
 
   app.delete('/api/models/:id', (c) => {
@@ -784,7 +845,7 @@ export function createApp({
     const id = Number(c.req.param('id'));
     if (findModel(db, id) === undefined) return c.json({ error: 'no such model' }, 404);
     const settings = modelConfig(db, masterKey, id);
-    if (settings === undefined) return c.json({ error: 'this model needs a base url, a model id and an api key' }, 400);
+    if (settings === undefined) return c.json({ error: 'this model needs a provider with a base url and an api key, and a model id' }, 400);
     const result = await testProvider(settings);
     if (result.ok) clearAuthFailure(db, id);
     return c.json<ProviderTestResult>(result);
@@ -914,9 +975,10 @@ export function createApp({
     runner.start(asker, approval.conversationId);
   }
 
-  app.get('/api/agents', (c) =>
-    c.json(listAgents(db).map((agent) => ({ ...agent, contextFullness: contextFullness(db, agent) }))),
-  );
+  app.get('/api/agents', (c) => {
+    if (c.req.header(ATTENDING_HEADER) !== undefined) attendedAt = Date.now();
+    return c.json(listAgents(db).map((agent) => ({ ...agent, contextFullness: contextFullness(db, agent) })));
+  });
 
   app.get('/api/agents/:name', (c) => {
     const agent = findAgent(db, c.req.param('name'));
