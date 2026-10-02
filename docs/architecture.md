@@ -970,13 +970,6 @@ second copy of what an agent said, no bot token, no account with anybody but App
   buttons the app registers. A button answers through `POST /api/needs-you/:id/action`, which only
   approves or denies; everything else opens the app. A plain reply is about nothing and carries
   neither.
-- **Recommendation** — a permanent agent's turn is also an iOS **Live Activity**, sent from
-  `liveactivity.ts` over the same APNs client. The phone registers push-to-start and per-activity
-  tokens through `POST /api/live-activities`; a turn's start goes to every push-to-start token,
-  updates (its goal updated, an approval asked; throttled to one per five seconds) and the end go
-  to that agent's activity tokens, which are then dropped. One send chain per agent with a
-  strictly increasing timestamp, so an end never overtakes its start. The content is the goal's
-  title and step count, or the owner's last line, the number of waiting items and the state.
 - **Requirement** — `POST /api/settings/push/test` sends one push to every device, so the owner
   learns on the settings screen whether the key, the ids and the phone line up.
 - The app needs a real Apple team and the `aps-environment` entitlement on a device build to be
@@ -1180,7 +1173,7 @@ turns it on.**
 - A `goals` row has a lead, a state, steps (each owned by the lead or a helper), results and a
   list of what is next from the owner. `update_goal` creates and edits it, `add_helper` adds up to
   six helpers. A helper is refused both: the lead keeps the plan. A goal with something next from the owner is a Needs
-  you item; a change updates the lead's Live Activity.
+  you item.
 - **Requirement** — two kinds of helper. A **worker** is a task worker with a real display of its
   own, still under the lead's Linux user, so it gets the computer tool without sharing a mouse. A
   **temporary agent**, `<lead>-g<goal>-<n>`, is a permanent agent with its own Linux user and
@@ -1352,7 +1345,6 @@ them outside the drizzle schema.
 | `events`                    | The structured record of what an agent did                            |
 | `approvals`                 | A standing request: kind, category, target, amount, site, reason      |
 | `devices`                   | APNs device tokens                                                    |
-| `live_activity_tokens`      | Push-to-start and per-activity tokens for Live Activities             |
 | `forms`                     | A form the daemon read for `request_form`, or an IMAP login request   |
 | `form_vault`                | Remembered form values per agent and origin, values encrypted         |
 | `feedback`                  | The owner's thumbs on one reply, cascading with the message           |
@@ -1530,8 +1522,8 @@ WebSocket and `/hooks/:token`. [`apple/README.md`](../apple/README.md) owns the 
   a **Needs you** page and badge (polling `/api/needs-you`, not `/api/approvals`), per-agent
   **Rules**, **When idle** and **Routines and triggers** pages, a **Models** settings page, a
   **goals** section in the sidebar, a **search** panel, restore and forward sheets, the form sheet,
-  and "Show how" on the desktop. Beyond the app itself there are actionable notifications, a
-  Live Activity widget and a share extension on iOS, and a menu bar panel and a Services entry on
+  and "Show how" on the desktop. Beyond the app itself there are actionable notifications and a
+  share extension on iOS, and a menu bar panel and a Services entry on
   the Mac. A notification button or a share runs without a logged-in window, so each signs in
   with the stored address and Keychain password on its own.
 

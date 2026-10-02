@@ -23,10 +23,6 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = relay
         PushCategory.register()
-        LiveActivityTokens.observe()
-        #if DEBUG
-        DebugActivity.startIfAsked()
-        #endif
         return true
     }
 

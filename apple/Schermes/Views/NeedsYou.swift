@@ -76,9 +76,9 @@ func retryStart(_ loaded: [Message], failure: Int) -> Int? {
     return from
 }
 
-/// Everything waiting on the owner, with the answers inline. On a wide window "Right now" and
-/// "Last night" sit in a column beside it.
-struct NeedsYouPage: View {
+/// The owner's dashboard: what waits on them first and loudest, then the agents right now and
+/// what they did while the owner was away. On a wide window the agents sit in a column beside it.
+struct HomePage: View {
     let session: Session
     let items: [NeedsYouItem]
     let agents: [Agent]
@@ -96,11 +96,11 @@ struct NeedsYouPage: View {
                 Group {
                     if twoColumns {
                         HStack(alignment: .top, spacing: 24) {
-                            waiting
-                            VStack(spacing: 14) { rightNow; lastNight }.frame(width: 390)
+                            VStack(spacing: 14) { header; waiting; lastNight }
+                            rightNow.frame(width: 340)
                         }
                     } else {
-                        VStack(spacing: 14) { waiting; rightNow; lastNight }
+                        VStack(spacing: 14) { header; waiting; rightNow; lastNight }
                     }
                 }
                 .padding(.vertical, 32)
@@ -110,8 +110,9 @@ struct NeedsYouPage: View {
             }
         }
         .onGeometryChange(for: Bool.self) { $0.size.width >= 860 } action: { twoColumns = $0 }
+        .animation(.snappy, value: items.map(\.id))
         .background(Theme.ground)
-        .navigationTitle("Needs you")
+        .navigationTitle("Home")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         // Beside the back button, as on the canvas: a `.largeTitle` item is ignored in the split
@@ -120,7 +121,7 @@ struct NeedsYouPage: View {
         .toolbar {
             if !wide {
                 ToolbarItem(placement: .topBarLeading) {
-                    Text("Needs you")
+                    Text("Home")
                         .font(.pageTitle)
                         .fixedSize()
                         .accessibilityAddTraits(.isHeader)
@@ -131,42 +132,65 @@ struct NeedsYouPage: View {
         #endif
     }
 
-    private var waiting: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            if wide {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Needs you")
-                        .font(.pageTitle)
-                        .tracking(-0.7)
-                    Text(summary)
-                        .font(.canvas(15, .subheadline))
-                        .foregroundStyle(Theme.muted)
-                }
-            }
-            ForEach(items) { item in
-                NeedsYouCard(item: item, agent: agents.first { $0.name == item.agent }, titles: titles, onAct: onAct)
-            }
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Home")
+                .font(.pageTitle)
+                .tracking(-0.7)
+            Text(summary)
+                .font(.canvas(15, .subheadline, weight: items.isEmpty ? .regular : .semibold))
+                .foregroundStyle(items.isEmpty ? Theme.muted : Theme.needsYou)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var summary: String {
+        let working = agents.filter(\.state.busy).count
+        let running = working == 0 ? "No agent is working right now."
+            : working == 1 ? "One agent is working right now."
+            : "\(working) agents are working right now."
         switch items.count {
-        case 0: "Nothing is waiting on you. Everything is running on its own."
-        case 1: "One thing is waiting on you. Everything else is running on its own."
-        default: "\(items.count) things are waiting on you. Everything else is running on its own."
+        case 0: return "Nothing needs you. \(running)"
+        case 1: return "One thing is waiting on you."
+        default: return "\(items.count) things are waiting on you."
         }
     }
 
+    /// Only there when something waits, on the Needs you tint so it reads before anything else.
+    @ViewBuilder private var waiting: some View {
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                Label {
+                    Text(items.count == 1 ? "Needs you" : "Needs you · \(items.count)")
+                } icon: {
+                    Image(systemName: "bell.fill")
+                }
+                .font(.canvas(15, .headline, weight: .bold, design: .rounded))
+                .foregroundStyle(Theme.needsYou)
+                .padding(.horizontal, 4)
+                ForEach(items) { item in
+                    NeedsYouCard(item: item, agent: agents.first { $0.name == item.agent }, titles: titles, onAct: onAct)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.needsYouSoft, in: .rect(cornerRadius: 26))
+            .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+        }
+    }
+
+    /// Who is working first, then every other lead agent at rest; a worker only while it works.
     private var rightNow: some View {
         Panel(title: "Right now") {
-            let busy = agents.filter(\.state.busy)
-            if busy.isEmpty {
-                Text("Nothing is running.")
+            let shown = agents.filter(\.state.busy) + agents.filter { !$0.state.busy && $0.parentId == nil }
+            if shown.isEmpty {
+                Text("No agents yet.")
                     .font(.canvas(13, .footnote))
                     .foregroundStyle(Theme.muted)
             }
-            ForEach(busy) { BusyAgentRow(agent: $0) }
+            ForEach(shown) { agent in
+                AgentStateRow(agent: agent, waiting: items.contains { $0.agent == agent.name && $0.kind != .failure })
+            }
         }
     }
 
@@ -177,8 +201,9 @@ struct NeedsYouPage: View {
     }
 }
 
-struct BusyAgentRow: View {
+struct AgentStateRow: View {
     let agent: Agent
+    var waiting = false
     var size: CGFloat = 24
 
     @Environment(AgentLooks.self) private var looks
@@ -186,11 +211,17 @@ struct BusyAgentRow: View {
     var body: some View {
         HStack(spacing: 10) {
             BloubView(state: agent.state.bloub, identity: looks[agent.name], size: size)
-                .busyHalo(true, color: looks[agent.name].color)
+                .busyHalo(agent.state.busy, color: looks[agent.name].color)
             Text(agent.title)
                 .font(.canvas(13, .footnote, weight: .bold))
                 .foregroundStyle(Theme.ink)
-            StateLine(state: agent.state, identity: looks[agent.name], font: .canvas(13, .footnote))
+            if waiting {
+                Label("Needs you", systemImage: "bell")
+                    .font(.canvas(13, .footnote, weight: .semibold))
+                    .foregroundStyle(Theme.needsYou)
+            } else {
+                StateLine(state: agent.state, identity: looks[agent.name], font: .canvas(13, .footnote))
+            }
             Spacer(minLength: 0)
         }
         .padding(.vertical, 6)
@@ -402,6 +433,39 @@ struct NeedsYouCard: View {
     }
 }
 
+/// The top of the iPhone agent list while nothing waits: the quiet way into Home.
+struct HomeStrip: View {
+    let working: Int
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "house.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Theme.secondary)
+                .frame(width: 34, height: 34)
+                .background(Theme.ink.opacity(0.06), in: .rect(cornerRadius: 11))
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Home")
+                    .font(.body.weight(.bold))
+                    .foregroundStyle(Theme.ink)
+                Text(working == 0 ? "Nothing needs you" : "Nothing needs you · \(working) working")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.right")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(Theme.muted)
+        }
+        .padding(.vertical, 12)
+        .padding(.horizontal, 14)
+        .background(Theme.card, in: .rect(cornerRadius: 20))
+        .overlay { RoundedRectangle(cornerRadius: 20).strokeBorder(Theme.hairline) }
+        .accessibilityElement(children: .combine)
+    }
+}
+
 /// The top of the iPhone agent list: how many things wait, the first of them, and the way in.
 struct NeedsYouStrip: View {
     let items: [NeedsYouItem]
@@ -444,6 +508,52 @@ struct NeedsYouStrip: View {
         .padding(.vertical, 12)
         .padding(.horizontal, 14)
         .background(Theme.needsYouFill, in: .rect(cornerRadius: 20))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+extension Approval {
+    /// The outcome as the thread shows it. "Waiting" lasts only until Needs you's next poll lists it.
+    var settled: (symbol: String, word: String, color: Token) {
+        switch outcome {
+        case "approved": ("checkmark.circle.fill", kind == .action ? "Approved" : "Deleted", Theme.done)
+        case "declined": ("xmark.circle.fill", "Declined", Theme.failed)
+        case "handed_back": ("person.crop.circle.badge.checkmark", "You do this yourself", Theme.done)
+        default: ("bell", "Waiting for you", Theme.needsYou)
+        }
+    }
+}
+
+/// An approval request where it was asked in the thread, once it has stopped waiting.
+struct ApprovalLine: View {
+    let approval: Approval
+    let titles: [String: String]
+
+    private func title(_ name: String) -> String { titles[name] ?? name }
+
+    var body: some View {
+        let settled = approval.settled
+        VStack(alignment: .leading, spacing: 6) {
+            Text("\(Text(title(approval.agent)).bold()) \(approval.asks(title))")
+                .font(.canvas(14, .subheadline))
+                .foregroundStyle(Theme.ink)
+            if !approval.reason.isEmpty {
+                Text(approval.reason)
+                    .font(.canvas(13, .footnote))
+                    .foregroundStyle(Theme.secondary)
+            }
+            Label {
+                Text([settled.word, approval.decidedAt.map(shortTime)].compactMap { $0 }.joined(separator: " · "))
+            } icon: {
+                Image(systemName: settled.symbol)
+            }
+            .font(.canvas(12, .caption, weight: .semibold))
+            .foregroundStyle(settled.color)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.card, in: .rect(cornerRadius: 16))
+        .overlay { RoundedRectangle(cornerRadius: 16).strokeBorder(Theme.hairline) }
         .accessibilityElement(children: .combine)
     }
 }

@@ -1382,7 +1382,7 @@ test('request_approval and request_deletion both leave a standing request and ch
     ],
   );
   const result = (id: string) => String(f.messages().find((m) => m.toolCallId === id)?.content);
-  assert.match(result('a1'), /Asked the owner to install software: jq\. Do not do it yet\./);
+  assert.match(result('a1'), /Request 1 to install software: jq is waiting for the owner, shown to them in this thread and in Needs you\. Do not do it yet\./);
   assert.match(result('d1'), /Nothing has been deleted/);
   assert.match(result('a2'), /^error: category must be one of/);
   assert.deepEqual(delivered.slice(0, 2), [

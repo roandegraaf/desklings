@@ -84,7 +84,6 @@ import { listIdlePasses, readIdle, resolveIdleOutput, updateIdle } from './idle.
 import { MAX_HOOK_BYTES, SECRET_HEADER, actOnTrigger, fireWebhook, listTriggers, loginRequests, saveLogin } from './triggers.ts';
 import { ATTENDING_HEADER, MAX_PUSH_BODY_CHARS, PRESENCE, deleteDevice, listDevices, pushCategory, sendPush, upsertDevice } from './push.ts';
 import type { Presence, PushSend } from './push.ts';
-import { createLiveActivities } from './liveactivity.ts';
 import {
   AGENT_NAME,
   MAX_LABEL_CHARS,
@@ -107,7 +106,8 @@ import {
   CATEGORY_WORDS,
   GO_AHEAD,
   describeApproval,
-  dropApproval,
+  settleApproval,
+  threadApprovals,
   findApproval,
   listApprovals,
 } from './approvals.ts';
@@ -116,6 +116,7 @@ import { createRecorder, saveRecording, shownLine } from './recording.ts';
 import type { Recording } from './recording.ts';
 import type { Connect } from './browser.ts';
 import { filledLine, fillSteps, findForm, hideFromAgent, rememberSteps } from './forms.ts';
+import { listReadMarks, markRead } from './read.ts';
 import { formRequests, handOvers, hungBrowsers, listNeedsYou, pushedItem, threadsOf } from './needs.ts';
 import type { DesktopOps } from './agents.ts';
 import { deleteGoal, findGoal, finishGoal, keepHelper, listGoals } from './goals.ts';
@@ -424,8 +425,6 @@ export type AppDeps = {
   pushSend?: PushSend;
   /** When the owner counts as at a screen and how long a push waits for them; tests shrink it. */
   presence?: Presence;
-  /** The Live Activity update throttle; tests shrink it. */
-  activityThrottleMs?: number;
 };
 
 export function createApp({
@@ -440,18 +439,10 @@ export function createApp({
   connect = cdpConnect,
   pushSend,
   presence = PRESENCE,
-  activityThrottleMs,
 }: AppDeps) {
   const app = new Hono();
   let attendedAt = -Infinity;
   const attended = () => Date.now() - attendedAt < presence.attendedMs;
-  const activities = createLiveActivities({
-    db,
-    config: () => pushConfig(db, masterKey),
-    send: pushSend,
-    quiet: attended,
-    ...(activityThrottleMs === undefined ? {} : { throttleMs: activityThrottleMs }),
-  });
   const buildProvider = makeProvider ?? openAiProvider;
   /** The model call each agent is waiting to ask again, with the owner's levers over it. */
   const waits = new Map<string, { state: RetryState; control: RetryControl }>();
@@ -517,14 +508,11 @@ export function createApp({
     // device. Fire and forget; nothing configured or nobody registered is silence, and a
     // failed delivery is a log line.
     rename: (agent, name) => moveAgent(agent, name).then(() => undefined),
-    turn: (agent, phase) => (phase === 'start' ? activities.started(agent) : activities.ended(agent)),
-    progress: (agent) => activities.changed(agent),
     desktop,
     // Called from inside a turn, so a throw here would fail a turn that already finished.
     deliver: (agent, conversationId, text, kind) => {
       try {
         if (agent.parentId !== undefined) return;
-        if (kind === 'approval') activities.changed(agent);
         if (kind !== 'approval' && participantAgents(db, conversationId).length !== 1) return;
         const push = pushConfig(db, masterKey);
         if (push === undefined) return;
@@ -691,21 +679,6 @@ export function createApp({
     // ever have to be pushed to at once.
     writePushIds(db, { teamId, bundleId });
     if (environment !== undefined) writePushSandbox(db, environment === 'development');
-    return c.json({ ok: true }, 201);
-  });
-
-  // A phone's push-to-start token, and each running activity's own token with the agent it shows.
-  app.post('/api/live-activities', async (c) => {
-    const body = await jsonBody(c);
-    const token = stringField(body, 'token') ?? '';
-    const kind = stringField(body, 'kind');
-    const agent = stringField(body, 'agent');
-    if (!DEVICE_TOKEN.test(token)) return c.json({ error: 'token must be a hex APNs token' }, 400);
-    if (kind !== 'start' && kind !== 'update') return c.json({ error: 'kind must be start or update' }, 400);
-    if (kind === 'update' && (agent === undefined || findAgent(db, agent) === undefined)) {
-      return c.json({ error: 'an update token names the agent its activity shows' }, 400);
-    }
-    activities.registered(token.toLowerCase(), kind, kind === 'update' ? agent : undefined);
     return c.json({ ok: true }, 201);
   });
 
@@ -1914,7 +1887,33 @@ export function createApp({
 
   app.get('/api/approvals', (c) => c.json(listApprovals(db)));
 
+  app.get('/api/agents/:name/approvals', (c) => {
+    const agent = findAgent(db, c.req.param('name'));
+    if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
+    return c.json(threadApprovals(db, conversationFor(db, agent.id)));
+  });
+
+  app.get('/api/conversations/:id/approvals', (c) => {
+    const conversation = conversationParam(db, c.req.param('id'));
+    if (conversation === undefined) return c.json({ error: 'no such conversation' }, 404);
+    return c.json(threadApprovals(db, conversation.id));
+  });
+
   app.get('/api/needs-you', (c) => c.json(listNeedsYou(db)));
+
+  app.get('/api/read', (c) => c.json(listReadMarks(db)));
+
+  app.put('/api/read', async (c) => {
+    const body = await jsonBody(c);
+    const thread = stringField(body, 'thread');
+    const messageId = body.messageId;
+    if (thread === undefined || !/^(agent|conversation):.{1,200}$/.test(thread)) {
+      return c.json({ error: 'thread must be agent:<name> or conversation:<id>' }, 400);
+    }
+    if (!Number.isSafeInteger(messageId) || (messageId as number) < 1) return c.json({ error: 'messageId must be a message id' }, 400);
+    markRead(db, thread, messageId as number);
+    return c.json({ ok: true });
+  });
 
   app.get('/api/goals', (c) => c.json<Goal[]>(listGoals(db)));
 
@@ -1953,7 +1952,7 @@ export function createApp({
     return c.json<SearchAnswer>(await answerSearch(db, question, reader, Date.now()));
   });
 
-  /** The owner's answer. Either way the request is gone afterwards and the agent that asked is
+  /** The owner's answer. Either way the request stops waiting and the agent that asked is
    * told, in the thread it asked in, so it learns the outcome the same way it learns anything. */
   const answered = { status: 200 as const, body: { ok: true as const } };
   /** The owner's answer to an approval, from the app's buttons or a notification's. */
@@ -1961,7 +1960,7 @@ export function createApp({
     approval: Approval,
     approve: boolean,
     always: boolean,
-  ): Promise<{ status: 200 | 400 | 409; body: { ok: true } | { error: string } }> {
+  ): Promise<{ status: 200 | 400 | 404 | 409; body: { ok: true } | { error: string } }> {
     const allowed = alwaysAllowable(approval);
     if (always && (!approve || allowed === undefined)) {
       return { status: 400, body: { error: 'only an approved action with a site or recipient can be always allowed' } };
@@ -1975,7 +1974,13 @@ export function createApp({
       return { status: 409, body: { error: `${inFlight.name} is in the middle of a turn; try again in a moment` } };
     }
 
-    dropApproval(db, approval.id);
+    const handedBack =
+      approve && approval.kind === 'action' && asker !== undefined &&
+      readRules(db, asker).levels[approval.category] === 'hand_to_you';
+    const outcome = !approve ? 'declined' : handedBack ? 'handed_back' : 'approved';
+    if (!settleApproval(db, approval.id, outcome, Date.now())) {
+      return { status: 404, body: { error: 'no such request' } };
+    }
     if (asker !== undefined) {
       recordEvent(db, asker.id, 'approval', {
         decided: approval.id,
@@ -1991,7 +1996,7 @@ export function createApp({
     }
 
     if (approval.kind === 'action') {
-      if (asker !== undefined && readRules(db, asker).levels[approval.category] === 'hand_to_you') {
+      if (handedBack) {
         tellTheAsker(
           approval,
           `The owner saw your request to ${describeApproval(approval)} and will do it themselves. Do not do it.`,

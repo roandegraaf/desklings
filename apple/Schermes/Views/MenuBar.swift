@@ -250,7 +250,7 @@ struct MenuBarPanel: View {
                     .foregroundStyle(Theme.muted)
                     .padding(.horizontal, 4)
             }
-            ForEach(busy) { BusyAgentRow(agent: $0, size: 22).padding(.horizontal, 8) }
+            ForEach(busy) { AgentStateRow(agent: $0, size: 22).padding(.horizontal, 8) }
         }
     }
 

@@ -30,7 +30,7 @@ func renderMacScreens() async throws {
         ("main-agent", "agent:juno"),
         ("main-mo", "agent:mo"),
         ("main-bare", "bare:juno"),
-        ("needs-you", "needs-you"),
+        ("home", "home"),
         ("goal", "goal:1"),
         ("search", "search:invoices"),
         ("new-agent", "new-agent"),

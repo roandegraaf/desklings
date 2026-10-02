@@ -385,6 +385,22 @@ private func agent(_ id: Int, _ name: String, label: String? = nil, parentId: In
     #expect(alone == [true])
 }
 
+@Test func anApprovalRequestLeavesTheFoldWhereItWasAsked() {
+    let rows = [
+        message(1, role: .assistant, content: "", toolCalls: [
+            ToolCall(id: "a", name: "run_command", arguments: "{}"),
+            ToolCall(id: "b", name: "request_approval", arguments: "{}"),
+            ToolCall(id: "c", name: "request_deletion", arguments: "{}"),
+        ]),
+        message(2, role: .tool, content: "ok", toolCallId: "a"),
+        message(3, role: .tool, content: "Request 4 to delete files: ~/old is waiting for the owner", toolCallId: "b"),
+        message(4, role: .tool, content: "error: reason must say why", toolCallId: "c"),
+        message(5, role: .assistant, content: "Asked."),
+    ]
+    #expect(chatItems(rows).map(\.id) == ["t1", "r3", "t4", "m5"])
+    #expect(ChatRows(rows, mark: 0).requestCalls == ["b"])
+}
+
 @Test func whatTheChatDrawsIsWorkedOutOnceFromTheRows() {
     let day = 86_400_000
     var rows = [

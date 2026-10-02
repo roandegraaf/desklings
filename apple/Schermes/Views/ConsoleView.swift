@@ -128,7 +128,7 @@ struct ConsoleView: View {
     }
 
     enum SidebarPick: Hashable {
-        case needsYou
+        case home
         case goal(Int)
         case thread(ThreadSource)
         /// An agent's settings page in the chat's place, by agent name. Mac only.
@@ -138,7 +138,7 @@ struct ConsoleView: View {
     /// A whole page in the detail rather than a thread, so there is no agent to inspect.
     private var pickedPage: Bool {
         switch selection {
-        case .needsYou, .goal, .agentSettings: true
+        case .home, .goal, .agentSettings: true
         case .thread, nil: false
         }
     }
@@ -285,8 +285,8 @@ struct ConsoleView: View {
                 .accessibilityLabel("Search or ask")
                 .sidebarRow()
 
-            pickRow(SidebarPick.needsYou) {
-                SidebarNeedsYouRow(count: needs.count, selected: selection == .needsYou)
+            pickRow(SidebarPick.home) {
+                SidebarHomeRow(count: needs.count, selected: selection == .home)
             }
             .sidebarRow()
             .padding(.top, 4)
@@ -303,13 +303,21 @@ struct ConsoleView: View {
                 .buttonStyle(.plain)
                 .keyboardShortcut("k", modifiers: .command)
 
-                pickRow(SidebarPick.needsYou) {
-                    Label("Needs you", systemImage: "bell")
+                pickRow(SidebarPick.home) {
+                    if needs.isEmpty {
+                        Label("Home", systemImage: "house")
+                    } else {
+                        Label("Home", systemImage: "bell.fill").foregroundStyle(Theme.needsYou)
+                    }
                 }
                 .badge(needs.count)
-            } else if !needs.isEmpty {
-                pickRow(SidebarPick.needsYou) {
-                    NeedsYouStrip(items: needs, titles: titles(agents))
+            } else {
+                pickRow(SidebarPick.home) {
+                    if needs.isEmpty {
+                        HomeStrip(working: agents.filter(\.state.busy).count)
+                    } else {
+                        NeedsYouStrip(items: needs, titles: titles(agents))
+                    }
                 }
                 .phoneCardRow(true, below: 10)
             }
@@ -546,7 +554,7 @@ struct ConsoleView: View {
     #if os(macOS)
     /// The rows in the order the sidebar shows them, for the arrow keys.
     private var sidebarOrder: [SidebarPick] {
-        var order: [SidebarPick] = [.needsYou]
+        var order: [SidebarPick] = [.home]
         if query.isEmpty { order += sortedGoals.map { .goal($0.id) } }
         for tree in visible {
             order.append(.thread(.agent(tree.agent.name)))
@@ -694,8 +702,8 @@ struct ConsoleView: View {
         Group {
             if case .agentSettings(let name) = selection {
                 agentSettings(name)
-            } else if selection == .needsYou {
-                NeedsYouPage(session: session, items: needs, agents: agents, wide: roomy) { item, action in
+            } else if selection == .home {
+                HomePage(session: session, items: needs, agents: agents, wide: roomy) { item, action in
                     await act(item, action)
                 }
             } else if case .goal(let id) = selection {
@@ -722,6 +730,8 @@ struct ConsoleView: View {
                     inspector: roomy ? $inspecting : nil,
                     workers: thread.only.map { activeWorkers(of: $0, in: agents) } ?? [],
                     forms: needs.filter { $0.form != nil },
+                    requests: needs.filter { $0.approval != nil },
+                    onAct: { item, action in await act(item, action) },
                     onOpenWorker: { worker in
                         if let parent = agents.first(where: { $0.id == worker.parentId }) {
                             openWorkers.insert(parent.name)
@@ -1054,6 +1064,7 @@ struct ConsoleView: View {
             if needs != pending { needs = pending }
             let listed = (try? await session.run { try await $0.goals() }) ?? goals
             if goals != listed { goals = listed }
+            if let marks = try? await session.run({ try await $0.readMarks() }) { unread.adopt(marks) }
             trouble = nil
             for agent in rows where agent.parentId == nil {
                 await loadPreview(.agent(agent.name))
@@ -1070,15 +1081,15 @@ struct ConsoleView: View {
 
     #if DEBUG
     /// `-schermes.debugOpen <target>` opens a screen once at launch, so a test reaches it without
-    /// clicking: `needs-you`, `goal:<id>`, `agent:<name>`, `bare:<name>` (inspector hidden), `agent-settings:<name>`, `look:<name>` (name and appearance), `search:<question>`, `pages:<name>:<Page raw value>`, `new-agent`, `menu-bar` (Mac, as a sheet) or `settings` (its
+    /// clicking: `home` (or `needs-you`), `goal:<id>`, `agent:<name>`, `bare:<name>` (inspector hidden), `agent-settings:<name>`, `look:<name>` (name and appearance), `search:<question>`, `pages:<name>:<Page raw value>`, `new-agent`, `menu-bar` (Mac, as a sheet) or `settings` (its
     /// tab from `-schermes.settingsTab`).
     private func openLaunchTarget() {
         guard let target = launchTarget else { return }
         launchTarget = nil
         let parts = target.split(separator: ":", maxSplits: 2).map(String.init)
         switch (parts.first, parts.count) {
-        case ("needs-you", 1):
-            selection = .needsYou
+        case ("home", 1), ("needs-you", 1):
+            selection = .home
         case ("goal", 2):
             guard let id = Int(parts[1]) else { return trouble = "No goal id in -schermes.debugOpen \(target)" }
             selection = .goal(id)

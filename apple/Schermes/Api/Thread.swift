@@ -210,11 +210,14 @@ extension AgentState {
 enum ChatItem: Identifiable {
     case message(Message, shown: [Base64Image] = [])
     case tools([ToolStep])
+    /// A request for the owner's approval, out of the fold and drawn where it was asked.
+    case request(ToolStep)
 
     var id: String {
         switch self {
         case .message(let message, _): "m\(message.id)"
         case .tools(let run): "t\(run[0].id)"
+        case .request(let step): "r\(step.id)"
         }
     }
 
@@ -222,9 +225,12 @@ enum ChatItem: Identifiable {
         switch self {
         case .message(let message, _): message
         case .tools(let run): run[0].message
+        case .request(let step): step.message
         }
     }
 }
+
+let approvalTools: Set<String> = ["request_approval", "request_deletion"]
 
 /// One row of a tool run, with the call it answers already looked up on the page.
 struct ToolStep: Hashable, Identifiable {
@@ -253,11 +259,17 @@ func chatItems(_ loaded: [Message], breaks: (Message) -> Bool = { _ in false }) 
             shown.removeAll { $0.sender == message.sender }
         } else {
             if breaks(message) { fold() }
-            run.append(ToolStep(
+            let step = ToolStep(
                 message: message,
                 name: message.toolCallId.flatMap { calls[$0]?.name },
                 orphaned: isOrphanTool(message, calls: calls)
-            ))
+            )
+            if message.role == .tool, let name = step.name, approvalTools.contains(name), !message.content.hasPrefix("error:") {
+                fold()
+                items.append(.request(step))
+            } else {
+                run.append(step)
+            }
         }
     }
     fold()
@@ -295,6 +307,8 @@ struct ChatRows {
     var form: PendingForm?
     /// The agent's newest trigger proposal, until the owner writes after it fired.
     var trigger: PendingTrigger?
+    /// The calls of the approval requests drawn in the thread.
+    var requestCalls: [String] = []
 
     init() {}
 
@@ -317,6 +331,9 @@ struct ChatRows {
         handOver = pendingHandOver(in: loaded)
         form = pendingForm(in: loaded)
         trigger = pendingTrigger(in: loaded)
+        requestCalls = items.compactMap { item in
+            if case .request(let step) = item { step.message.toolCallId } else { nil }
+        }
     }
 }
 

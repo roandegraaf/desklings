@@ -217,7 +217,3 @@ private func text(_ string: AttributedString) -> String { String(string.characte
     #expect(bubbleChunks("- a\n- b") == ["- a\n- b"])
 }
 
-@Test func selectableTextKeepsCodeLinesAndDropsMarkup() {
-    let text = String(selectable("**De fout:** `x`\n\n```\nhello   ok\nvalueOf THROWS\n```\n\n- een").characters)
-    #expect(text == "De fout: x\n\nhello   ok\nvalueOf THROWS\n\n- een")
-}

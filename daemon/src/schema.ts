@@ -197,6 +197,10 @@ export const approvals = sqliteTable('approvals', {
   origin: text('origin'),
   reason: text('reason').notNull(),
   createdAt: integer('created_at').notNull(),
+  callId: text('call_id'),
+  // An ApprovalOutcome; null while it waits for the owner.
+  outcome: text('outcome'),
+  decidedAt: integer('decided_at'),
 });
 
 /** A device the app registered for push, by its APNs token. One row per token, whichever
@@ -206,15 +210,6 @@ export const devices = sqliteTable('devices', {
   token: text('token').notNull().unique(),
   // 'ios' or 'macos'.
   platform: text('platform').notNull(),
-  createdAt: integer('created_at').notNull(),
-});
-
-/** An iPhone's Live Activity tokens: `start` is the phone's push-to-start token, `update` one
- * running activity's, for the agent it shows. Dropped when Apple says the token is gone. */
-export const liveActivityTokens = sqliteTable('live_activity_tokens', {
-  token: text('token').primaryKey(),
-  kind: text('kind').notNull(),
-  agent: text('agent'),
   createdAt: integer('created_at').notNull(),
 });
 
@@ -381,4 +376,10 @@ export const goalHelpers = sqliteTable('goal_helpers', {
   reason: text('reason').notNull(),
   keptAt: integer('kept_at'),
   createdAt: integer('created_at').notNull(),
+});
+
+/** The newest message the owner has read per thread, shared so every device agrees on unread. */
+export const readMarks = sqliteTable('read_marks', {
+  thread: text('thread').primaryKey(),
+  messageId: integer('message_id').notNull(),
 });

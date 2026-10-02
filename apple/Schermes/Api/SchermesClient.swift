@@ -40,7 +40,7 @@ enum ThreadSource: Hashable, Sendable {
     case agent(String)
     case conversation(Int)
 
-    /// How a thread is named in local storage that has to survive a relaunch.
+    /// How a thread is named in read marks, here and on the daemon.
     var key: String {
         switch self {
         case .agent(let name): "agent:\(name)"
@@ -497,6 +497,11 @@ struct SchermesClient: Sendable {
         try await send("GET", messagesURL(source, window))
     }
 
+    /// Every approval asked in the thread, answered ones included.
+    func approvals(_ source: ThreadSource) async throws -> [Approval] {
+        try await send("GET", url(Self.path(source) + "/approvals"))
+    }
+
     /// Removes everything from `from` on. With `retry`, the agents answer the message left last again.
     /// With `files`, every agent in the thread also gets its home back as it was at that point.
     func rewind(_ source: ThreadSource, from: Int, retry: Bool, files: Bool = false) async throws {
@@ -546,13 +551,6 @@ struct SchermesClient: Sendable {
     }
     #endif
 
-    /// A Live Activity token: the phone's push-to-start one, or a running activity's with its agent.
-    func registerLiveActivity(token: String, kind: String, agent: String?) async throws {
-        var body = ["token": token, "kind": kind]
-        if let agent { body["agent"] = agent }
-        let _: Empty = try await send("POST", url("/api/live-activities"), body: body)
-    }
-
     func unregisterDevice(token: String) async throws {
         let _: Empty = try await send("DELETE", url("/api/devices/\(Self.escape(token))"))
     }
@@ -572,6 +570,15 @@ struct SchermesClient: Sendable {
 
     func needsYou() async throws -> [NeedsYouItem] {
         try await send("GET", url("/api/needs-you"))
+    }
+
+    func readMarks() async throws -> [String: Int] {
+        try await send("GET", url("/api/read"))
+    }
+
+    func markRead(_ source: ThreadSource, through id: Int) async throws {
+        struct Mark: Encodable { let thread: String; let messageId: Int }
+        let _: Empty = try await send("PUT", url("/api/read"), body: Mark(thread: source.key, messageId: id))
     }
 
     /// The owner's answer. Either way the request is gone afterwards and the agent that asked is

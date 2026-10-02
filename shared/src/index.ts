@@ -69,27 +69,6 @@ export type PushCategory = 'needs.approval' | 'needs.delete' | 'needs.yours' | '
 /** `POST /api/needs-you/:id/action`: what a notification button answers, without the app open. */
 export type NeedsYouActionRequest = { action: NeedsYouAction };
 
-/** The Live Activity's fixed part, the app's `AgentActivityAttributes`. `look` is `Agent.look`;
- * without it the widget draws the agent's standard colour. The keys must match the Swift
- * property names exactly: ActivityKit decodes them with a default decoder and shows nothing
- * on a mismatch. */
-export type LiveActivityAttributes = { agent: string; label: string; look?: string };
-
-/** The Live Activity's changing part, the app's `AgentActivityAttributes.ContentState`. `title` is
- * the goal the agent leads or helps with, else the owner's last line to it; `state` an
- * `AgentState`. */
-export type LiveActivityState = {
-  title: string;
-  stepsDone: number;
-  stepsTotal: number;
-  needsYou: number;
-  state: string;
-};
-
-/** `POST /api/live-activities`: the phone's push-to-start token, or one running activity's
- * update token and the agent it shows. */
-export type LiveActivityTokenRequest = { token: string; kind: 'start' | 'update'; agent?: string };
-
 /** One configured MCP server as the owner's screen may see it: what it is and which secrets it
  * carries by name, never their values — the provider key's behaviour. A screen that never sees a
  * value cannot send one back, so on `PUT /api/mcp/servers/<name>` a secret sent blank keeps the
@@ -648,10 +627,13 @@ export type Trigger = {
 /** `POST /api/triggers/:id`: turning on is the owner's confirmation. */
 export type TriggerAction = 'on' | 'off' | 'delete';
 
+/** `handed_back` is an approved action whose category the owner does themselves. */
+export type ApprovalOutcome = 'approved' | 'declined' | 'handed_back';
+
 /**
- * A destructive change an agent has asked for and the owner has not answered yet. Nothing is
- * deleted while one of these stands: the daemon keeps the request and performs it only when the
- * owner approves, then writes the outcome back into the thread the request came from.
+ * Something an agent has asked the owner for. Nothing is done while one stands: the daemon
+ * performs it only when the owner approves, then writes the outcome back into the thread the
+ * request came from. Answered rows stay, with their outcome, so the thread can show it.
  */
 export type Approval = {
   id: number;
@@ -674,6 +656,10 @@ export type Approval = {
   participants: string[];
   reason: string;
   createdAt: number;
+  /** The `request_approval` or `request_deletion` call that asked, which places it in the thread. */
+  callId?: string;
+  outcome?: ApprovalOutcome;
+  decidedAt?: number;
 };
 
 export type NeedsYouKind = 'approval' | 'question' | 'failure' | 'provider_auth' | 'browser_hung' | 'hand_over' | 'form' | 'goal';

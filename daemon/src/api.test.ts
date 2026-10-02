@@ -28,7 +28,6 @@ import {
   formVault as formVaultTable,
   forms as formsTable,
   idlePasses as idlePassesTable,
-  liveActivityTokens,
   messages as messagesTable,
   models as modelsTable,
   providers as providersTable,
@@ -61,7 +60,7 @@ import {
   SYSTEM_SENDER,
 } from './conversations.ts';
 import { listNeedsYou } from './needs.ts';
-import { APPROVED, GO_AHEAD, describeApproval, insertApproval, listApprovals } from './approvals.ts';
+import { APPROVED, GO_AHEAD, MAX_PENDING_APPROVALS, describeApproval, insertApproval, listApprovals, pendingCount, settleApproval } from './approvals.ts';
 import { ATTENDING_HEADER, pushCategory } from './push.ts';
 import type { PushSend } from './push.ts';
 import { KEEP_SNAPSHOTS_MS, SNAPSHOTS, diffManifests, pruneSnapshots } from './snapshots.ts';
@@ -78,14 +77,14 @@ import {
   windowOpenedAt,
   DEFAULT_IDLE,
 } from './idle.ts';
-import type { Agent, AgentRules, IdlePass, IdleSettings, Approval, LiveReply, Message, ModelEntry, NeedsYouItem, ProviderEntry, RewindPreview, SearchAnswer, AgentSuggestion, LiveActivityState } from '@schermes/shared';
+import type { Agent, AgentRules, IdlePass, IdleSettings, Approval, LiveReply, Message, ModelEntry, NeedsYouItem, ProviderEntry, RewindPreview, SearchAnswer, AgentSuggestion } from '@schermes/shared';
 
 const MIGRATIONS = resolve(import.meta.dirname, '../migrations');
 const PASSWORD = 'correct-horse-battery';
 /** An agent created with a profile is not interviewed, so a test's scripted replies are its. */
 const PROFILED = 'A test agent.';
 
-function fixture(caps: Partial<Pick<AppDeps, 'maxLoops' | 'retryBaseMs' | 'makeProvider' | 'connect' | 'pushSend' | 'presence' | 'activityThrottleMs'>> = {}) {
+function fixture(caps: Partial<Pick<AppDeps, 'maxLoops' | 'retryBaseMs' | 'makeProvider' | 'connect' | 'pushSend' | 'presence'>> = {}) {
   const db = openDb(':memory:', MIGRATIONS);
   const masterKey = loadMasterKey(join(mkdtempSync(join(tmpdir(), 'schermes-api-')), 'master.key'));
   const spawned: string[] = [];
@@ -619,7 +618,7 @@ test('an unknown agent is refused before the daemon shells out at all', async ()
 });
 
 async function configured(
-  caps: Partial<Pick<AppDeps, 'maxLoops' | 'connect' | 'pushSend' | 'presence' | 'activityThrottleMs'>> = {},
+  caps: Partial<Pick<AppDeps, 'maxLoops' | 'connect' | 'pushSend' | 'presence'>> = {},
 ): Promise<{ f: ReturnType<typeof fixture>; cookie: string }> {
   const f = fixture(caps);
   const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
@@ -1776,7 +1775,7 @@ test('an idle pass cannot send, delete, spend, share or install, whatever the ru
   }
   assert.match(results.get('rm') ?? '', /never may delete files, whatever the rules say/);
   assert.match(results.get('apt') ?? '', /never may install software/);
-  assert.match(results.get('clean') ?? '', /Asked the owner/);
+  assert.match(results.get('clean') ?? '', /is waiting for the owner/);
   const commands = f.ran.map((argv) => argv.join(' '));
   assert.ok(commands.some((c) => c.includes('ls ~')));
   assert.ok(!commands.some((c) => c.includes('rm -rf') || c.includes('apt install') || c.includes('mail -s')));
@@ -1965,6 +1964,51 @@ test('needs you lists approvals, waiting questions and failures, and each leaves
   await post(f.app, '/api/agents/alpha/messages', { text: 'try again' }, cookie);
   await until('waiting_for_user');
   assert.deepEqual(await needs(), []);
+});
+
+test('an approval is placed in its thread by its call, keeps its outcome once answered, and the asker is told', async () => {
+  const { f, cookie } = await configured();
+  const thread = conversationFor(f.db, (findAgent(f.db, 'alpha') as Agent).id);
+  const inThread = async () => (await getJson(f.app, '/api/agents/alpha/approvals', cookie)) as Approval[];
+
+  f.replies.push(
+    {
+      text: '',
+      toolCalls: [
+        { id: 'a1', name: 'request_approval', arguments: JSON.stringify({ category: 'delete_files', target: '~/old', reason: 'Untouched for a year' }) },
+      ],
+    },
+    { text: 'Waiting on you.' },
+  );
+  await post(f.app, '/api/agents/alpha/messages', { text: 'tidy up' }, cookie);
+  assert.equal(await f.settled('alpha'), 'waiting_for_user');
+
+  const [asked] = await inThread();
+  assert.equal(asked?.callId, 'a1');
+  assert.equal(asked?.outcome, undefined);
+  assert.deepEqual(await getJson(f.app, `/api/conversations/${thread}/approvals`, cookie), [asked]);
+  assert.deepEqual(listNeedsYou(f.db).map((item) => item.approval?.id), [asked?.id]);
+  const told = listMessages(f.db, thread).find((m) => m.role === 'tool' && m.toolCallId === 'a1');
+  assert.match(String(told?.content), /is waiting for the owner, shown to them in this thread and in Needs you/);
+
+  f.replies.push({ text: 'Leaving it.' });
+  assert.equal((await post(f.app, `/api/approvals/${asked?.id}`, { approve: false }, cookie)).status, 200);
+  assert.equal((await post(f.app, `/api/approvals/${asked?.id}`, { approve: true }, cookie)).status, 404, 'a second answer is no answer');
+  assert.equal(await f.settled('alpha'), 'waiting_for_user');
+
+  const [answered] = await inThread();
+  assert.equal(answered?.outcome, 'declined');
+  assert.equal(typeof answered?.decidedAt, 'number');
+  assert.deepEqual(listNeedsYou(f.db), []);
+  const rows = listMessages(f.db, thread);
+  assert.equal(rows.filter((m) => /said no to your request to delete files: ~\/old/.test(m.content)).length, 1);
+  assert.equal(rows.at(-1)?.content, 'Leaving it.', 'the answer started a turn that read it');
+
+  for (let n = 0; n < MAX_PENDING_APPROVALS; n += 1) {
+    const old = insertApproval(f.db, findAgent(f.db, 'alpha') as Agent, thread, { kind: 'action', target: '', reason: 'old' });
+    settleApproval(f.db, old.id, 'approved', Date.now());
+  }
+  assert.equal(pendingCount(f.db), 0, 'answered requests do not count against the cap');
 });
 
 test('the owner can stop a turn, and the agent takes the next message afterwards', async () => {
@@ -2376,88 +2420,16 @@ test('the push settings round-trip with the key stored encrypted, and devices re
   assert.equal((await post(app, '/api/settings/push/test', {}, cookie)).status, 400, 'no device');
 });
 
-test('a turn starts, updates and ends its Live Activity through the tokens the phone registered', async () => {
-  const pushed: { headers: Record<string, string>; aps: Record<string, unknown> }[] = [];
-  const pushSend: PushSend = (_host, headers, body) => {
-    pushed.push({ headers, aps: (JSON.parse(body) as { aps: Record<string, unknown> }).aps });
-    return Promise.resolve({ status: 200, body: '' });
-  };
-  const { f, cookie } = await configured({ pushSend, activityThrottleMs: 30 });
-  await put(f.app, '/api/settings', { pushKeyId: 'K1', pushTeamId: 'T1', pushBundleId: 'dev.x.App', pushKey: P8 }, cookie);
-  const register = (body: unknown) => post(f.app, '/api/live-activities', body, cookie);
-  const start = 'cd'.repeat(32);
-  const update = 'ef'.repeat(40);
-  assert.equal((await register({ token: 'nothex', kind: 'start' })).status, 400);
-  assert.equal((await register({ token: start, kind: 'later' })).status, 400);
-  assert.equal((await register({ token: update, kind: 'update' })).status, 400, 'names no agent');
-  assert.equal((await register({ token: update, kind: 'update', agent: 'nobody' })).status, 400);
-  assert.equal((await register({ token: start.toUpperCase(), kind: 'start' })).status, 201);
-  assert.equal((await f.app.request('/api/live-activities', { method: 'POST', body: '{}' })).status, 401);
-  const events = () => pushed.map((p) => `${String(p.aps['event'])}:${p.headers[':path']?.slice(10, 12)}`);
-  const until = async (count: number) => {
-    for (let i = 0; i < 200 && pushed.length < count; i += 1) await new Promise((done) => setTimeout(done, 5));
-    assert.ok(pushed.length >= count, `only ${events().join(', ')}`);
-  };
-
-  const release = f.hold();
-  f.replies.push(
-    { toolCalls: [tool('g', 'update_goal', { title: 'Ship the site', steps: [{ text: 'build', state: 'done' }, { text: 'deploy' }] })] },
-    { text: 'Built it.' },
-  );
-  await post(f.app, '/api/agents/alpha/messages', { text: 'Ship the site\nand tell me' }, cookie);
-  await until(1);
-  const started = pushed[0]!;
-  assert.equal(started.headers[':path'], `/3/device/${start}`);
-  assert.equal(started.headers['apns-topic'], 'dev.x.App.push-type.liveactivity');
-  assert.equal(started.headers['apns-push-type'], 'liveactivity');
-  assert.equal(started.headers['apns-priority'], '10');
-  assert.equal(started.aps['event'], 'start');
-  assert.equal(started.aps['attributes-type'], 'AgentActivityAttributes');
-  assert.deepEqual(started.aps['attributes'], { agent: 'alpha', label: 'alpha' });
-  assert.deepEqual(
-    { ...(started.aps['content-state'] as LiveActivityState), state: '' },
-    { title: 'Ship the site', stepsDone: 0, stepsTotal: 0, needsYou: 0, state: '' },
-    "the owner's first line until there is a goal",
-  );
-
-  // The phone answers the start with the activity's own token; updates go there from now on.
-  assert.equal((await register({ token: update, kind: 'update', agent: 'alpha' })).status, 201);
-  await until(2);
-  assert.equal(events()[1], 'update:ef');
-  release();
-  await f.settled('alpha');
-  await until(4);
-  assert.deepEqual(events().slice(2), ['update:ef', 'end:ef'], 'the goal change, then the end');
-  const progressed = pushed[2]!.aps['content-state'] as LiveActivityState;
-  assert.deepEqual([progressed.title, progressed.stepsDone, progressed.stepsTotal], ['Ship the site', 1, 2]);
-  assert.equal(pushed[2]!.headers['apns-priority'], '5', 'a plain update is not budgeted');
-  const ended = pushed[3]!.aps;
-  assert.equal((ended['content-state'] as LiveActivityState).state, 'waiting_for_user');
-  assert.ok(Number(ended['dismissal-date']) > Number(ended['timestamp']));
-  assert.ok(Number(ended['timestamp']) > Number(pushed[2]!.aps['timestamp']), 'never older than what it follows');
-  const left = f.db.select().from(liveActivityTokens).all();
-  assert.deepEqual(left.map((row) => [row.token, row.kind]), [[start, 'start']], 'an ended activity token is spent');
-
-  // An activity token that arrives after its turn is over is ended straight away.
-  pushed.length = 0;
-  await register({ token: update, kind: 'update', agent: 'alpha' });
-  await until(1);
-  assert.deepEqual(events(), ['end:ef']);
-});
-
 test('a reply waits while the owner is at a screen and reaches the phone only once they leave', async () => {
   const pushed: string[] = [];
-  const activities: string[] = [];
-  const pushSend: PushSend = (_host, headers, body) => {
-    const aps = (JSON.parse(body) as { aps: { alert?: { body: string }; event?: string } }).aps;
-    if (headers['apns-push-type'] === 'liveactivity') activities.push(aps.event ?? '');
-    else pushed.push(aps.alert?.body ?? '');
+  const pushSend: PushSend = (_host, _headers, body) => {
+    const aps = (JSON.parse(body) as { aps: { alert?: { body: string } } }).aps;
+    pushed.push(aps.alert?.body ?? '');
     return Promise.resolve({ status: 200, body: '' });
   };
   const { f, cookie } = await configured({ pushSend, presence: { attendedMs: 20, holdMs: 60 } });
   await put(f.app, '/api/settings', { pushKeyId: 'K1', pushTeamId: 'T1', pushBundleId: 'dev.x.App', pushKey: P8 }, cookie);
   await post(f.app, '/api/devices', { token: 'ab'.repeat(32), platform: 'ios' }, cookie);
-  await post(f.app, '/api/live-activities', { token: 'cd'.repeat(32), kind: 'start' }, cookie);
   const attend = () => f.app.request('/api/agents', { headers: { cookie, [ATTENDING_HEADER]: '1' } });
   const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
   const reply = async (text: string) => {
@@ -2469,7 +2441,6 @@ test('a reply waits while the owner is at a screen and reaches the phone only on
   await reply('Away.');
   await sleep(5);
   assert.deepEqual(pushed, ['Away.'], 'nobody attending: straight out');
-  assert.deepEqual(activities, ['start'], 'and the turn shows on the lock screen');
 
   await attend();
   await reply('Still here.');
@@ -2478,7 +2449,6 @@ test('a reply waits while the owner is at a screen and reaches the phone only on
     await attend();
   }
   assert.deepEqual(pushed, ['Away.'], 'the owner was at a screen through the hold: dropped');
-  assert.deepEqual(activities, ['start'], 'no lock screen activity for a turn the owner is watching');
 
   await attend();
   await reply('Walked off.');
@@ -3717,4 +3687,16 @@ test('a manifest diff compares whole seconds and drops paths that leave the home
   const then = ['4 100.75 a.txt', '4 100.0 gone', '3 5.0 ../up'].map((r) => `${r}\0`).join('');
   const now = ['4 100.0 a.txt', '4 100.0 new file\nline', '9 5.0 /etc/x'].map((r) => `${r}\0`).join('');
   assert.deepEqual(diffManifests(`${then}\0${now}`), { added: ['new file\nline'], changed: [], removed: ['gone'] });
+});
+
+test('read marks are shared across devices and only ever move forward', async () => {
+  const { app } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  assert.deepEqual(await getJson(app, '/api/read', cookie), {});
+  assert.equal((await put(app, '/api/read', { thread: 'agent:ada', messageId: 7 }, cookie)).status, 200);
+  assert.equal((await put(app, '/api/read', { thread: 'agent:ada', messageId: 3 }, cookie)).status, 200);
+  assert.equal((await put(app, '/api/read', { thread: 'conversation:2', messageId: 9 }, cookie)).status, 200);
+  assert.deepEqual(await getJson(app, '/api/read', cookie), { 'agent:ada': 7, 'conversation:2': 9 });
+  assert.equal((await put(app, '/api/read', { thread: 'nonsense', messageId: 1 }, cookie)).status, 400);
+  assert.equal((await put(app, '/api/read', { thread: 'agent:ada', messageId: '8' }, cookie)).status, 400);
 });

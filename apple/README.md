@@ -9,14 +9,12 @@ and its own screen on an iPhone.
 | Target | Platform | Sources | What it is |
 | --- | --- | --- | --- |
 | `Schermes` | iOS and macOS, one target | `Schermes/` | The app. On the Mac it also carries the menu bar extra and the "Send to Schermes…" Service. |
-| `SchermesWidgets` | iOS | `SchermesWidgets/`, plus `AgentActivity.swift`, `Bloub/Skins.swift`, `Bloub/Tables.swift` | The Live Activity: lock screen and Dynamic Island views of an agent's turn. |
 | `SchermesShare` | iOS | `SchermesShare/`, plus `Share.swift`, `Session.swift`, `Api/SchermesClient.swift`, `Api/Types.swift` | The share sheet's "Schermes" entry. |
 | `SchermesTests` | iOS and macOS | `SchermesTests/` | Swift Testing, hosted in the app. |
 
-Both extensions are embedded in the app with `destinationFilters: [iOS]`, so the Mac app ships
-neither. They compile a handful of app files by path rather than the app's views, which is why the
-widget repeats the app's state words and the share sheet draws no bloub and no `Theme` colours. The
-share extension builds with `SCHERMES_EXTENSION`, which leaves out the app-only device
+The share extension is embedded in the app with `destinationFilters: [iOS]`, so the Mac app ships
+none. It compiles a handful of app files by path rather than the app's views, which is why the
+share sheet draws no bloub and no `Theme` colours. It builds with `SCHERMES_EXTENSION`, which leaves out the app-only device
 registration.
 
 The two Mac-only pieces live in the app target:
@@ -65,7 +63,7 @@ registers everything with Apple and makes the profiles:
 xcodebuild -scheme Schermes -destination 'generic/platform=iOS' -allowProvisioningUpdates build
 ```
 
-That one build registers three App IDs (`dev.schermes.Schermes`, `.Widgets`, `.Share`), the push
+That one build registers two App IDs (`dev.schermes.Schermes`, `.Share`), the push
 capability on the app, and the App Group `group.dev.schermes` on the app and the share extension.
 Nothing needs clicking in the developer portal first.
 
@@ -83,13 +81,10 @@ without a profile does not launch. So:
 | --- | --- |
 | `Schermes/Schermes.entitlements` | `aps-environment`, App Group `group.dev.schermes` |
 | `SchermesShare/SchermesShare.entitlements` | App Group `group.dev.schermes` |
-| `SchermesWidgets` | none: a Live Activity needs only `NSSupportsLiveActivities` in the app's `Info.plist` |
 
 The simulator and the Mac build get no push token and no app group. Everything that needs either
-is therefore checked on a physical iPhone, by the owner: remote and actionable push, the Live
-Activity started and updated over APNs, and the share extension (its login hand-off goes through the
-group). The Live Activity's views can still be looked at on a simulator with the DEBUG launch
-argument `-schermes.debugActivity YES`, which starts a local one with made-up content.
+is therefore checked on a physical iPhone, by the owner: remote and actionable push, and the share
+extension (its login hand-off goes through the group).
 
 **The app group.** The share extension has no `Session` and cannot see the app's container, so the
 iPhone app shares two things with it through `group.dev.schermes`:
@@ -181,13 +176,6 @@ Yes and no answer through `POST /api/needs-you/:id/action` from the background, 
 own built off the stored address, since a background launch has no `Session`. "Always allow" is
 never offered on a lock screen. A failed answer comes back as a local notification.
 
-**Live Activity.** While a permanent agent runs a turn, the daemon starts, updates and ends a Live
-Activity on the phone over APNs (goal title, steps done, a Needs you count, the state). The app
-hands the daemon its push-to-start token and each running activity's own token
-(`POST /api/live-activities`, `LiveActivityTokens` in `Notifier.swift`) from launch on, because a
-push-to-start wakes the app in the background. The payload's shape is `AgentActivity.swift`, shared
-with `SchermesWidgets`, and `AgentActivityTests.swift` pins it against the daemon's JSON.
-
 The APNs key itself comes from the developer portal, once per team: Certificates, Identifiers &
 Profiles ▸ Keys ▸ add a key with **Apple Push Notifications service (APNs)** enabled and download
 the `AuthKey_<KEYID>.p8` (it can be downloaded only once). Put its path and id in the daemon's
@@ -227,11 +215,9 @@ itself.
 - `Schermes/Session.swift` owns the server address, the Keychain password and the auth state, and
   on iOS mirrors the address and a password copy into the app group.
 - `Schermes/Notifier.swift` is local notifications, push registration (`PushRegistration`), the
-  actionable categories, the background relay that answers them, and the Live Activity tokens.
+  actionable categories and the background relay that answers them.
 - `Schermes/Share.swift` is shared by the app and `SchermesShare`: the shared item, the message it
   becomes, the upload name, `StoredDaemon`, `SendToSheet`, and the Mac `ShareService`.
-- `Schermes/AgentActivity.swift` is the Live Activity's attributes and state, compiled by the app
-  and `SchermesWidgets`; the widget's views are `SchermesWidgets/AgentActivityWidget.swift`.
 - `Schermes/Views/` is the connect and login screens, the agent list, the chat, an agent's
   routines (schedules) and activity feed, and the settings: one gear opening
   six categories — Models, Web search, Notifications, Plugins (the MCP servers), Daemon and About.
@@ -259,8 +245,7 @@ itself.
   `ImageRenderer` over the engine itself rather than drawn by hand, and downsampled for the Mac's
   sizes. The engine is a pure function of time, so re-rendering it gives the same picture.
 - `SchermesTests/` is the one test target, run on both platforms. Wire types are pinned in
-  `TypesTests`, the palette and state words in `ThemeTests`, the Live Activity JSON in
-  `AgentActivityTests`, the share message and file names in `ShareTests`, the menu bar's
+  `TypesTests`, the palette and state words in `ThemeTests`, the share message and file names in `ShareTests`, the menu bar's
   `@name` parsing in `QuickMessageTests`.
 
 Where the newer screens live, in `Schermes/Views/` unless named otherwise:

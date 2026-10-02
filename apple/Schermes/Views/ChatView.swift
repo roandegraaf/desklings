@@ -52,6 +52,9 @@ struct ChatView: View {
     var workers: [Agent] = []
     /// Needs you's form items: the transcript says a form is waiting, the item holds its fields.
     var forms: [NeedsYouItem] = []
+    /// Needs you's approval items, answered from the card where the request sits in the thread.
+    var requests: [NeedsYouItem] = []
+    var onAct: (NeedsYouItem, NeedsYouAction) async -> Void = { _, _ in }
     var onOpenWorker: (Agent) -> Void = { _ in }
     /// A row to open the thread at instead of the newest, as a search hit asks.
     var focus: Int? = nil
@@ -80,6 +83,8 @@ struct ChatView: View {
     @State private var filling: NeedsYouItem?
     /// The agent's triggers, fetched only while the chat shows a trigger card.
     @State private var triggers: [Trigger] = []
+    /// The thread's approvals, answered ones included, refetched when a request appears or stops waiting.
+    @State private var approvals: [Approval] = []
     /// A reply the owner gave a thumbs down, waiting on the optional reason.
     @State private var faulting: Message?
     @State private var forwarder = Forwarder()
@@ -189,6 +194,64 @@ struct ChatView: View {
         }
     }
 
+    @ViewBuilder private func row(_ item: ChatItem) -> some View {
+        switch item {
+        case .message(let message, _) where message.isIdleNote:
+            IdleNoteLine(millis: message.createdAt)
+        case .message(let message, _) where message.isTriggerLine:
+            TriggerLine(message: message)
+        case .message(let message, _) where message.isRestoreLine:
+            RestoreLine(message: message)
+        case .message(let message, _) where message.isShownLine:
+            ShownLine(message: message)
+        case .message(let message, _) where message.isSystemLine:
+            SystemLine(message: message)
+        case .message(let message, let shown):
+            MessageRow(
+                session: session,
+                message: message,
+                shown: shown,
+                speaker: speakerLabel(of: message, own: thread.only?.name, among: thread.members),
+                bubble: bubble,
+                bubbleText: bubbleText,
+                replyBubble: replyBubble,
+                replyLink: replyLink,
+                enterFrom: arrivals.from[message.id],
+                onRestore: rewindable(restoring: message).map { request in { ask(request) } },
+                onRetry: rewindable(retrying: message).map { request in { ask(request) } },
+                onFeedback: message.role == .assistant ? { rating in rate(message, rating) } : nil
+            )
+            .equatable()
+        case .tools(let run):
+            ToolRun(run: run, by: thread.only == nil ? speaker(of: run[0].message, among: thread.members) : nil)
+                .equatable()
+        case .request(let step):
+            request(step)
+        }
+    }
+
+    /// Answered from the card while it waits; once answered, its outcome. A request from before
+    /// outcomes were kept has no row and stays a tool line.
+    @ViewBuilder private func request(_ step: ToolStep) -> some View {
+        if let approval = approvals.first(where: { $0.callId == step.message.toolCallId }) {
+            if let item = requests.first(where: { $0.approval?.id == approval.id }) {
+                NeedsYouCard(item: item, agent: nil, titles: titles(thread.members), onAct: onAct)
+            } else {
+                ApprovalLine(approval: approval, titles: titles(thread.members))
+            }
+        } else {
+            ToolRun(run: [step], by: thread.only == nil ? speaker(of: step.message, among: thread.members) : nil)
+                .equatable()
+        }
+    }
+
+    private var approvalsKey: [String] { rows.requestCalls + requests.map(\.id) }
+
+    private func loadApprovals() async {
+        guard !rows.requestCalls.isEmpty else { return }
+        if let fresh = try? await session.run({ try await $0.approvals(thread.source) }) { approvals = fresh }
+    }
+
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 16) {
@@ -210,37 +273,7 @@ struct ChatView: View {
                     if message.id == rows.unreadId {
                         NewDivider()
                     }
-                    switch item {
-                    case .message(let message, _) where message.isIdleNote:
-                        IdleNoteLine(millis: message.createdAt)
-                    case .message(let message, _) where message.isTriggerLine:
-                        TriggerLine(message: message)
-                    case .message(let message, _) where message.isRestoreLine:
-                        RestoreLine(message: message)
-                    case .message(let message, _) where message.isShownLine:
-                        ShownLine(message: message)
-                    case .message(let message, _) where message.isSystemLine:
-                        SystemLine(message: message)
-                    case .message(let message, let shown):
-                        MessageRow(
-                            session: session,
-                            message: message,
-                            shown: shown,
-                            speaker: speakerLabel(of: message, own: thread.only?.name, among: thread.members),
-                            bubble: bubble,
-                            bubbleText: bubbleText,
-                            replyBubble: replyBubble,
-                            replyLink: replyLink,
-                            enterFrom: arrivals.from[message.id],
-                            onRestore: rewindable(restoring: message).map { request in { ask(request) } },
-                            onRetry: rewindable(retrying: message).map { request in { ask(request) } },
-                            onFeedback: message.role == .assistant ? { rating in rate(message, rating) } : nil
-                        )
-                        .equatable()
-                    case .tools(let run):
-                        ToolRun(run: run, by: thread.only == nil ? speaker(of: run[0].message, among: thread.members) : nil)
-                            .equatable()
-                    }
+                    row(item)
                 }
 
                 if let live, let agent = thread.only {
@@ -258,6 +291,7 @@ struct ChatView: View {
             .environment(\.arrivals, arrivals)
             .environment(forwarder)
         }
+        .task(id: approvalsKey) { await loadApprovals() }
         .defaultScrollAnchor(.bottom, for: .initialOffset)
         .defaultScrollAnchor(followAnchor, for: .sizeChanges)
         .scrollPosition($position)
@@ -501,7 +535,9 @@ struct ChatView: View {
         // Reading the newest row is what marks the thread seen, wherever the row came from: the
         // first page, a poll, an older page, or the owner's own send.
         .onChange(of: loaded.last?.id) { _, newest in
-            if let newest { unread.see(thread.source, through: newest) }
+            guard let newest, unread.see(thread.source, through: newest) else { return }
+            let source = thread.source
+            Task { try? await session.run { try await $0.markRead(source, through: newest) } }
         }
     }
 
@@ -1660,9 +1696,6 @@ struct MessageRow: View, Equatable {
     @Environment(Forwarder.self) private var forwarder: Forwarder?
     @State private var hovering = false
     @State private var copied = false
-    @State private var selecting = false
-
-    private var canSelect: Bool { !isOwner && !message.content.isEmpty }
     @Environment(\.arrivals) private var arrivals
 
     private var canForward: Bool { forwarder != nil && !message.content.isEmpty }
@@ -1699,13 +1732,11 @@ struct MessageRow: View, Equatable {
         .contentShape(.rect)
         .onHover { hovering = $0 }
         .onAppear { arrivals?.from[message.id] = nil }
-        .sheet(isPresented: $selecting) { SelectTextSheet(content: message.content) }
         .environment(\.forwardedMessage, message.id)
         .contextMenu {
             if !message.content.isEmpty {
                 Button("Copy", systemImage: "doc.on.doc") { copyToPasteboard(message.content) }
             }
-            if canSelect { Button("Select Text", systemImage: "selection.pin.in.out") { selecting = true } }
             if canForward { Button("Send to…", systemImage: "arrowshape.turn.up.right") { forward() } }
             if let onRetry { Button("Retry", systemImage: "arrow.clockwise", action: onRetry) }
             if let onRestore { Button("Restore to this message", systemImage: "arrow.uturn.backward", action: onRestore) }
@@ -1770,7 +1801,6 @@ struct MessageRow: View, Equatable {
             if !message.content.isEmpty {
                 action(copied ? "Copied" : "Copy", copied ? "checkmark" : "doc.on.doc") { copy() }
             }
-            if canSelect { action("Select Text", "selection.pin.in.out") { selecting = true } }
             if canForward { action("Send to…", "arrowshape.turn.up.right") { forward() } }
             if let onRetry { action("Retry", "arrow.clockwise", onRetry) }
             if let onRestore { action("Restore to this message", "arrow.uturn.backward", onRestore) }
@@ -1841,10 +1871,24 @@ struct MessageRow: View, Equatable {
                     enterFrom: enterFrom,
                     files: message.role == .assistant ? message.sender.map { FileSource(session: session, agent: $0) } : nil,
                     fill: replyBubble,
-                    link: replyLink
+                    link: replyLink,
+                    actions: menuActions
                 )
             }
         }
+    }
+
+    private var menuActions: [ReplyAction] {
+        var out = [ReplyAction(title: "Copy Reply", symbol: "doc.on.doc") { copyToPasteboard(message.content) }]
+        if canForward { out.append(ReplyAction(title: "Send to…", symbol: "arrowshape.turn.up.right") { forward() }) }
+        if let onRetry { out.append(ReplyAction(title: "Retry", symbol: "arrow.clockwise", perform: onRetry)) }
+        if let onRestore { out.append(ReplyAction(title: "Restore to this message", symbol: "arrow.uturn.backward", perform: onRestore)) }
+        if onFeedback != nil {
+            for rating in [FeedbackRating.up, .down] {
+                out.append(ReplyAction(title: thumbTitle(rating), symbol: thumbSymbol(rating)) { thumb(rating) })
+            }
+        }
+        return out
     }
 }
 
@@ -1855,17 +1899,19 @@ struct ReplyBubbles: View {
     var files: FileSource?
     let fill: Color
     let link: Color
+    var actions: [ReplyAction] = []
 
     @State private var revealed: Int?
     @State private var played = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    init(chunks: [String], enterFrom: Int? = nil, files: FileSource? = nil, fill: Color, link: Color) {
+    init(chunks: [String], enterFrom: Int? = nil, files: FileSource? = nil, fill: Color, link: Color, actions: [ReplyAction] = []) {
         self.chunks = chunks
         self.enterFrom = enterFrom
         self.files = files
         self.fill = fill
         self.link = link
+        self.actions = actions
         // Set before the first frame: from `.task` the first bubble is already drawn by the time it runs.
         _revealed = State(initialValue: enterFrom)
     }
@@ -1874,26 +1920,26 @@ struct ReplyBubbles: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            ForEach(Array(chunks.prefix(shown).enumerated()), id: \.offset) { index, chunk in
-                MarkdownText(content: chunk, files: files)
-                    .equatable()
-                    .foregroundStyle(Theme.ink)
-                    .tint(link)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(fill, in: UnevenRoundedRectangle(
-                        topLeadingRadius: index == 0 ? 20 : 6,
-                        bottomLeadingRadius: 6,
-                        bottomTrailingRadius: 20,
-                        topTrailingRadius: 20
-                    ))
-                    .transition(reduceMotion ? .opacity : .scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
+            ForEach(Array(replySegments(Array(chunks.prefix(shown))).enumerated()), id: \.offset) { _, segment in
+                Group {
+                    switch segment {
+                    case .text(let bubbles):
+                        ReplyText(chunks: bubbles, files: files, fill: fill, link: link, actions: actions)
+                    case .file(let path):
+                        if let files {
+                            FileCard(source: files, path: path)
+                        } else {
+                            Text(path).font(.callout.monospaced())
+                        }
+                    }
+                }
+                .transition(reduceMotion ? .opacity : .scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
             }
             if shown < chunks.count {
                 TypingBubble(fill: fill).padding(.top, 5)
             }
         }
-        .padding(.trailing, 48)
+        .modifier(FileLinkOpening(files: files))
         .animation(.spring(duration: 0.4, bounce: 0.3), value: shown)
         .task {
             guard let start = enterFrom, !played, start < chunks.count else { return }
@@ -1938,59 +1984,6 @@ struct TypingBubble: View {
         .onAppear { withAnimation(.spring(duration: 0.4, bounce: 0.3)) { appeared = true } }
         .accessibilityLabel("Writing")
     }
-}
-
-/// A selection cannot cross from one bubble's text into the next, so the whole reply goes in one.
-struct SelectTextSheet: View {
-    let content: String
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                Text(selectable(content))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(20)
-            }
-            .navigationTitle("Select Text")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                ToolbarItem(placement: .primaryAction) {
-                    Button("Copy All", systemImage: "doc.on.doc") {
-                        copyToPasteboard(content)
-                        dismiss()
-                    }
-                }
-            }
-        }
-        #if os(macOS)
-        .frame(minWidth: 520, idealWidth: 640, minHeight: 420, idealHeight: 560)
-        #endif
-    }
-}
-
-/// The reply as one text: prose with its inline styling, code exactly as written.
-func selectable(_ content: String) -> AttributedString {
-    var out = AttributedString()
-    for (index, block) in markdownBlocks(content).enumerated() {
-        if index > 0 { out += AttributedString("\n\n") }
-        switch block {
-        case .prose(let text):
-            out += (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-                ?? AttributedString(text)
-        case .code(_, let text):
-            var code = AttributedString(text)
-            code.font = .body.monospaced()
-            out += code
-        case .file(let path):
-            out += AttributedString(path)
-        }
-    }
-    return out
 }
 
 /// Fixed when the bubble is made: the row is redrawn with its arrival cleared while the spring still runs.

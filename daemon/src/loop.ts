@@ -475,8 +475,6 @@ export type LoopDeps = {
   deliver?:
     | ((agent: Agent, conversationId: number, text: string, kind: 'reply' | 'failure' | 'approval') => void)
     | undefined;
-  /** Hears that an agent changed its goal mid-turn. */
-  progress?: ((agent: Agent) => void) | undefined;
 };
 
 /** Writes the transition the moment it happens; the row, not this process, is the truth. */
@@ -1162,7 +1160,7 @@ async function dispatch(
     if ('error' in request) {
       return { text: `error: ${request.error}`, event: { ok: false, error: request.error } };
     }
-    return standingRequest(deps, agent, conversationId, {
+    return standingRequest(deps, agent, conversationId, call.id, {
       ...request,
       target: request.kind === 'conversation' ? String(conversationId) : request.target,
     });
@@ -1173,7 +1171,7 @@ async function dispatch(
     if ('error' in request) {
       return { text: `error: ${request.error}`, event: { ok: false, error: request.error } };
     }
-    return standingRequest(deps, agent, conversationId, request);
+    return standingRequest(deps, agent, conversationId, call.id, request);
   }
 
   if (call.name === PROPOSE_TRIGGER && agent.parentId === undefined) {
@@ -1305,13 +1303,14 @@ function standingRequest(
   deps: LoopDeps,
   agent: Agent,
   conversationId: number,
+  callId: string,
   request: ApprovalRequest,
 ): Observation {
   if (pendingCount(deps.db) >= MAX_PENDING_APPROVALS) {
     const error = `${MAX_PENDING_APPROVALS} requests are already waiting for the owner`;
     return { text: `error: ${error}`, event: { ok: false, error } };
   }
-  const asked = insertApproval(deps.db, agent, conversationId, request);
+  const asked = insertApproval(deps.db, agent, conversationId, request, callId);
   recordEvent(deps.db, agent.id, 'approval', {
     asked: asked.id,
     kind: asked.kind,
@@ -1322,8 +1321,9 @@ function standingRequest(
   const nothingYet = asked.kind === 'action' ? 'Do not do it yet.' : 'Nothing has been deleted.';
   return {
     text:
-      `Asked the owner to ${describeApproval(asked)}. ${nothingYet} The answer ` +
-      'arrives here as a message; carry on with the rest of your work, or end your turn.',
+      `Request ${asked.id} to ${describeApproval(asked)} is waiting for the owner, shown to them ` +
+      `in this thread and in Needs you. ${nothingYet} The answer arrives here as a message; ` +
+      'carry on with the rest of your work, or end your turn.',
     event: { ok: true, approval: asked.id, kind: asked.kind, category: asked.category, target: asked.target },
   };
 }
@@ -1636,7 +1636,6 @@ export async function runAgent(
           ...(observation.image === undefined ? {} : { image: observation.image }),
         });
         recordEvent(db, agent.id, 'tool_result', { callId: call.id, ...observation.event });
-        if (call.name === UPDATE_GOAL && observation.event['ok'] === true) deps.progress?.(agent);
       }
 
       // A human took the mouse. Every call in this reply still got its result — a reply asking
@@ -1738,9 +1737,6 @@ export type RunnerDeps = {
   maxLoops: number;
   maxWorkers: number;
   deliver?: NonNullable<LoopDeps['deliver']> | undefined;
-  progress?: LoopDeps['progress'];
-  /** Hears a permanent agent's turns begin and end, idle passes left out. */
-  turn?: ((agent: Agent, phase: 'start' | 'end') => void) | undefined;
   rename?: LoopDeps['rename'];
   desktop?: DesktopOps | undefined;
   connect?: Connect;
@@ -1787,11 +1783,7 @@ export function createRunner(deps: RunnerDeps): Runner {
       return;
     }
     busy.add(agent.name);
-    const told = idle === undefined && agent.parentId === undefined;
-    if (told) deps.turn?.(agent, 'start');
-    void drain(agent, conversationId, idle).finally(() => {
-      if (told) deps.turn?.(agent, 'end');
-    });
+    void drain(agent, conversationId, idle);
   }
 
   /** `idle` shapes the first round only; what arrives meanwhile gets an ordinary turn. */
@@ -1822,7 +1814,7 @@ export function createRunner(deps: RunnerDeps): Runner {
             provider,
             runner,
             signal: controller.signal,
-            ...(turnIdle === undefined ? {} : { idle: turnIdle, deliver: undefined, progress: undefined }),
+            ...(turnIdle === undefined ? {} : { idle: turnIdle, deliver: undefined }),
           },
           agent,
           conversationId,

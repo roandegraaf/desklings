@@ -1,6 +1,6 @@
-import { asc, eq } from 'drizzle-orm';
+import { and, asc, eq, isNull } from 'drizzle-orm';
 import { APPROVAL_CATEGORIES } from '@schermes/shared';
-import type { Agent, Approval, ApprovalCategory, ApprovalKind } from '@schermes/shared';
+import type { Agent, Approval, ApprovalCategory, ApprovalKind, ApprovalOutcome } from '@schermes/shared';
 import { AGENT_NAME, findAgent, findAgentById, isWorker } from './agents.ts';
 import { participantAgents } from './conversations.ts';
 import { approvals } from './schema.ts';
@@ -57,19 +57,30 @@ function toApproval(db: Db, row: typeof approvals.$inferSelect, agent: string): 
         : [],
     reason: row.reason,
     createdAt: row.createdAt,
+    ...(row.callId === null ? {} : { callId: row.callId }),
+    ...(row.outcome === null ? {} : { outcome: row.outcome as ApprovalOutcome }),
+    ...(row.decidedAt === null ? {} : { decidedAt: row.decidedAt }),
   };
 }
 
+function withAsker(db: Db, rows: (typeof approvals.$inferSelect)[]): Approval[] {
+  return rows.flatMap((row) => {
+    const asker = findAgentById(db, row.agentId);
+    return asker === undefined ? [] : [toApproval(db, row, asker.name)];
+  });
+}
+
+/** The requests still waiting for the owner. */
 export function listApprovals(db: Db): Approval[] {
-  return db
-    .select()
-    .from(approvals)
-    .orderBy(asc(approvals.id))
-    .all()
-    .flatMap((row) => {
-      const asker = findAgentById(db, row.agentId);
-      return asker === undefined ? [] : [toApproval(db, row, asker.name)];
-    });
+  return withAsker(db, db.select().from(approvals).where(isNull(approvals.decidedAt)).orderBy(asc(approvals.id)).all());
+}
+
+/** Every request asked in one thread, answered or not. */
+export function threadApprovals(db: Db, conversationId: number): Approval[] {
+  return withAsker(
+    db,
+    db.select().from(approvals).where(eq(approvals.conversationId, conversationId)).orderBy(asc(approvals.id)).all(),
+  );
 }
 
 export function findApproval(db: Db, id: number): Approval | undefined {
@@ -84,6 +95,7 @@ export function insertApproval(
   agent: Agent,
   conversationId: number,
   request: ApprovalRequest,
+  callId?: string,
 ): Approval {
   const row = db
     .insert(approvals)
@@ -97,18 +109,26 @@ export function insertApproval(
       origin: request.origin ?? null,
       reason: request.reason,
       createdAt: Date.now(),
+      callId: callId ?? null,
     })
     .returning()
     .get();
   return toApproval(db, row, agent.name);
 }
 
-export function dropApproval(db: Db, id: number): void {
-  db.delete(approvals).where(eq(approvals.id, id)).run();
+/** Records the owner's answer. False when it was already answered, so a second tap is no second answer. */
+export function settleApproval(db: Db, id: number, outcome: ApprovalOutcome, now: number): boolean {
+  return (
+    db
+      .update(approvals)
+      .set({ outcome, decidedAt: now })
+      .where(and(eq(approvals.id, id), isNull(approvals.decidedAt)))
+      .run().changes === 1
+  );
 }
 
 export function pendingCount(db: Db): number {
-  return db.select().from(approvals).all().length;
+  return listApprovals(db).length;
 }
 
 /** What a standing request is about, in the words the owner and the agent both read. */

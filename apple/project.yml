@@ -32,9 +32,6 @@ targets:
     sources:
       - path: Schermes
     dependencies:
-      # The Live Activity is iPhone only; the Mac app embeds nothing.
-      - target: SchermesWidgets
-        destinationFilters: [iOS]
       - target: SchermesShare
         destinationFilters: [iOS]
     info:
@@ -53,8 +50,6 @@ targets:
         # one. Without this the prompt gives no reason for the app's own main path.
         NSLocalNetworkUsageDescription:
           Schermes connects to your daemon, which usually runs on this network.
-        # The daemon starts and updates each agent's turn on the lock screen over APNs.
-        NSSupportsLiveActivities: true
         # "Send to Schermes…" in the Mac Services menu (ignored on iOS). Handled by `ShareService`.
         NSServices:
           - NSMenuItem:
@@ -81,30 +76,6 @@ targets:
         # only a device build signed by a real team has. Ad-hoc simulator and Mac builds carry
         # none: a Mac app with a restricted entitlement and no profile does not launch.
         CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]: Schermes/Schermes.entitlements
-
-  # The Live Activity's lock screen and Dynamic Island views. It compiles only the activity's
-  # shared types and the bloub palette out of the app, not the app's views.
-  SchermesWidgets:
-    type: app-extension
-    platform: iOS
-    sources:
-      - path: SchermesWidgets
-      - path: Schermes/AgentActivity.swift
-      - path: Schermes/Bloub/Skins.swift
-      - path: Schermes/Bloub/Tables.swift
-    info:
-      path: SchermesWidgets/Info.plist
-      properties:
-        CFBundleDisplayName: Schermes
-        CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "1"
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.widgetkit-extension
-    settings:
-      base:
-        <<: *signing
-        PRODUCT_BUNDLE_IDENTIFIER: dev.schermes.Schermes.Widgets
-        ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: NO
 
   # The share sheet's "Schermes" entry. It has no `Session`: the address and a copy of the
   # password come from the app group, which only a device build signed by the team carries.

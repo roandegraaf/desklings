@@ -1,7 +1,6 @@
 import Foundation
 import UserNotifications
 #if os(iOS)
-import ActivityKit
 import UIKit
 #else
 import AppKit
@@ -212,58 +211,3 @@ final class NotificationRelay: NSObject, UNUserNotificationCenterDelegate {
     }
 }
 
-#if os(iOS)
-/// Hands the daemon this phone's push-to-start token and each running activity's own token,
-/// from launch on: a push-to-start wakes the app in the background with no `Session`, and the
-/// daemon cannot update or end the activity it started until it hears the new token.
-enum LiveActivityTokens {
-    private static var watched: Set<String> = []
-
-    static func observe() {
-        Task {
-            for await token in Activity<AgentActivityAttributes>.pushToStartTokenUpdates {
-                await register(token, kind: "start", agent: nil)
-            }
-        }
-        Task {
-            for activity in Activity<AgentActivityAttributes>.activities { watch(activity) }
-            for await activity in Activity<AgentActivityAttributes>.activityUpdates { watch(activity) }
-        }
-    }
-
-    private static func watch(_ activity: Activity<AgentActivityAttributes>) {
-        guard watched.insert(activity.id).inserted else { return }
-        Task {
-            for await token in activity.pushTokenUpdates {
-                await register(token, kind: "update", agent: activity.attributes.agent)
-            }
-        }
-    }
-
-    private static func register(_ token: Data, kind: String, agent: String?) async {
-        let hex = token.map { String(format: "%02x", $0) }.joined()
-        try? await NotificationRelay.background { try await $0.registerLiveActivity(token: hex, kind: kind, agent: agent) }
-    }
-}
-
-#if DEBUG
-/// `-schermes.debugActivity YES` starts a local Live Activity at launch, so the lock screen and
-/// Dynamic Island views can be looked at on a simulator, where no liveactivity push arrives.
-enum DebugActivity {
-    static func startIfAsked() {
-        guard UserDefaults.standard.bool(forKey: "schermes.debugActivity") else { return }
-        do {
-            _ = try Activity.request(
-            attributes: AgentActivityAttributes(agent: "alpha", label: "Alpha", look: "cloud:teal"),
-            content: ActivityContent(
-                state: .init(title: "Ship the site", stepsDone: 1, stepsTotal: 3, needsYou: 1, state: "thinking"),
-                staleDate: nil
-            )
-        )
-        } catch {
-            print("debug activity not started: \(error)")
-        }
-    }
-}
-#endif
-#endif

@@ -325,13 +325,15 @@ export function goalPrompt(db: Db, agent: Agent): string {
   const parts = led.map(
     (goal) => `${describeGoal(goal)}\nYou lead it: keep the plan, results and "next from the owner" current with update_goal.`,
   );
+  const start =
+    'When the owner asks for something with several parts or that takes more than one sitting, such as planning a ' +
+    'trip, a move, a launch or a purchase to compare, call update_goal first, before any search: give it a title and ' +
+    'a plan of steps, then work through them and keep it current. A quick question or a single lookup is not a goal.';
   if (helping !== undefined) {
     parts.push(`${describeGoal(helping)}\nYou are a helper on it. Report to ${helping.lead} with send_message; it keeps the plan.`);
   }
-  if (parts.length === 0) {
-    return 'You lead no goals. When the owner gives you a larger aim, update_goal starts one with a plan, and add_helper brings in help.';
-  }
-  return ['Your goals:', ...parts].join('\n\n');
+  if (parts.length === 0) return `You lead no goals. ${start} add_helper brings in help once it runs.`;
+  return ['Your goals:', ...parts, helping === undefined ? start : ''].filter(Boolean).join('\n\n');
 }
 
 export function goalNeeds(db: Db): NeedsYouItem[] {
@@ -379,7 +381,8 @@ export function updateGoalToolDef(): ToolDef {
   return {
     name: UPDATE_GOAL,
     description:
-      'Start or keep up a goal you lead: a larger aim with a plan the owner follows on the goal page. ' +
+      'Start or keep up a goal you lead: work with several parts or that takes more than one sitting, with a plan ' +
+      'the owner follows on the goal page. Start it before doing the work, not after. ' +
       'Without goal it starts a new one (title needed). steps replaces the whole plan; each step has an owner, ' +
       'you or one of the goal\'s helpers. addResults appends what came out of the work; nextFromYou replaces the list ' +
       'of what only the owner can do (an empty list clears it), shown to them under Needs you. finish marks it done ' +

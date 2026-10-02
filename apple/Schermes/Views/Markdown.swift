@@ -245,10 +245,6 @@ struct MarkdownText: View {
     let content: String
     var files: FileSource?
 
-    @State private var previewing: URL?
-    @State private var trouble: String?
-    @Environment(Artifacts.self) private var artifacts: Artifacts?
-
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(markdownBlocks(content).enumerated()), id: \.offset) { _, block in
@@ -265,11 +261,27 @@ struct MarkdownText: View {
                     }
                 }
             }
+        }
+        .textSelection(.enabled)
+        .modifier(FileLinkOpening(files: files))
+    }
+}
+
+/// A link to a file the agent named opens it here: as an artifact where one can show it, else a preview.
+struct FileLinkOpening: ViewModifier {
+    let files: FileSource?
+
+    @State private var previewing: URL?
+    @State private var trouble: String?
+    @Environment(Artifacts.self) private var artifacts: Artifacts?
+
+    func body(content: Content) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            content
             if let trouble {
                 Text(trouble).font(.caption).foregroundStyle(Theme.failed)
             }
         }
-        .textSelection(.enabled)
         .environment(\.openURL, OpenURLAction { url in
             guard let files, let path = linkedFile(url) else { return .systemAction }
             if artifacts?.show(path, from: files) == true { return .handled }

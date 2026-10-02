@@ -490,6 +490,11 @@ struct Approval: Codable, Sendable, Identifiable, Hashable {
     var participants: [String]
     var reason: String
     var createdAt: Int
+    /// The `request_approval` or `request_deletion` call that asked, which places it in the thread.
+    var callId: String?
+    /// `approved`, `declined` or `handed_back`; nil while it waits.
+    var outcome: String?
+    var decidedAt: Int?
 }
 
 /// Open on the wire: form items arrive later, and a kind this build doesn't know

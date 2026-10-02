@@ -230,30 +230,50 @@ struct SidebarSearchRow: View {
     }
 }
 
-struct SidebarNeedsYouRow: View {
+/// Calm when nothing waits; the Needs you tile, fill and count the moment something does.
+struct SidebarHomeRow: View {
     let count: Int
     let selected: Bool
 
+    private var waiting: Bool { count > 0 }
+
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "bell.fill")
+            Image(systemName: waiting ? "bell.fill" : "house.fill")
                 .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(Theme.onNeedsYouTile)
+                .foregroundStyle(waiting ? Theme.onNeedsYouTile : Theme.secondary)
                 .frame(width: 30, height: 30)
-                .background(Theme.needsYouTile, in: .rect(cornerRadius: 10))
-            Text("Needs you")
-                .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(Theme.ink)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            if count > 0 {
+                .background(waiting ? AnyShapeStyle(Theme.needsYouTile) : AnyShapeStyle(Theme.ink.opacity(0.06)), in: .rect(cornerRadius: 10))
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Home")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(Theme.ink)
+                if waiting {
+                    Text(count == 1 ? "1 thing needs you" : "\(count) things need you")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.needsYou)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if waiting {
                 CountCapsule(count: count, fill: AnyShapeStyle(Theme.ink), text: AnyShapeStyle(Theme.onInk))
             }
         }
         .padding(8)
-        .background(selected ? Theme.needsYouFill : Theme.needsYouSoft, in: .rect(cornerRadius: 12))
+        .background(fill, in: .rect(cornerRadius: 12))
+        .animation(.snappy, value: waiting)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Needs you")
-        .accessibilityValue(count > 0 ? "\(count)" : "")
+        .accessibilityLabel("Home")
+        .accessibilityValue(waiting ? (count == 1 ? "1 thing needs you" : "\(count) things need you") : "")
+    }
+
+    private var fill: AnyShapeStyle {
+        switch (waiting, selected) {
+        case (true, true): AnyShapeStyle(Theme.needsYouFill)
+        case (true, false): AnyShapeStyle(Theme.needsYouSoft)
+        case (false, true): AnyShapeStyle(Theme.ink.opacity(0.06))
+        case (false, false): AnyShapeStyle(.clear)
+        }
     }
 }
 

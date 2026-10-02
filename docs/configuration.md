@@ -159,21 +159,6 @@ so it works without the app open — as long as the phone can reach the daemon's
 moment. When the answer does not land (unreachable, or the item went stale and answers 404) the
 app posts a local notification saying so.
 
-### Live Activities
-
-The iPhone's per-agent Live Activity rides the same APNs key, team and bundle id; there is nothing
-more to configure: the pushes go to the same gateway with topic `<bundleId>.push-type.liveactivity`.
-The activity shows the agent's goal steps and how many things need the owner, so it is updated when
-`update_goal` changes the steps or an approval request arrives, and ended when the turn ends. The
-app registers two kinds of token with `POST /api/live-activities` `{token, kind, agent?}`:
-
-| `kind`   | What it is                                                                  |
-| -------- | --------------------------------------------------------------------------- |
-| `start`  | The phone's push-to-start token. A turn of a permanent agent starts an activity on every one, once until that activity reports its own token. |
-| `update` | A running activity's token, naming its `agent`. Updates go there, throttled to one per `ACTIVITY_THROTTLE_MS`, and the end push (dismissed 15 minutes later) drops the token. |
-
-Without a push config or a start token nothing is sent and nothing fails.
-
 ## MCP servers
 
 The owner's MCP servers are **one settings row**, `mcp.servers`, holding the whole list as JSON
@@ -285,7 +270,6 @@ stop", not because anything reads them from the environment. Changing one is a c
 | `APNS_TOKEN_TTL_MS`       | 50 min             | `daemon/src/push.ts`      | How long one provider JWT is reused; APNs refuses one older than an hour |
 | `MAX_PUSH_BODY_CHARS`     | 200                | `daemon/src/push.ts`      | The body of a push; the thread has the rest       |
 | `MAX_IMAGE_BYTES`         | 5 000 000          | `daemon/src/app.ts`       | A picture the owner sends with a message, decoded |
-| `ACTIVITY_THROTTLE_MS`    | 5 s                | `daemon/src/liveactivity.ts` | Between two updates of one Live Activity; the last change is sent when it runs out |
 | `MAX_TRIGGERS`            | 20                 | `daemon/src/triggers.ts`  | Triggers one agent may hold                       |
 | `MAX_HOOK_BYTES`          | 64 KiB             | `daemon/src/triggers.ts`  | One webhook body; more is a 413                   |
 | `MAX_HELPERS`             | 6                  | `daemon/src/goals.ts`     | Helpers one goal may add                          |
