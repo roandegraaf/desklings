@@ -146,10 +146,7 @@ export function describeApproval(approval: Approval): string {
       ? `delete itself (${approval.agent})`
       : `delete the agent ${approval.target}`;
   }
-  const others = approval.participants.filter((name) => name !== approval.agent);
-  return others.length === 0
-    ? 'delete the thread it asked in'
-    : `delete its thread with ${others.join(', ')}`;
+  return 'delete the thread it asked in';
 }
 
 /**

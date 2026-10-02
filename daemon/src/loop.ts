@@ -53,17 +53,17 @@ import {
   appendMessage,
   appendSummary,
   conversationFor,
-  conversationWith,
   existingConversation,
   lastMessageBy,
   lastMessageId,
   latestSummary,
   listConversations,
   listMessages,
+  markAnswered,
+  owedRequests,
   listMessagesWithoutImages,
   parseSendMessage,
   pendingConversation,
-  participantAgents,
   recordEvent,
   repairInterruptedCalls,
   sendMessageToolDef,
@@ -288,12 +288,9 @@ async function compact(
  * How close the agent's own thread is to compaction, 0–100: the measure `compact` takes, against
  * the budget it takes it against. The system text is left out; it is built from the home, which
  * is too slow to read on every poll of the agent list, and is small beside the budget.
- *
- * ponytail: each call scans every participant row, so a poll is O(agents × rows). Build the
- * participant map once per poll if accumulated workers ever make the list slow.
  */
 export function contextFullness(db: Db, agent: Agent): number {
-  const conversationId = existingConversation(db, [agent.id]);
+  const conversationId = existingConversation(db, agent.id);
   if (conversationId === undefined) return 0;
   const summary = latestSummary(db, conversationId, agent.name);
   const replay =
@@ -489,7 +486,6 @@ function transition(db: Db, agent: Agent, to: AgentState): void {
 function systemPrompt(
   agent: Agent,
   screen: Screen,
-  others: readonly string[],
   home: string,
 ): string {
   const intro = [
@@ -516,7 +512,7 @@ function systemPrompt(
     'The moment you have what was asked for, answer: state the result and stop, rather than',
     'checking it again or polishing. When the data is imperfect, answer with the best result',
     'and say what is uncertain; the owner can ask for more. When you are done, reply in plain',
-    'text: a reply with no tool call ends your turn and everyone here can read it.',
+    'text: a reply with no tool call ends your turn and the owner reads it.',
     'The owner reads your reply in a chat app, where each paragraph shows as its own message.',
     'Write the way a person texts: short, casual messages of one thought each, separated by a',
     'blank line, two or three for most replies and a single one when that is all it takes. No',
@@ -528,12 +524,10 @@ function systemPrompt(
     'with no label, sentence or other path on that line, and one line per file. That line shows as',
     'a card they can open. A path inside a sentence shows only as a link, and a file outside your',
     'home cannot be opened at all, so save what you hand over in ~/workspace.',
-    others.length === 0
-      ? 'Nobody but you and the owner is in this conversation.'
-      : `Also here: ${others.join(', ')}. Every message you are shown names who wrote it. ` +
-        'Another agent\'s reply here is addressed to the owner, like yours: read it, but do not ' +
-        'answer, thank or acknowledge it unless it asks you for something. When a message from ' +
-        'another agent needs nothing from you, say so in one line and stop.',
+    'Every message you are shown names who wrote it. When another agent writes to you, your',
+    'final reply goes back to it on its own: answer it there, never with send_message. When an',
+    'agent\'s answer to something you asked needs nothing more from you, carry on with what the',
+    'owner wanted rather than answering it.',
   ].join(' ');
   return `${intro}\n\n${profilePrompt(agent.profile)}\n\n${home}`;
 }
@@ -635,10 +629,7 @@ export function transcript(
   for (const message of kept) {
     if (message.sender !== name) {
       if (message.role === 'tool' || (message.content === '' && message.image === undefined)) continue;
-      const text =
-        message.role === 'assistant'
-          ? `${message.sender} said here, to the owner:\n${message.content}`
-          : `Message from ${message.sender ?? 'the owner'}:\n${message.content}`;
+      const text = `Message from ${message.sender ?? 'the owner'}:\n${message.content}`;
       if (message.image === undefined) {
         pending.push({ role: 'user', text });
       } else if (visible.has(message.id)) {
@@ -725,7 +716,7 @@ function cappedWorkers(deps: LoopDeps): string | undefined {
 /** The runaway guard `send_message` uses, applied to the other way an agent multiplies. A
  * worker's result is an agent-authored message like any other, so it counts here too. */
 function cappedChain(db: Db, conversationId: number): string | undefined {
-  return agentChain(db, conversationId) < MAX_AGENT_CHAIN
+  return agentChain(db, [conversationId]) < MAX_AGENT_CHAIN
     ? undefined
     : `${MAX_AGENT_CHAIN} messages have passed between agents in this thread since the owner ` +
         'last spoke. Answer the owner instead.';
@@ -849,8 +840,8 @@ async function addHelper(deps: LoopDeps, agent: Agent, conversationId: number, r
   }
   const full = deps.runner.atCapacity();
   if (full !== undefined) return undo(full);
-  const thread = conversationWith(deps.db, [agent.id, helper.id]);
-  appendMessage(deps.db, thread, { role: 'user', content: request.brief, sender: agent.name });
+  const thread = conversationFor(deps.db, helper.id);
+  appendMessage(deps.db, thread, { role: 'user', content: request.brief, sender: agent.name, kind: 'request' });
   deps.runner.start(helper, thread);
   return {
     text:
@@ -943,8 +934,8 @@ async function dispatch(
       return { text: `error: ${error}`, event: { ok: false, error } };
     }
 
-    const conversationId = conversationWith(deps.db, [agent.id, target.id]);
-    if (agentChain(deps.db, conversationId) >= MAX_AGENT_CHAIN) {
+    const conversationId = conversationFor(deps.db, target.id);
+    if (agentChain(deps.db, [conversationFor(deps.db, agent.id), conversationId]) >= MAX_AGENT_CHAIN) {
       const error =
         `you and ${target.name} have passed ${MAX_AGENT_CHAIN} messages back and forth without ` +
         'the owner. Answer the owner instead.';
@@ -955,6 +946,7 @@ async function dispatch(
       role: 'user',
       content: request.text,
       sender: agent.name,
+      kind: 'request',
     });
     deps.runner.start(target, conversationId);
     return {
@@ -1408,11 +1400,6 @@ const STATE_FOR_TOOL: Record<string, AgentState> = {
   run_command: 'using_terminal',
 };
 
-/**
- * An answer is addressed to nobody, so it only wakes an agent standing in `waiting_for_agent`
- * for exactly this reply. Without that rule two agents in a group conversation would answer
- * each other forever off one message from the owner.
- */
 export const WORKER_FAILED = 'I could not finish the job';
 export const RUN_FAILED = 'I could not finish this turn';
 export const STOPPED = 'I was stopped here by the owner and did not finish.';
@@ -1430,12 +1417,20 @@ function report(deps: LoopDeps, worker: Agent, parent: Agent, text: string): voi
   deps.runner.start(parent, conversationId);
 }
 
-function wake(deps: LoopDeps, conversationId: number, others: readonly Agent[]): void {
-  for (const other of others) {
-    if (findAgent(deps.db, other.name)?.state === 'waiting_for_agent') {
-      deps.runner.start(other, conversationId);
-    }
+/**
+ * A turn's last word goes back to every agent whose request it covered, into that agent's own
+ * thread. A reply is never a request, so the agent it wakes answers the owner, not this one.
+ */
+function answerRequests(deps: LoopDeps, agent: Agent, owed: readonly { id: number; sender: string }[], text: string): void {
+  if (owed.length === 0) return;
+  for (const name of new Set(owed.map((request) => request.sender))) {
+    const asker = findAgent(deps.db, name);
+    if (asker === undefined || isWorker(asker)) continue;
+    const thread = conversationFor(deps.db, asker.id);
+    appendMessage(deps.db, thread, { role: 'user', content: text, sender: agent.name, kind: 'reply' });
+    deps.runner.start(asker, thread);
   }
+  markAnswered(deps.db, agent.id, owed.at(-1)!.id);
 }
 
 /**
@@ -1450,10 +1445,6 @@ export async function runAgent(
 ): Promise<void> {
   const { db } = deps;
   const parent = agent.parentId === undefined ? undefined : findAgentById(db, agent.parentId);
-  const others =
-    parent === undefined
-      ? participantAgents(db, conversationId).filter((other) => other.id !== agent.id)
-      : [];
   // A worker shares its parent's X display, so giving it the computer tool would put two loops
   // on one mouse. It gets the terminal and nothing else, and it cannot spawn workers of its own.
   const builtin =
@@ -1496,7 +1487,6 @@ export async function runAgent(
       ? systemPrompt(
           findAgent(db, agent.name) ?? agent,
           deps.screen,
-          others.map((other) => other.name),
           await homeTail(deps, agent),
         )
       : workerPrompt(agent, parent.name, helperGoal(db, agent));
@@ -1507,6 +1497,15 @@ export async function runAgent(
   const since = history.at(-1)?.id ?? 0;
   let seen = since;
   const started = (message: Message) => message.id <= since || message.sender === agent.name;
+  const answers = parent === undefined && deps.idle === undefined;
+  const owed = answers ? owedRequests(db, agent.id, conversationId, since) : [];
+  const lastOwn = history.findLast((message) => message.sender === agent.name)?.id ?? 0;
+  const requestIds = new Set(owed.map((request) => request.id));
+  // Asked only by other agents: the answer goes back to them, and the owner reads it in the
+  // thread without a push on top of the one the asking agent's own answer will send.
+  const onlyAgentsAsked =
+    owed.length > 0 &&
+    history.every((message) => message.id <= lastOwn || message.role !== 'user' || requestIds.has(message.id));
   // Decided here with the system text rather than between steps, for the same reason: every
   // step of this turn is handed the same request head, and the summariser runs at most once.
   const replay = await compact(
@@ -1598,9 +1597,12 @@ export async function runAgent(
           report(deps, agent, parent, reply.text.trim() === '' ? NOTHING_TO_REPORT : reply.text);
           return;
         }
-        transition(db, agent, endState());
-        wake(deps, conversationId, others);
-        deps.deliver?.(agent, conversationId, reply.text, 'reply');
+        const ending = endState();
+        transition(db, agent, ending);
+        if (ending === 'waiting_for_user') {
+          answerRequests(deps, agent, owed, reply.text.trim() === '' ? NOTHING_TO_REPORT : reply.text);
+        }
+        if (!onlyAgentsAsked) deps.deliver?.(agent, conversationId, reply.text, 'reply');
         return;
       }
 
@@ -1696,6 +1698,7 @@ export async function runAgent(
     // send, so the failure travels the same path the result would have.
     if (parent !== undefined) report(deps, agent, parent, `${WORKER_FAILED}: ${message}`);
     else deps.deliver?.(agent, conversationId, `${RUN_FAILED}: ${message}`, 'failure');
+    answerRequests(deps, agent, owed, `${RUN_FAILED}: ${message}`);
     log.error('agent run failed', { agent: agent.name, error });
   } finally {
     // What the turn cost, on every way out. The tokens are only what the endpoint reported;

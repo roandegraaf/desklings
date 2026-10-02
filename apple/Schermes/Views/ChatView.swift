@@ -953,8 +953,10 @@ struct ChatView: View {
                         // Not a vertical `TextField`: on macOS that one clips past its line limit and
                         // ignores the scroll wheel. The editor is sized by a copy of the draft underneath,
                         // which doubles as the placeholder: inside the split view its own height is zero.
-                        Text(draft.isEmpty ? placeholder : draft + " ")
-                            .lineLimit(5)
+                        ViewThatFits(in: .horizontal) {
+                            Text(draft.isEmpty ? placeholder : draft + " ").lineLimit(draft.isEmpty ? 1 : 5)
+                            Text(draft.isEmpty ? recipient : draft + " ").lineLimit(draft.isEmpty ? 1 : 5)
+                        }
                             .foregroundStyle(.tertiary)
                             .opacity(draft.isEmpty ? 1 : 0)
                             .padding(.horizontal, 5)

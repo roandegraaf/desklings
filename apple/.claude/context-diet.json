@@ -1,0 +1,53 @@
+{
+  "_note": "written by context-diet on 2026-10-02; edit freely, an existing file is never regenerated except by /diet init",
+  "mcp": [
+    "Neon",
+    "afpunter-live",
+    "higgsfield",
+    "monitorzz",
+    "plugin_legal_atlassian",
+    "plugin_legal_docusign",
+    "plugin_legal_egnyte",
+    "plugin_legal_slack",
+    "plugin_stripe_stripe",
+    "figma",
+    "figma-desktop",
+    "mobbin",
+    "claude_ai_Linear",
+    "claude_ai_Notion",
+    "claude_ai_Gmail",
+    "claude_ai_Google_Calendar",
+    "claude_ai_Google_Drive"
+  ],
+  "skills": [
+    "landing-page-audit",
+    "payload",
+    "stripe:*",
+    "osmo:osmo",
+    "dezzign:dezzign",
+    "hyperframes:*",
+    "kicad-happy:*",
+    "cowork-plugin-management:*",
+    "legal:*",
+    "dataviz",
+    "artifact-design",
+    "artifact-diagramming",
+    "artifact-capabilities",
+    "anthropic-skills:docs",
+    "anthropic-skills:docx",
+    "anthropic-skills:google-workspace",
+    "anthropic-skills:import-memory",
+    "anthropic-skills:morning",
+    "anthropic-skills:pdf",
+    "anthropic-skills:pptx",
+    "anthropic-skills:xlsx",
+    "onboarding-wizard-design",
+    "apple-design",
+    "plugin-authoring",
+    "workflow-authoring",
+    "claude-api"
+  ],
+  "agents": [
+    "stripe:Company Researcher"
+  ]
+}

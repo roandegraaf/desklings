@@ -225,15 +225,6 @@ private func encode(_ value: some Encodable) throws -> String {
     #expect(events[2].data["note"] == JSONValue.null)
 }
 
-@Test func aConversationDecodes() throws {
-    let conversations: [Conversation] = try decode("""
-    [{"id":1,"participants":["alpha"],"createdAt":1757000000000},
-     {"id":2,"participants":["alpha","bravo"],"createdAt":1757000001000}]
-    """)
-    #expect(conversations[0].participants == ["alpha"])
-    #expect(conversations[1].participants.count == 2)
-}
-
 @Test func computerActionsAndResultsRoundTripOnTheWire() throws {
     let click = ComputerAction(action: .click, x: 10, y: 20, button: 1)
     #expect(try encode(click) == #"{"action":"click","button":1,"x":10,"y":20}"#)
@@ -588,7 +579,7 @@ private func field(_ id: String, type: String = "text", autocomplete: String? = 
      "hits":[
       {"kind":"file","agent":"ledger","path":"~/tap/a.pdf","at":5,"snippet":"~/tap/a.pdf"},
       {"kind":"message","conversationId":3,"participants":["ledger"],"messageId":9,"at":4,"snippet":"hi"},
-      {"kind":"screenshot","conversationId":4,"participants":["ledger","mo"],"messageId":2,"at":3,"snippet":""},
+      {"kind":"screenshot","conversationId":4,"participants":["mo"],"messageId":2,"at":3,"snippet":""},
       {"kind":"hologram","at":1,"snippet":"x"}
      ]}
     """#)
@@ -598,7 +589,7 @@ private func field(_ id: String, type: String = "text", autocomplete: String? = 
     #expect(answer.hits.map(\.kind) == [.file, .message, .screenshot, .other("hologram")])
     #expect(answer.hits[0].thread == nil && answer.hits[0].conversationId == nil)
     #expect(answer.hits[1].thread == .agent("ledger"))
-    #expect(answer.hits[2].thread == .conversation(4))
+    #expect(answer.hits[2].thread == .agent("mo"))
     #expect(answer.hits[3].agent == nil && answer.hits[3].thread == nil)
     #expect(Set(answer.hits.map(\.id)).count == 4)
 }

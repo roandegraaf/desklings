@@ -356,12 +356,6 @@ struct FeedbackAnswer: Decodable {
     var feedback: MessageFeedback?
 }
 
-struct Conversation: Codable, Sendable, Identifiable, Hashable {
-    var id: Int
-    var participants: [String]
-    var createdAt: Int
-}
-
 struct Schedule: Codable, Sendable, Identifiable, Hashable {
     var id: Int
     var agent: String

@@ -177,12 +177,6 @@ func activeWorkers(of agent: Agent, in agents: [Agent]) -> [Agent] {
     agents.filter { $0.parentId == agent.id && $0.state.busy }
 }
 
-/// The thread an agent shares with nobody but the owner is reached through the agent itself, so
-/// the list shows only the ones it shares with somebody.
-func sharedConversations(_ conversations: [Conversation], _ name: String) -> [Conversation] {
-    conversations.filter { $0.participants.count > 1 || $0.participants.first != name }
-}
-
 extension AgentState {
     var label: String {
         switch self {

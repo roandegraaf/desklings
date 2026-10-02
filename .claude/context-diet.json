@@ -1,0 +1,23 @@
+{
+  "_note": "written by context-diet on 2026-10-02; edit freely, an existing file is never regenerated except by /diet init",
+  "mcp": [
+    "Neon",
+    "afpunter-live",
+    "higgsfield",
+    "plugin_legal_atlassian",
+    "plugin_legal_docusign",
+    "plugin_legal_egnyte",
+    "plugin_legal_slack",
+    "plugin_stripe_stripe"
+  ],
+  "skills": [
+    "stripe:*",
+    "hyperframes:*",
+    "kicad-happy:*",
+    "legal:*",
+    "payload"
+  ],
+  "agents": [
+    "stripe:*"
+  ]
+}

@@ -1,11 +1,10 @@
 import SwiftUI
 
 extension SearchResult {
-    /// An agent's own thread is reached through the agent; every other one by its id.
+    /// Every thread is one agent's, reached through the agent.
     var thread: ThreadSource? {
-        guard let conversationId else { return nil }
-        if let participants, participants.count == 1, let only = participants.first { return .agent(only) }
-        return .conversation(conversationId)
+        guard conversationId != nil, let agent = participants?.first else { return nil }
+        return .agent(agent)
     }
 
     var kindWord: (symbol: String, word: String) {

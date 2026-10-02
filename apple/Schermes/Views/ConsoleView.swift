@@ -12,10 +12,6 @@ struct ConsoleView: View {
     /// The newest message of each thread, keyed by `ThreadSource.key`.
     @State private var previews: [String: Message] = [:]
     @State private var selection: SidebarPick?
-    /// Whose shared threads are loaded. One agent at a time, as the web UI does it: listing them
-    /// for everybody would be another request per agent on every poll.
-    @State private var expanded: String?
-    @State private var conversations: [Conversation] = []
     @State private var openWorkers: Set<String> = []
     @State private var query = ""
     @State private var trouble: String?
@@ -47,8 +43,7 @@ struct ConsoleView: View {
     @State private var searchTrouble: String?
     /// ⌘K's panel, and the question it opens with.
     @State private var searching: String?
-    /// The search hit whose thread is open, kept so the chat can scroll to it and a thread outside
-    /// the expanded subtree still has its participants.
+    /// The search hit whose thread is open, kept so the chat can scroll to it.
     @State private var focus: SearchResult?
     @State private var previewing: URL?
     /// The state each permanent agent was last seen in, so a turn ending while the owner is
@@ -76,24 +71,20 @@ struct ConsoleView: View {
     private var roomy: Bool { true }
     #endif
 
-    /// What the owner is being asked to confirm. Deleting either is final, so neither happens on
-    /// the press that asks for it.
+    /// What the owner is being asked to confirm. Deleting is final, so it doesn't happen on the
+    /// press that asks for it.
     enum Removal: Identifiable {
         case agent(Agent)
-        /// An agent's own thread is reached through the agent, so only a shared one is offered.
-        case thread(Conversation)
 
         var id: String {
             switch self {
             case .agent(let agent): "agent:\(agent.name)"
-            case .thread(let conversation): "thread:\(conversation.id)"
             }
         }
 
         var title: String {
             switch self {
             case .agent(let agent): "Delete \(agent.title)?"
-            case .thread: "Delete this thread?"
             }
         }
 
@@ -102,8 +93,6 @@ struct ConsoleView: View {
             case .agent(let agent):
                 let workers = agent.parentId == nil ? "its task workers, " : ""
                 return "This takes \(workers)its threads, its routines and everything it has said, and cannot be undone. Its files on the machine stay."
-            case .thread:
-                return "Everything said in this thread goes. The agents in it stay as they are."
             }
         }
     }
@@ -157,16 +146,6 @@ struct ConsoleView: View {
         nonmutating set { selection = newValue.map(SidebarPick.thread) }
     }
 
-    /// `task(id:)` takes one value, and this loop turns on two.
-    private struct Pair: Equatable {
-        var expanded: String?
-        var awake: Bool
-        init(_ expanded: String?, _ awake: Bool) {
-            self.expanded = expanded
-            self.awake = awake
-        }
-    }
-
     /// Helpers are listed under their lead, so they are left out of the trees.
     private var trees: [AgentTree] {
         let helpers = helperLeads
@@ -188,16 +167,7 @@ struct ConsoleView: View {
         case .agent(let name):
             guard let agent = agents.first(where: { $0.name == name }) else { return nil }
             return .agent(agent)
-        case .conversation(let id):
-            // A search hit can open a thread under an agent whose subtree is not the expanded one.
-            guard let participants = conversations.first(where: { $0.id == id })?.participants
-                ?? (focus?.conversationId == id ? focus?.participants : nil)
-            else { return nil }
-            return .group(
-                id: id,
-                members: agents.filter { participants.contains($0.name) }
-            )
-        case nil:
+        case .conversation, nil:
             return nil
         }
     }
@@ -254,19 +224,8 @@ struct ConsoleView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openAgent)) { note in
             if let name = note.object as? String { picked = .agent(name) }
         }
-        // Its own, slower loop: shared threads are made by agents writing to each other, which is
-        // far rarer than a message arriving, and this one costs a request per thread it finds.
-        .task(id: Pair(expanded, awake)) {
-            conversations = []
-            guard awake, expanded != nil else { return }
-            while !Task.isCancelled {
-                await refreshConversations()
-                try? await Task.sleep(for: .seconds(5))
-            }
-        }
         .onChange(of: picked) { _, next in
             if next != focus?.thread { focus = nil }
-            if case .agent(let name) = next { expanded = subtreeOwner(name) }
         }
         .sheet(isPresented: $creating) {
             NewAgentSheet(session: session, taken: Set(agents.map(\.name))) { agent in
@@ -559,9 +518,6 @@ struct ConsoleView: View {
         for tree in visible {
             order.append(.thread(.agent(tree.agent.name)))
             order += helpers(of: tree.agent.name).map { .thread(.agent($0.name)) }
-            if expanded == tree.agent.name {
-                order += sharedConversations(conversations, tree.agent.name).map { .thread(.conversation($0.id)) }
-            }
             if query.isEmpty, openWorkers.contains(tree.agent.name) {
                 order += tree.workers.map { .thread(.agent($0.name)) }
             }
@@ -644,27 +600,6 @@ struct ConsoleView: View {
                 .contextMenu {
                     if let agent = agents.first(where: { $0.name == helper.name }), agent.parentId == nil {
                         menu(for: agent)
-                    }
-                }
-            }
-
-            if expanded == tree.agent.name {
-                ForEach(sharedConversations(conversations, tree.agent.name)) { conversation in
-                    pickRow(SidebarPick.thread(.conversation(conversation.id))) {
-                        GroupRow(
-                            conversation: conversation,
-                            besides: tree.agent.name,
-                            titles: titles(agents),
-                            preview: preview(.conversation(conversation.id)),
-                            unread: isUnread(.conversation(conversation.id))
-                        )
-                        .sidebarPicked(picked == .conversation(conversation.id))
-                    }
-                    .phoneCardRow(!roomy)
-                    .contextMenu {
-                        Button("Delete thread", systemImage: "trash", role: .destructive) {
-                            removing = .thread(conversation)
-                        }
                     }
                 }
             }
@@ -939,18 +874,8 @@ struct ConsoleView: View {
         }
     }
 
-    /// An agent's own thread is reached through the agent; a shared one needs its subtree
-    /// expanded, whose loop then loads the thread for the detail.
     private func open(_ item: NeedsYouItem) async {
-        guard let rows = try? await session.run({ try await $0.conversations(agent: item.agent) }),
-              let conversation = rows.first(where: { $0.id == item.conversationId }),
-              conversation.participants != [item.agent]
-        else {
-            picked = .agent(item.agent)
-            return
-        }
-        expanded = subtreeOwner(item.agent)
-        picked = .conversation(conversation.id)
+        picked = .agent(item.agent)
     }
 
     private func remove(_ what: Removal) {
@@ -961,15 +886,9 @@ struct ConsoleView: View {
                     try await session.run { try await $0.deleteAgent(name: agent.name) }
                     if picked == .agent(agent.name) { picked = nil }
                     previews[ThreadSource.agent(agent.name).key] = nil
-                case .thread(let conversation):
-                    try await session.run { try await $0.deleteConversation(id: conversation.id) }
-                    if picked == .conversation(conversation.id) { picked = nil }
-                    previews[ThreadSource.conversation(conversation.id).key] = nil
-                    conversations.removeAll { $0.id == conversation.id }
                 }
                 trouble = nil
                 await refresh()
-                await refreshConversations()
             } catch {
                 if !error.isCancellation { trouble = error.localizedDescription }
             }
@@ -989,7 +908,6 @@ struct ConsoleView: View {
     private func open(_ hit: SearchResult) {
         if let source = hit.thread {
             focus = hit
-            if case .conversation = source, let first = hit.participants?.first { expanded = subtreeOwner(first) }
             picked = source
         } else if let agent = hit.agent, let path = hit.path {
             picked = .agent(agent)
@@ -1042,14 +960,6 @@ struct ConsoleView: View {
 
     private func isUnread(_ source: ThreadSource) -> Bool {
         unread.has(source, newest: previews[source.key]?.id)
-    }
-
-    /// A worker's subtree is its parent's. Expanding the worker instead would list the worker's
-    /// own threads and take the parent's out from under the row the owner just picked.
-    private func subtreeOwner(_ name: String) -> String {
-        if let lead = helperLeads[name] { return subtreeOwner(lead) }
-        guard let parentId = agents.first(where: { $0.name == name })?.parentId else { return name }
-        return agents.first { $0.id == parentId }?.name ?? name
     }
 
     /// One `?limit=1` per agent alongside the list poll. Fine for the handful of agents one
@@ -1130,16 +1040,6 @@ struct ConsoleView: View {
     }
     #endif
 
-    private func refreshConversations() async {
-        guard let expanded,
-              let rows = try? await session.run({ try await $0.conversations(agent: expanded) })
-        else { return }
-        conversations = rows
-        for conversation in sharedConversations(rows, expanded) {
-            await loadPreview(.conversation(conversation.id))
-        }
-    }
-
     private func loadPreview(_ source: ThreadSource) async {
         guard let last = try? await session.run({
             try await $0.messages(source, window: MessageWindow(limit: 1, images: false))
@@ -1209,51 +1109,6 @@ func previewLine(_ preview: Message?) -> String? {
     return preview.toolCalls?.first?.name
 }
 
-/// A thread an agent shares with somebody. The one it shares with nobody but the owner is reached
-/// through the agent itself and is not listed twice.
-struct GroupRow: View {
-    let conversation: Conversation
-    let besides: String
-    let titles: [String: String]
-    let preview: Message?
-    let unread: Bool
-
-    @Environment(AgentLooks.self) private var looks
-
-    private var others: [String] {
-        conversation.participants.filter { $0 != besides }
-    }
-
-    var body: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text("with")
-                    ForEach(others, id: \.self) { name in
-                        HStack(spacing: 4) {
-                            BloubView(state: .idle, identity: looks[name], size: 20)
-                            Text(titles[name] ?? name).fontWeight(.semibold).fontDesign(.rounded)
-                        }
-                    }
-                }
-                .font(.subheadline)
-                .lineLimit(1)
-                .accessibilityElement(children: .combine)
-                if let preview, !preview.content.isEmpty {
-                    Text(plainPreview(preview.content))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
-            Spacer(minLength: 4)
-            if unread { UnreadDot() }
-        }
-        .padding(.leading, 22)
-        .padding(.vertical, 2)
-    }
-}
 
 /// Workers accumulate for as long as an agent runs, so they stay folded away until asked for.
 struct WorkersToggle: View {

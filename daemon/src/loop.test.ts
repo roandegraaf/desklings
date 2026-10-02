@@ -14,7 +14,8 @@ import {
   agentChain,
   appendMessage,
   conversationFor,
-  conversationWith,
+  deleteConversation,
+  existingConversation,
   lastMessageId,
   latestSummary,
   listConversations,
@@ -400,7 +401,7 @@ test('the transcript names who wrote every message and hides another agent tool 
   const said = projected.filter((m) => m.role === 'user').map((m) => m.text);
   assert.match(String(said[0]), /^Message from the owner:\nyou two sort it out$/);
   assert.match(String(said[1]), /^Message from bravo:\nwhat is your hostname\?$/);
-  assert.match(String(said[2]), /^bravo said here, to the owner:\nmine is bravo-box$/);
+  assert.match(String(said[2]), /^Message from bravo:\nmine is bravo-box$/);
   // bravo's tool call and its result are dropped together, or the pair would be half a turn.
   assert.doesNotMatch(JSON.stringify(projected), /exit code 0/);
 });
@@ -690,23 +691,74 @@ test('an agent writes to another one, which replies and wakes it', async () => {
   p.runner.start(p.alpha, owner);
   await quiet(p.db);
 
-  const shared = conversationWith(p.db, [p.alpha.id, p.bravo.id]);
+  const theirs = conversationFor(p.db, p.bravo.id);
   assert.deepEqual(
-    listMessages(p.db, shared).map((m) => [m.role, m.sender, m.content]),
+    listMessages(p.db, theirs).map((m) => [m.role, m.sender, m.content]),
     [
       ['user', 'alpha', 'what is your hostname?'],
       ['assistant', 'bravo', 'my hostname is bravo-box'],
+    ],
+  );
+  assert.deepEqual(
+    listMessages(p.db, owner)
+      .filter((m) => m.role !== 'tool' && m.toolCalls === undefined)
+      .map((m) => [m.role, m.sender, m.content]),
+    [
+      ['user', undefined, 'ask bravo for its hostname'],
+      ['assistant', 'alpha', 'I asked bravo; waiting for it.'],
+      ['user', 'bravo', 'my hostname is bravo-box'],
       ['assistant', 'alpha', 'bravo says it is bravo-box.'],
     ],
   );
 
-  // The thread the two share is its own row, and both of them are in it.
-  assert.deepEqual(
-    listConversations(p.db, p.bravo.id).map((c) => c.participants),
-    [['alpha', 'bravo']],
-  );
+  // No thread of their own: each one only ever has the one it shares with the owner.
+  assert.deepEqual(listConversations(p.db, p.bravo.id).map((c) => c.participants), [['bravo']]);
+  assert.equal(p.seen.length, 4, 'the reply alpha answered was not sent back to bravo');
   assert.equal(p.state('alpha'), 'waiting_for_user', 'the reply arrived and alpha answered it');
   assert.equal(p.state('bravo'), 'waiting_for_user');
+});
+
+test('an answer goes back once, pushes only for the owner, and a cleared thread brings nothing back', async () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const bravo = insertAgent(db, 'bravo') as Agent;
+  const { provider, seen } = scriptedProvider({
+    alpha: [
+      { toolCalls: [sendCall('m1', 'bravo', 'hostname?')] },
+      { text: 'asked bravo' },
+      { text: 'it is bravo-box' },
+    ],
+    bravo: [{ text: 'bravo-box' }, { text: 'still here' }],
+  });
+  const pushed: string[] = [];
+  const runner = createRunner({
+    db,
+    exec: fakeExec([]),
+    screen: SCREEN,
+    provider: () => provider,
+    control: createControl(),
+    search: noSearch,
+    mcp: noMcp,
+    ...CAPS,
+    deliver: (agent, _conversation, text) => pushed.push(`${agent.name}: ${text}`),
+  });
+  const mine = conversationFor(db, alpha.id);
+  appendMessage(db, mine, { role: 'user', content: 'ask bravo' });
+  runner.start(alpha, mine);
+  await quiet(db);
+
+  assert.deepEqual(pushed, ['alpha: asked bravo', 'alpha: it is bravo-box'], 'bravo answering alpha is no push of its own');
+
+  // Clearing alpha's thread takes the reply with it, and must not make bravo's old request look unanswered.
+  deleteConversation(db, mine);
+  const theirs = conversationFor(db, bravo.id);
+  appendMessage(db, theirs, { role: 'user', content: 'you there?' });
+  runner.start(bravo, theirs);
+  await quiet(db);
+
+  assert.equal(existingConversation(db, alpha.id), undefined, 'nothing was sent back to alpha');
+  assert.deepEqual(pushed.at(-1), 'bravo: still here', 'the owner asked, so the owner hears it');
+  assert.equal(seen.length, 5);
 });
 
 test('writing to an agent that does not exist is an observation, not a failed turn', async () => {
@@ -843,73 +895,6 @@ test('a message that lands between steps stays out of the turn while its own res
   assert.ok(heard(asked[2] ?? []), 'the next turn carries it');
 });
 
-test('messages that land in two threads mid-turn are both answered', async () => {
-  let release: () => void = () => {};
-  const held = new Promise<void>((done) => {
-    release = () => done();
-  });
-  const db = openDb(':memory:', MIGRATIONS);
-  const alpha = insertAgent(db, 'alpha') as Agent;
-  let turns = 0;
-  const provider: Provider = async () => {
-    turns += 1;
-    if (turns === 1) await held;
-    return { text: `answer ${turns}`, toolCalls: [] };
-  };
-  const runner = createRunner({
-    db,
-    exec: fakeExec([]),
-    screen: SCREEN,
-    provider: () => provider,
-    control: createControl(),
-    search: noSearch,
-    mcp: noMcp,
-    maxLoops: 1,
-    maxWorkers: 1,
-  });
-  const bravo = insertAgent(db, 'bravo') as Agent;
-  const owner = conversationFor(db, alpha.id);
-  const other = conversationWith(db, [alpha.id, bravo.id]);
-
-  appendMessage(db, owner, { role: 'user', content: 'first' });
-  runner.start(alpha, owner);
-  await tick();
-  appendMessage(db, owner, { role: 'user', content: 'second' });
-  appendMessage(db, other, { role: 'user', content: 'elsewhere' });
-  runner.start(alpha, owner);
-  runner.start(alpha, other);
-  release();
-  await quiet(db);
-
-  assert.equal(turns, 3, 'one turn per message, none repeated for a thread already answered');
-  assert.equal(listMessages(db, other).at(-1)?.role, 'assistant', 'the other thread got its answer');
-  assert.deepEqual(
-    listMessages(db, owner).map((m) => m.content),
-    ['first', 'second', 'answer 1', 'answer 2'],
-  );
-});
-
-test('one message to a group conversation is answered by every agent in it', async () => {
-  const p = pair({ alpha: [{ text: 'alpha here' }], bravo: [{ text: 'bravo here' }] });
-  const group = conversationWith(p.db, [p.alpha.id, p.bravo.id]);
-  appendMessage(p.db, group, { role: 'user', content: 'who is around?' });
-  p.runner.start(p.alpha, group);
-  p.runner.start(p.bravo, group);
-  await quiet(p.db);
-
-  assert.deepEqual(
-    listMessages(p.db, group)
-      .filter((m) => m.role === 'assistant')
-      .map((m) => [m.sender, m.content])
-      .sort(),
-    [['alpha', 'alpha here'], ['bravo', 'bravo here']],
-  );
-  // An answer is addressed to nobody, so neither reply set the other one off again.
-  assert.equal(p.seen.length, 2, 'one model call each');
-  assert.equal(p.state('alpha'), 'waiting_for_user');
-  assert.equal(p.state('bravo'), 'waiting_for_user');
-});
-
 test('two agents that only write to each other are stopped', async () => {
   const pingPong = (other: string) =>
     Array.from({ length: 40 }, (_unused, index) =>
@@ -924,33 +909,33 @@ test('two agents that only write to each other are stopped', async () => {
   p.runner.start(p.alpha, owner);
   await quiet(p.db);
 
-  const shared = conversationWith(p.db, [p.alpha.id, p.bravo.id]);
-  const passed = listMessages(p.db, shared).filter((m) => m.role === 'user');
-  // The replies each side gives count too, so the cap lands before that many were even sent.
-  assert.ok(passed.length < MAX_AGENT_CHAIN, `only ${passed.length} got through`);
-  assert.ok(agentChain(p.db, shared) >= MAX_AGENT_CHAIN, 'the chain stopped at the cap');
+  const threads = [owner, conversationFor(p.db, p.bravo.id)];
+  const passed = threads.flatMap((id) => listMessages(p.db, id)).filter((m) => m.role === 'user' && m.sender !== undefined);
+  assert.equal(passed.filter((m) => m.content === 'your turn').length, MAX_AGENT_CHAIN, 'no request got past the cap');
+  // After the refusal each answers the last request it was sent, once, and that is the end of it.
+  assert.equal(passed.filter((m) => m.content === 'passed it on').length, 2);
+  assert.ok(agentChain(p.db, threads) >= MAX_AGENT_CHAIN, 'the chain stopped at the cap');
   assert.equal(p.state('alpha'), 'waiting_for_user');
   assert.equal(p.state('bravo'), 'waiting_for_user');
-  const refusal = listMessages(p.db, shared).find((m) => m.content.includes('back and forth'));
+  const refusal = threads.flatMap((id) => listMessages(p.db, id)).find((m) => m.content.includes('back and forth'));
   assert.ok(refusal !== undefined, 'the agent was told why, in a message it can act on');
 });
 
-test('a reply in a shared thread counts as a message between agents; in an owner thread it does not', () => {
+test('requests and the replies routed back count as messages between agents; tool steps do not', () => {
   const db = openDb(':memory:', MIGRATIONS);
   const alpha = insertAgent(db, 'alpha') as Agent;
   const bravo = insertAgent(db, 'bravo') as Agent;
-  const shared = conversationWith(db, [alpha.id, bravo.id]);
-  const owner = conversationFor(db, alpha.id);
-  const chainAfterExchange = (conversationId: number): number => {
-    appendMessage(db, conversationId, { role: 'user', content: 'go' });
-    appendMessage(db, conversationId, { role: 'assistant', content: '', sender: 'alpha', toolCalls: [commandCall] });
-    appendMessage(db, conversationId, { role: 'tool', content: 'exit code 0', sender: 'alpha', toolCallId: 'c2' });
-    appendMessage(db, conversationId, { role: 'assistant', content: 'done', sender: 'alpha' });
-    appendMessage(db, conversationId, { role: 'user', content: 'thanks', sender: 'bravo' });
-    return agentChain(db, conversationId);
-  };
-  assert.equal(chainAfterExchange(shared), 2, 'the reply and the message, not the tool step');
-  assert.equal(chainAfterExchange(owner), 1, 'a reply to the owner is not between agents');
+  const mine = conversationFor(db, alpha.id);
+  const theirs = conversationFor(db, bravo.id);
+  appendMessage(db, mine, { role: 'user', content: 'go' });
+  appendMessage(db, mine, { role: 'assistant', content: '', sender: 'alpha', toolCalls: [commandCall] });
+  appendMessage(db, mine, { role: 'tool', content: 'exit code 0', sender: 'alpha', toolCallId: 'c2' });
+  appendMessage(db, theirs, { role: 'user', content: 'hostname?', sender: 'alpha', kind: 'request' });
+  appendMessage(db, theirs, { role: 'assistant', content: 'bravo-box', sender: 'bravo' });
+  appendMessage(db, mine, { role: 'user', content: 'bravo-box', sender: 'bravo', kind: 'reply' });
+  appendMessage(db, mine, { role: 'assistant', content: 'done', sender: 'alpha' });
+  assert.equal(agentChain(db, [mine, theirs]), 2, 'the request and the reply, not the tool step or the answers');
+  assert.equal(agentChain(db, [mine]), 1);
 });
 
 test('the owner writing to either agent resets the chain', () => {
@@ -958,17 +943,17 @@ test('the owner writing to either agent resets the chain', () => {
   const alpha = insertAgent(db, 'alpha') as Agent;
   const bravo = insertAgent(db, 'bravo') as Agent;
   const charlie = insertAgent(db, 'charlie') as Agent;
-  const shared = conversationWith(db, [alpha.id, bravo.id]);
+  const threads = [conversationFor(db, alpha.id), conversationFor(db, bravo.id)];
   for (let i = 0; i < MAX_AGENT_CHAIN; i++) {
-    appendMessage(db, shared, { role: 'user', content: 'again', sender: i % 2 ? 'alpha' : 'bravo' });
+    appendMessage(db, threads[i % 2]!, { role: 'user', content: 'again', sender: i % 2 ? 'alpha' : 'bravo' });
   }
-  assert.equal(agentChain(db, shared), MAX_AGENT_CHAIN);
+  assert.equal(agentChain(db, threads), MAX_AGENT_CHAIN);
   appendMessage(db, conversationFor(db, charlie.id), { role: 'user', content: 'unrelated' });
-  assert.equal(agentChain(db, shared), MAX_AGENT_CHAIN, 'a post to a stranger is not the owner joining in');
-  appendMessage(db, conversationFor(db, bravo.id), { role: 'user', content: 'go ahead' });
-  assert.equal(agentChain(db, shared), 0, 'a post in a participant\'s own thread resets it');
-  appendMessage(db, shared, { role: 'user', content: 'again', sender: 'alpha' });
-  assert.equal(agentChain(db, shared), 1);
+  assert.equal(agentChain(db, threads), MAX_AGENT_CHAIN, 'a post to a stranger is not the owner joining in');
+  appendMessage(db, threads[1]!, { role: 'user', content: 'go ahead' });
+  assert.equal(agentChain(db, threads), 0, 'a post in either agent\'s thread resets it');
+  appendMessage(db, threads[1]!, { role: 'user', content: 'again', sender: 'alpha' });
+  assert.equal(agentChain(db, threads), 1);
 });
 
 test('a restart hands back an agent whose reply landed before the daemon died', () => {
@@ -979,10 +964,12 @@ test('a restart hands back an agent whose reply landed before the daemon died', 
   // What a daemon killed after bravo answered leaves behind: alpha wrote to bravo, ended its
   // turn waiting, and bravo's answer is stored. The wake only ever fires from inside a live
   // turn, so without a repair nothing would ever start alpha again.
-  const shared = conversationWith(db, [alpha.id, bravo.id]);
-  appendMessage(db, shared, { role: 'user', content: 'hostname?', sender: 'alpha' });
-  appendMessage(db, shared, { role: 'assistant', content: 'asked bravo', sender: 'alpha' });
-  appendMessage(db, shared, { role: 'assistant', content: 'bravo-box', sender: 'bravo' });
+  const mine = conversationFor(db, alpha.id);
+  const theirs = conversationFor(db, bravo.id);
+  appendMessage(db, theirs, { role: 'user', content: 'hostname?', sender: 'alpha', kind: 'request' });
+  appendMessage(db, mine, { role: 'assistant', content: 'asked bravo', sender: 'alpha' });
+  appendMessage(db, theirs, { role: 'assistant', content: 'bravo-box', sender: 'bravo' });
+  appendMessage(db, mine, { role: 'user', content: 'bravo-box', sender: 'bravo', kind: 'reply' });
   setAgentState(db, 'alpha', 'waiting_for_agent');
   setAgentState(db, 'bravo', 'waiting_for_user');
 
@@ -1001,8 +988,7 @@ test('a restart leaves an agent still genuinely waiting where it stands', () => 
 
   // Same shape, minus the answer: bravo has not replied yet, so alpha is waiting for something
   // that can still arrive, and moving it would throw away the state that lets the reply wake it.
-  const shared = conversationWith(db, [alpha.id, bravo.id]);
-  appendMessage(db, shared, { role: 'user', content: 'hostname?', sender: 'alpha' });
+  appendMessage(db, conversationFor(db, bravo.id), { role: 'user', content: 'hostname?', sender: 'alpha', kind: 'request' });
   setAgentState(db, 'alpha', 'waiting_for_agent');
 
   reconcileAgents(db);
@@ -1296,10 +1282,11 @@ test('a line remembered in one conversation is in the system prompt of the next'
   const written = listMessages(db, owner).find((message) => message.toolCallId === 'r1');
   assert.equal(written?.content, 'Written to /home/agent-alpha/memory/MEMORY.md.');
 
-  // A thread it has never spoken in: nothing but the loaded file can carry the fact into it.
-  const shared = conversationWith(db, [alpha.id, bravo.id]);
-  appendMessage(db, shared, { role: 'user', content: 'who am I?' });
-  await runAgent(deps, alpha, shared);
+  // A cleared thread: nothing but the loaded file can carry the fact into it.
+  deleteConversation(db, owner);
+  const fresh = conversationFor(db, alpha.id);
+  appendMessage(db, fresh, { role: 'user', content: 'who am I?' });
+  await runAgent(deps, alpha, fresh);
 
   const later = systemOf(seen.at(-1));
   assert.match(later, /- the owner is called Roan/, 'the remembered line reached the next turn');
@@ -1704,35 +1691,6 @@ test('the cut lands between turns, never inside one', async () => {
     assertNoOrphanResult(transcript('alpha', SYSTEM, f.messages(), { text: SUMMARY, throughId: inside })),
   );
   assert.ok(COMPACTION_TAIL_CHARS < MAX_TRANSCRIPT_CHARS, 'a compacted thread is a smaller one');
-});
-
-test('each agent in a group thread is compacted on its own view of it', async () => {
-  const p = pair({ alpha: [{ text: 'alpha is caught up.' }], bravo: [{ text: 'bravo too.' }] });
-  const group = conversationWith(p.db, [p.alpha.id, p.bravo.id]);
-  longThread(p.db, group, LONG_TURNS, TURN_CHARS, { label: 'A', sender: 'alpha' });
-  longThread(p.db, group, LONG_TURNS, TURN_CHARS, { label: 'B', sender: 'bravo' });
-
-  p.runner.start(p.alpha, group);
-  await quiet(p.db);
-  p.runner.start(p.bravo, group);
-  await quiet(p.db);
-
-  const mine = latestSummary(p.db, group, 'alpha');
-  const theirs = latestSummary(p.db, group, 'bravo');
-  assert.ok(mine !== undefined && theirs !== undefined, 'one summary each, not one for the thread');
-  assert.notEqual(mine.id, theirs.id);
-
-  // What each one was asked to summarise is its own projection. Another agent's tool traffic
-  // never reaches a transcript, so it cannot reach a summary of one either.
-  assert.equal(p.summarised.length, 2);
-  const [forAlpha, forBravo] = p.summarised as [string, string];
-  assert.match(forAlpha, /\[you called run_command/, 'alpha summarises its own calls');
-  assert.ok(!forAlpha.includes('exit code 0 (B'), 'and never bravo\'s results');
-  assert.ok(!forBravo.includes('exit code 0 (A'), 'nor bravo alpha\'s');
-
-  // Each agent is still shown who said what, which is the whole point of the group thread.
-  assert.match(forBravo, /alpha said here, to the owner:\n\(A\d/, 'bravo sees alpha by name');
-  assert.match(forAlpha, /Message from the owner:\nread the logs/);
 });
 
 test('a forced compaction covers everything since the last summary, and the next turn opens on it', async () => {
@@ -2516,12 +2474,17 @@ test('a lead keeps a goal, brings in both kinds of helper, and finishing removes
   assert.equal(temp.parentId, undefined, 'a temporary agent is an agent of its own');
   assert.match(String(temp.profile), /helper of alpha on the goal "Ship the site"/);
   assert.ok(desktop.includes(`ensure ${helper} :${temp.display}`));
-  const shared = conversationWith(p.db, [p.alpha.id, temp.id]);
+  const helperThread = conversationFor(p.db, temp.id);
   assert.deepEqual(
-    listMessages(p.db, shared).filter((m) => m.role !== 'tool' && m.toolCalls === undefined).map((m) => [m.sender, m.content]),
-    [['alpha', 'Draft the copy.'], [helper, 'drafted'], ['alpha', 'Got the draft.']],
+    listMessages(p.db, helperThread).filter((m) => m.role !== 'tool' && m.toolCalls === undefined).map((m) => [m.sender, m.content]),
+    [['alpha', 'Draft the copy.'], [helper, 'drafted']],
   );
-  assert.ok(listMessages(p.db, shared).some((m) => m.content === 'error: a helper does not bring in helpers of its own; ask your lead'));
+  assert.ok(listMessages(p.db, helperThread).some((m) => m.content === 'error: a helper does not bring in helpers of its own; ask your lead'));
+  assert.deepEqual(
+    listMessages(p.db, owner).filter((m) => m.sender === helper).map((m) => [m.role, m.content]),
+    [['user', 'drafted']],
+    'its answer came back to the lead\'s own thread',
+  );
   const asHelper = p.seen.findIndex((messages) => askedAgent(messages) === helper);
   assert.match(String(p.seen[asHelper]?.[0]?.text), /You are a helper on it\. Report to alpha/);
 
@@ -2534,6 +2497,7 @@ test('a lead keeps a goal, brings in both kinds of helper, and finishing removes
 
   await ask('finish it');
   assert.equal(findAgent(p.db, helper), undefined, 'the temporary agent is gone');
+  assert.ok(listMessages(p.db, owner).some((m) => m.sender === helper && m.content === 'drafted'), 'its answer stays in the lead\'s thread');
   assert.ok(desktop.includes(`stop ${helper}`));
   assert.ok(desktop.includes(`stopDisplay alpha :${worker.display}`), 'only the worker\'s own display is stopped');
   assert.ok(!desktop.includes('stop alpha'));

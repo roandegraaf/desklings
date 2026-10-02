@@ -564,10 +564,6 @@ struct SchermesClient: Sendable {
         let _: Empty = try await send("DELETE", url("/api/agents/\(Self.escape(name))"))
     }
 
-    func deleteConversation(id: Int) async throws {
-        let _: Empty = try await send("DELETE", url("/api/conversations/\(id)"))
-    }
-
     func needsYou() async throws -> [NeedsYouItem] {
         try await send("GET", url("/api/needs-you"))
     }
@@ -595,10 +591,6 @@ struct SchermesClient: Sendable {
         let _: Empty = try await send(
             "POST", url("/api/needs-you/\(Self.escape(id))/action"), body: ["action": action]
         )
-    }
-
-    func conversations(agent: String) async throws -> [Conversation] {
-        try await send("GET", url("/api/agents/\(Self.escape(agent))/conversations"))
     }
 
     func live(agent: String) async throws -> LiveReply {

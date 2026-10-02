@@ -28,7 +28,8 @@ daemon killed while an agent was mid tool call comes back, answers the interrupt
 stored transcript is one a strict model endpoint will still accept, records that a restart
 happened, and leaves the agent waiting for its owner rather than resuming on its own.
 
-Agent-to-agent messaging and task workers: agents write to each other and to group threads,
+Agent-to-agent messaging and task workers: a message from one agent lands in the other's
+thread and the answer comes back to the asker's,
 and a permanent agent can hand a job to a disposable task worker that runs as it and reports
 back. Human takeover: the agent desktops stream to the app over a WebSocket proxy on the
 same port, and taking control stands the agent down until you give it back. The owner's side:

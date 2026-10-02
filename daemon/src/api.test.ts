@@ -48,7 +48,6 @@ import {
   appendMessage,
   appendSummary,
   conversationFor,
-  conversationWith,
   deleteConversation,
   existingConversation,
   findConversation,
@@ -442,7 +441,7 @@ test('the agent list says how full each own thread is against the compaction bud
     );
 
   assert.deepEqual(await fullness(), { alpha: 0, bravo: 0 }, 'no thread yet is empty, and reading makes none');
-  assert.equal(existingConversation(f.db, [Number(alpha['id'])]), undefined);
+  assert.equal(existingConversation(f.db, Number(alpha['id'])), undefined);
 
   const thread = conversationFor(f.db, Number(alpha['id']));
   const first = appendMessage(f.db, thread, { role: 'user', content: 'x'.repeat(MAX_TRANSCRIPT_CHARS / 4) });
@@ -822,28 +821,6 @@ test('a failed turn leaves the agent able to take another message', async () => 
   assert.equal(await f.settled('alpha'), 'waiting_for_user');
 });
 
-test('an agent lists the conversations it is in, starting with its own thread', async () => {
-  const { f, cookie } = await configured();
-  await post(f.app, '/api/agents', { name: 'bravo', profile: PROFILED }, cookie);
-  f.replies.push({ text: 'hello' });
-  await post(f.app, '/api/agents/alpha/messages', { text: 'hi' }, cookie);
-  await f.settled('alpha');
-
-  const created = await post(f.app, '/api/conversations', { participants: ['alpha', 'bravo'] }, cookie);
-  assert.equal(created.status, 201);
-  const group = await json(created);
-  assert.deepEqual(group['participants'], ['alpha', 'bravo']);
-
-  const listed = (await getJson(f.app, '/api/agents/alpha/conversations', cookie)) as {
-    participants: string[];
-  }[];
-  assert.deepEqual(listed.map((c) => c.participants), [['alpha'], ['alpha', 'bravo']]);
-
-  // Asking for the same set again is the same thread, not a second one.
-  const again = await post(f.app, '/api/conversations', { participants: ['bravo', 'alpha'] }, cookie);
-  assert.equal((await json(again))['id'], group['id']);
-});
-
 test('a thread reads back a page at a time and can be walked backwards', async () => {
   const { f, cookie } = await configured();
   const agent = findAgent(f.db, 'alpha');
@@ -966,42 +943,11 @@ test('a page boundary can land inside a turn, and the reader gets the half it as
   assert.deepEqual(both.map((m) => m.role), ['assistant', 'tool']);
 });
 
-test('the conversation routes refuse an unknown agent and an unknown thread', async () => {
+test('the conversation routes refuse an unknown thread and a missing login', async () => {
   const { f, cookie } = await configured();
-  assert.equal((await f.app.request('/api/agents/nobody/conversations', { headers: { cookie } })).status, 404);
-
-  for (const participants of [['alpha', 'nobody'], [], ['x y'], 'alpha']) {
-    const res = await post(f.app, '/api/conversations', { participants }, cookie);
-    assert.equal(res.status, 400, `${JSON.stringify(participants)} should be rejected`);
-  }
-
   assert.equal((await f.app.request('/api/conversations/999/messages', { headers: { cookie } })).status, 404);
   assert.equal((await post(f.app, '/api/conversations/999/messages', { text: 'hi' }, cookie)).status, 404);
-  assert.equal((await f.app.request('/api/agents/alpha/conversations')).status, 401);
-  assert.equal((await post(f.app, '/api/conversations', { participants: ['alpha'] })).status, 401);
-});
-
-test('a group conversation gets a reply from every agent in it, each naming itself', async () => {
-  const { f, cookie } = await configured();
-  await post(f.app, '/api/agents', { name: 'bravo', profile: PROFILED }, cookie);
-  const group = await json(await post(f.app, '/api/conversations', { participants: ['alpha', 'bravo'] }, cookie));
-
-  f.replies.push({ text: 'alpha is here' }, { text: 'bravo is here' });
-  const posted = await post(f.app, `/api/conversations/${String(group['id'])}/messages`, { text: 'who is around?' }, cookie);
-  assert.equal(posted.status, 202);
-  await f.settled('alpha');
-  await f.settled('bravo');
-
-  const messages = (await getJson(f.app, `/api/conversations/${String(group['id'])}/messages`, cookie)) as {
-    role: string;
-    sender?: string;
-    content: string;
-  }[];
-  assert.equal(messages[0]?.sender, undefined, 'the owner has no sender');
-  assert.deepEqual(
-    messages.filter((m) => m.role === 'assistant').map((m) => m.sender).sort(),
-    ['alpha', 'bravo'],
-  );
+  assert.equal((await f.app.request(`/api/conversations/${String(conversationFor(f.db, findAgent(f.db, 'alpha')!.id))}/messages`)).status, 401);
 });
 
 test('a thread rewinds to an earlier point, and a retry asks the kept message again', async () => {
@@ -1392,9 +1338,9 @@ test('deleting an agent takes its workers, threads, routines and history with it
   const bravo = findAgent(db, 'bravo') as Agent;
   const own = conversationFor(db, alpha.id);
   appendMessage(db, own, { role: 'user', content: 'hello' });
-  const shared = conversationWith(db, [alpha.id, bravo.id]);
-  appendMessage(db, shared, { role: 'user', content: 'both of you', sender: 'alpha' });
-  appendMessage(db, shared, { role: 'user', content: 'heard', sender: 'bravo' });
+  const theirs = conversationFor(db, bravo.id);
+  appendMessage(db, theirs, { role: 'user', content: 'over to you', sender: 'alpha', kind: 'request' });
+  appendMessage(db, theirs, { role: 'assistant', content: 'on it', sender: 'bravo' });
   const worker = insertWorker(db, alpha, 'alpha-w1', own);
   await post(app, `/api/agents/alpha/schedules`, { cron: '0 9 * * *', prompt: 'morning' }, cookie);
 
@@ -1408,12 +1354,8 @@ test('deleting an agent takes its workers, threads, routines and history with it
   assert.deepEqual(listMessages(db, own), [], 'the thread it was alone in is gone');
   assert.equal(findConversation(db, own), undefined);
 
-  // The thread it shared outlives it, minus what it wrote and its seat in it.
-  assert.deepEqual(listMessages(db, shared).map((row) => row.sender), ['bravo']);
-  assert.deepEqual(
-    participantAgents(db, shared).map((agent) => agent.name),
-    ['bravo'],
-  );
+  // What it wrote to another agent goes with it; that agent's thread stays.
+  assert.deepEqual(listMessages(db, theirs).map((row) => row.sender), ['bravo']);
   assert.deepEqual(listSchedules(db, bravo), []);
   assert.equal(findAgent(db, 'bravo')?.name, 'bravo', 'nobody else is touched');
 
@@ -1435,14 +1377,6 @@ test('an agent in the middle of a turn is not deleted out from under its own loo
   assert.equal(refused.status, 409);
   assert.match(String((await json(refused))['error']), /middle of a turn/);
 
-  // Its thread is refused for the same reason: clearing it mid-turn is the same rows.
-  const thread = conversationFor(f.db, findAgent(f.db, 'alpha')?.id as number);
-  const alsoRefused = await f.app.request(`/api/conversations/${thread}`, {
-    method: 'DELETE',
-    headers: { cookie },
-  });
-  assert.equal(alsoRefused.status, 409);
-
   f.replies.push({ text: 'done' });
   release();
   await f.settled('alpha');
@@ -1450,31 +1384,6 @@ test('an agent in the middle of a turn is not deleted out from under its own loo
   assert.equal(
     (await f.app.request('/api/agents/alpha', { method: 'DELETE', headers: { cookie } })).status,
     200,
-  );
-});
-
-test('deleting a thread clears it and leaves the agents in it alone', async () => {
-  const { app, db } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
-  await post(app, '/api/agents', { name: 'alpha' }, cookie);
-  await post(app, '/api/agents', { name: 'bravo' }, cookie);
-  const shared = conversationWith(
-    db,
-    [findAgent(db, 'alpha') as Agent, findAgent(db, 'bravo') as Agent].map((agent) => agent.id),
-  );
-  appendMessage(db, shared, { role: 'user', content: 'a word' });
-
-  const gone = await app.request(`/api/conversations/${shared}`, {
-    method: 'DELETE',
-    headers: { cookie },
-  });
-  assert.equal(gone.status, 200);
-  assert.equal(findConversation(db, shared), undefined);
-  assert.equal(findAgent(db, 'alpha')?.name, 'alpha');
-  assert.equal(findAgent(db, 'bravo')?.name, 'bravo');
-  assert.equal(
-    (await app.request('/api/conversations/9999', { method: 'DELETE', headers: { cookie } })).status,
-    404,
   );
 });
 
@@ -1779,7 +1688,7 @@ test('an idle pass cannot send, delete, spend, share or install, whatever the ru
   const commands = f.ran.map((argv) => argv.join(' '));
   assert.ok(commands.some((c) => c.includes('ls ~')));
   assert.ok(!commands.some((c) => c.includes('rm -rf') || c.includes('apt install') || c.includes('mail -s')));
-  assert.deepEqual(listMessages(f.db, conversationWith(f.db, [findAgent(f.db, 'alpha')!.id, findAgent(f.db, 'bravo')!.id])), []);
+  assert.equal(existingConversation(f.db, findAgent(f.db, 'bravo')!.id), undefined, 'nothing reached bravo');
   assert.deepEqual(listApprovals(f.db).map((a) => a.category), ['delete_files']);
   assert.deepEqual(pass.outputs.map((o) => o.kind), ['cleanup']);
   assert.equal(pass.outcome, 'ran');
@@ -3212,7 +3121,7 @@ test('a webhook: minted on turn-on, secret checked, size capped, rate limited, s
   assert.equal(triggerRows(f).length, 2, 'one turn per accepted post, the third dropped');
   const [listed] = (await getJson(f.app, '/api/agents/alpha/triggers', cookie)) as Trigger[];
   assert.equal(listed?.dropped, 1);
-  assert.equal(agentChain(f.db, conversationFor(f.db, alpha.id)), 0, 'trigger rows are not agents talking');
+  assert.equal(agentChain(f.db, [conversationFor(f.db, alpha.id)]), 0, 'trigger rows are not agents talking');
 
   assert.equal((await post(f.app, `/api/triggers/${id}`, { action: 'off' }, cookie)).status, 200);
   assert.equal((await hook(path, 'x', secret)).status, 404);

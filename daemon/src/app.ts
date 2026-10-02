@@ -125,11 +125,9 @@ import { parseCommand, runCommand } from './terminal.ts';
 import {
   appendMessage,
   conversationFor,
-  conversationWith,
   deleteConversation,
   findConversation,
   findMessage,
-  listConversations,
   listEvents,
   listMessages,
   pageMessages,
@@ -513,7 +511,6 @@ export function createApp({
     deliver: (agent, conversationId, text, kind) => {
       try {
         if (agent.parentId !== undefined) return;
-        if (kind !== 'approval' && participantAgents(db, conversationId).length !== 1) return;
         const push = pushConfig(db, masterKey);
         if (push === undefined) return;
         const item = pushedItem(db, agent.name, conversationId, kind);
@@ -1638,30 +1635,6 @@ export function createApp({
     },
   );
 
-  app.get('/api/agents/:name/conversations', (c) => {
-    const agent = findAgent(db, c.req.param('name'));
-    if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
-    return c.json(listConversations(db, agent.id));
-  });
-
-  app.post('/api/conversations', async (c) => {
-    const names = (await jsonBody(c))['participants'];
-    if (!Array.isArray(names) || names.length === 0) {
-      return c.json({ error: 'participants must be a non-empty array of agent names' }, 400);
-    }
-
-    const agents = names.map((name) =>
-      typeof name === 'string' ? findAgent(db, name) : undefined,
-    );
-    const unknown = names.filter((_, index) => agents[index] === undefined);
-    if (unknown.length > 0) {
-      return c.json({ error: `no such agent: ${unknown.map(String).join(', ')}` }, 400);
-    }
-
-    const id = conversationWith(db, agents.map((agent) => (agent as Agent).id));
-    return c.json(findConversation(db, id), 201);
-  });
-
   app.get('/api/conversations/:id/messages', (c) => {
     const conversation = conversationParam(db, c.req.param('id'));
     if (conversation === undefined) return c.json({ error: 'no such conversation' }, 404);
@@ -1872,17 +1845,6 @@ export function createApp({
     const conversation = conversationParam(db, c.req.param('id'));
     if (conversation === undefined) return c.json({ error: 'no such conversation' }, 404);
     return compact(c, conversation.id);
-  });
-
-  app.delete('/api/conversations/:id', (c) => {
-    const conversation = conversationParam(db, c.req.param('id'));
-    if (conversation === undefined) return c.json({ error: 'no such conversation' }, 404);
-    const busy = participantAgents(db, conversation.id).find((agent) => runner.running(agent.name));
-    if (busy !== undefined) {
-      return c.json({ error: `${busy.name} is in the middle of a turn; try again in a moment` }, 409);
-    }
-    deleteConversation(db, conversation.id);
-    return c.json({ ok: true });
   });
 
   app.get('/api/approvals', (c) => c.json(listApprovals(db)));

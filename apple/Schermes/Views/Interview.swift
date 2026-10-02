@@ -64,13 +64,13 @@ struct InterviewCard: View {
             }
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
-            if step == 0, !interview.intro.isEmpty {
-                MarkdownText(content: interview.intro)
+            // The card sits in the composer's inset, which never scrolls; squeezed by the keyboard,
+            // its text would truncate instead.
+            ViewThatFits(in: .vertical) {
+                prompt
+                ScrollView { prompt }
+                    .scrollBounceBehavior(.basedOnSize)
             }
-
-            question(step, interview.questions[step])
-                .id(step)
-                .transition(.opacity)
 
             HStack(spacing: 8) {
                 if step > 0 {
@@ -94,6 +94,18 @@ struct InterviewCard: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var prompt: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if step == 0, !interview.intro.isEmpty {
+                MarkdownText(content: interview.intro)
+            }
+            question(step, interview.questions[step])
+                .id(step)
+                .transition(.opacity)
+        }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func question(_ index: Int, _ question: InterviewQuestion) -> some View {

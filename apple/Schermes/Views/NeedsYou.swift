@@ -1,16 +1,13 @@
 import SwiftUI
 
 extension Approval {
-    /// What the agent asks, after its name: "wants to delete its thread with Juno".
+    /// What the agent asks, after its name: "wants to delete its own thread".
     func asks(_ title: (String) -> String) -> String {
         switch kind {
         case .agent:
             return target == agent ? "wants to delete itself" : "wants to delete \(title(target))"
         case .conversation:
-            // Its own name is not news to the owner; who else is in the thread is.
-            let others = participants.filter { $0 != agent }.map(title)
-            guard !others.isEmpty else { return "wants to delete its own thread" }
-            return "wants to delete its thread with \(others.formatted(.list(type: .and)))"
+            return "wants to delete its own thread"
         case .action:
             var text = "wants to " + (Self.categoryWords[category] ?? category)
             if !target.isEmpty { text += ": \(target)" }

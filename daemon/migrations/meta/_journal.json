@@ -211,6 +211,13 @@
       "when": 1790923030670,
       "tag": "0029_foamy_silverclaw",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1790967992444,
+      "tag": "0030_dry_maginty",
+      "breakpoints": true
     }
   ]
 }

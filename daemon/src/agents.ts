@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, eq, isNull, ne, or } from 'drizzle-orm';
 import type { Agent, AgentState } from '@schermes/shared';
 import { config } from './config.ts';
 import { log } from './log.ts';
@@ -316,7 +316,8 @@ export function deleteAgent(db: Db, agent: Agent): void {
   db.delete(schedules).where(eq(schedules.agentId, agent.id)).run();
   db.delete(events).where(eq(events.agentId, agent.id)).run();
   db.delete(conversationParticipants).where(eq(conversationParticipants.agentId, agent.id)).run();
-  db.delete(messages).where(eq(messages.sender, agent.name)).run();
+  // An answer it sent back sits in the asker's own thread, which stays.
+  db.delete(messages).where(and(eq(messages.sender, agent.name), or(isNull(messages.kind), ne(messages.kind, 'reply')))).run();
   db.delete(summaries).where(eq(summaries.sender, agent.name)).run();
   db.delete(agents).where(eq(agents.id, agent.id)).run();
 

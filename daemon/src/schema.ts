@@ -73,11 +73,11 @@ export const agents = sqliteTable('agents', {
   // on it unchanged; what it is not is a Linux user with a desktop.
   parentId: integer('parent_id'),
   parentConversationId: integer('parent_conversation_id'),
+  answeredThrough: integer('answered_through').notNull().default(0),
   createdAt: integer('created_at').notNull(),
 });
 
-/** A thread. Who is in it lives in `conversation_participants`, not here: one agent is that
- * agent's owner thread, two or more is a group. The owner is in every one implicitly. */
+/** A thread: one agent and the owner. The agent lives in `conversation_participants`. */
 export const conversations = sqliteTable('conversations', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   createdAt: integer('created_at').notNull(),
@@ -112,6 +112,7 @@ export const messages = sqliteTable(
     toolCallId: text('tool_call_id'),
     // JSON: the base64 PNG a screenshot observation carries.
     image: text('image'),
+    kind: text('kind'),
     createdAt: integer('created_at').notNull(),
   },
   (table) => [index('messages_conversation_id_idx').on(table.conversationId)],
@@ -122,9 +123,7 @@ export const messages = sqliteTable(
  * between `from_message_id` and `through_message_id`, which stay in `messages` untouched: this
  * table is a second, shorter reading of the same rows, never a rewrite of them.
  *
- * `sender` is the agent the summary was written for. Each agent in a group thread sees its own
- * projection — its own tool traffic, nobody else's — so one shared summary would replay another
- * agent's work as this one's.
+ * `sender` is the agent the summary was written for.
  */
 export const summaries = sqliteTable(
   'summaries',

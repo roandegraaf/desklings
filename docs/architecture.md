@@ -572,7 +572,7 @@ asleep. A heartbeat is a schedule with a fixed prompt, **not a second mechanism*
   is what stops one agent pausing another's job.
 - **Deferred** — a schedule addressed to a group conversation. The owner thread is where the
   owner already reads, and a job that fired into a group would start a turn for every agent in
-  it. The default stands until somebody needs otherwise.
+  it. Moot since shared threads were removed: every thread is one agent's.
 - **Deferred** — a nightly job the daemon seeds by default to summarise `~/memory/<date>.md`
   into `MEMORY.md`, which is the open question the memory slice left here. The mechanism now
   exists — `schedule_task` plus slice 2's `SUMMARY_PROMPT` — and that is what the question was
@@ -730,12 +730,21 @@ SDK is the only reason this is one piece of work rather than three.
 
 ### Messaging
 
-- **Requirement** — a conversation **is its participant set**. One agent is that agent's own
-  thread with the owner, two is the thread those two share, more is a group; the owner is in
-  every conversation and is never listed as a participant. Look-up is find-or-create, so
-  `send_message` and the group route land in the same row rather than growing a thread per
-  message. A group of exactly two and the direct thread between those two are deliberately the
-  same conversation: they are the same set of people.
+- **Requirement** — **every agent has exactly one thread**, the one it shares with the owner;
+  the owner is in it and is never listed as a participant. There are no shared or group
+  threads: they split one exchange across three places and made every agent in them answer
+  every message. Look-up is find-or-create (`conversationFor`), so a cleared thread comes back
+  empty the next time anyone writes to the agent. Migration 0030 deleted the shared threads
+  older databases held, with everything hanging off them.
+- **Requirement** — agents talk **across** threads. `send_message` from A to B stores a row in
+  B's thread with `kind = 'request'` and starts B. When B ends a turn waiting on nobody (not on
+  another agent, a worker or the owner), its last reply is stored in A's thread with
+  `kind = 'reply'` and starts A. A reply is never a request, so A answers the owner, not B, and
+  a single exchange cannot ping-pong. What B has answered is a high-water mark on B's row
+  (`agents.answered_through`), not a lookup in A's thread, so clearing or rewinding A's thread
+  cannot make an old request look unanswered. A failed turn sends its failure back the same way,
+  so A is never left waiting on a turn that died. A turn whose only inputs were requests from
+  other agents sends no push: the owner hears about it when the asking agent answers.
 - **Requirement** — an owner's message may carry an image, stored on the row like a screenshot
   observation is. It reaches every agent in the thread as a user message with the picture, and
   it counts toward `MAX_REPLAYED_IMAGES` with the screenshots: both are bytes in the request,
@@ -760,11 +769,9 @@ SDK is the only reason this is one piece of work rather than three.
   repair and the runaway guard are all wrong on a truncated history, and a page boundary
   between an assistant message and its tool results is the exact shape a strict endpoint
   rejects.
-- **Requirement** — the transcript is a per-agent projection of the shared conversation. What
-  the agent wrote itself is replayed verbatim; everything else becomes a `user` message reading
-  `Message from <who>:` when it was written to this agent, or `<who> said here, to the owner:`
-  when it is another agent's own reply in a shared thread, so a reply is not mistaken for a
-  question that needs answering. Another agent's tool traffic is dropped along with the tool calls that
+- **Requirement** — the transcript is a per-agent projection of the thread. What the agent
+  wrote itself is replayed verbatim; everything else becomes a `user` message reading
+  `Message from <who>:`. Another agent's tool traffic is dropped along with the tool calls that
   asked for it, because half of an assistant/tool pair is a transcript a strict endpoint
   rejects.
 - **Requirement** — anything the agent did not write is **buffered until the transcript is
@@ -781,12 +788,10 @@ SDK is the only reason this is one piece of work rather than three.
   blocking inside it. Blocking would hold a process across an unbounded wait, and a restart
   during that wait leaves nothing to resume; the reply is a durable row, so being woken by it
   costs nothing and survives a restart.
-- An answer is addressed to nobody, so it wakes **only** an agent standing in
-  `waiting_for_agent` for exactly that reply. Without that rule two agents in a group would
-  answer each other forever off one message from the owner.
-- **Requirement** — two agents cannot write to each other forever. A conversation counts the
-  messages agents have passed since the owner last wrote in any thread one of its participants
-  is in, and `send_message` refuses past the cap with an observation the model can act on. Only
+- **Requirement** — two agents cannot write to each other forever. `agentChain` counts the
+  messages agents have passed in both agents' threads (requests, routed replies and worker
+  reports) since the owner last wrote in either, and `send_message` refuses past the cap with
+  an observation the model can act on. Only
   senders that are agent names count, so a trigger firing or an idle note never blocks a
   `send_message`. It is a query over the rows rather than a counter on the message, so nothing
   has to be threaded through the loop.
@@ -1338,8 +1343,8 @@ them outside the drizzle schema.
 | `models`                    | The model registry: name, base URL, model id, extra body, encrypted key |
 | `agents`                    | Name, label, look, profile, X display, state, a worker's parent and thread, and JSON columns for rules, one-shot grants and idle settings, plus its model |
 | `conversations`             | A thread, identified only by its id                                   |
-| `conversation_participants` | Who is in a thread. The owner is in every one and is never listed     |
-| `messages`                  | Role, content, sender, tool calls, tool call id, an optional image    |
+| `conversation_participants` | The one agent a thread belongs to. The owner is in every one and is never listed |
+| `messages`                  | Role, content, sender, tool calls, tool call id, an optional image, and `kind` (`request`/`reply`) on agent-to-agent rows |
 | `summaries`                 | A compacted stretch of a thread, for one agent, and the ids it covers  |
 | `schedules`                 | A standing job for one agent: cron, prompt, paused, and when it is next due |
 | `events`                    | The structured record of what an agent did                            |

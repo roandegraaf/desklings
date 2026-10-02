@@ -9,6 +9,7 @@ import {
   inArray,
   isNull,
   lt,
+  lte,
   max,
   ne,
   or,
@@ -27,6 +28,7 @@ import { AGENT_NAME, findAgent, listAgents } from './agents.ts';
 import type { Db } from './db.ts';
 import type { Image, ToolDef } from './provider.ts';
 import {
+  agents,
   approvals,
   conversationParticipants,
   conversations,
@@ -43,8 +45,8 @@ const MAX_MESSAGE_CHARS = 8_192;
  * owner. Two agents that keep writing to each other would otherwise never stop, and nothing in
  * a turn is expensive enough to notice the runaway on its own.
  *
- * ponytail: an agent-to-agent thread hits this ceiling permanently until the owner posts to any
- * of its agents. A decay rule can wait until anyone wants one.
+ * ponytail: two agents hit this ceiling permanently until the owner posts to either of them. A
+ * decay rule can wait until anyone wants one.
  */
 export const MAX_AGENT_CHAIN = 6;
 
@@ -56,54 +58,36 @@ export type NewMessage = {
   toolCalls?: readonly ToolCall[];
   toolCallId?: string;
   image?: Image;
+  kind?: MessageKind;
 };
+
+export type MessageKind = 'request' | 'reply';
 
 function participantRows(db: Db): { conversationId: number; agentId: number }[] {
   return db.select().from(conversationParticipants).all();
 }
 
-/**
- * A conversation is its participant set: one agent is that agent's owner thread, two is the
- * thread those two share, more is a group. Find-or-create, so `send_message` and the group
- * route both land in the same row rather than growing a new thread per message.
- */
-export function conversationWith(db: Db, agentIds: readonly number[]): number {
-  const found = existingConversation(db, agentIds);
-  if (found !== undefined) return found;
+/** `conversationFor` without the create, for a reader that must not make threads appear. */
+export function existingConversation(db: Db, agentId: number): number | undefined {
+  return db
+    .select({ id: conversationParticipants.conversationId })
+    .from(conversationParticipants)
+    .where(eq(conversationParticipants.agentId, agentId))
+    .get()?.id;
+}
 
-  const wanted = [...new Set(agentIds)].sort((a, b) => a - b);
+/** The agent's thread with the owner, find-or-create: the one thread it has. */
+export function conversationFor(db: Db, agentId: number): number {
+  const found = existingConversation(db, agentId);
+  if (found !== undefined) return found;
   const created = db.insert(conversations).values({ createdAt: Date.now() }).returning().get();
-  for (const agentId of wanted) {
-    db.insert(conversationParticipants).values({ conversationId: created.id, agentId }).run();
-  }
+  db.insert(conversationParticipants).values({ conversationId: created.id, agentId }).run();
   return created.id;
 }
 
-/** `conversationWith` without the create, for a reader that must not make threads appear. */
-export function existingConversation(db: Db, agentIds: readonly number[]): number | undefined {
-  const wanted = [...new Set(agentIds)].sort((a, b) => a - b);
-  const grouped = new Map<number, number[]>();
-  for (const row of participantRows(db)) {
-    grouped.set(row.conversationId, [...(grouped.get(row.conversationId) ?? []), row.agentId]);
-  }
-  for (const [conversationId, members] of grouped) {
-    const sorted = [...members].sort((a, b) => a - b);
-    if (sorted.length === wanted.length && sorted.every((id, i) => id === wanted[i])) {
-      return conversationId;
-    }
-  }
-  return undefined;
-}
-
-/** The thread an agent shares with nobody but the owner. */
-export function conversationFor(db: Db, agentId: number): number {
-  return conversationWith(db, [agentId]);
-}
-
 /**
- * A thread and everything written in it. The agents in it stay; only their seats here go.
- * Find-or-create means a deleted owner thread comes back empty the next time anyone writes to
- * that agent, which is what makes this "clear this thread" as well as "delete this group".
+ * A thread and everything written in it. The agent stays; find-or-create brings its thread
+ * back empty the next time anyone writes to it, which is what makes this "clear this thread".
  */
 export function deleteConversation(db: Db, conversationId: number): void {
   db.delete(approvals).where(eq(approvals.conversationId, conversationId)).run();
@@ -201,6 +185,7 @@ export function appendMessage(db: Db, conversationId: number, message: NewMessag
       toolCalls: message.toolCalls === undefined ? null : JSON.stringify(message.toolCalls),
       toolCallId: message.toolCallId ?? null,
       image: message.image === undefined ? null : JSON.stringify(message.image),
+      kind: message.kind ?? null,
       createdAt: Date.now(),
     })
     .returning()
@@ -345,10 +330,8 @@ function notSentBy(name: string) {
  * The conversation holding the oldest message addressed to this agent that no turn has covered:
  * newer than `since`, and newer than what `coveredUpTo` reports for its own thread. This is
  * what replaces the 409: a message for a busy agent is a row, and the turn that is running
- * looks here before it lets go of the agent. Normally only `user` rows count, because an
- * agent's answer is an `assistant` row and is addressed to nobody — but an agent that spent its
- * turn writing to another one is waiting for exactly that answer, and would otherwise miss a
- * reply that landed before it let go.
+ * looks here before it lets go of the agent. Only `user` rows count: another agent's answer
+ * arrives as one, routed into this agent's thread.
  */
 export function pendingConversation(
   db: Db,
@@ -356,8 +339,6 @@ export function pendingConversation(
   since: number,
   coveredUpTo: (conversationId: number) => number = () => since,
 ): number | undefined {
-  const state = findAgent(db, agent.name)?.state ?? agent.state;
-  const wakes = state === 'waiting_for_agent' ? ['user', 'assistant'] : ['user'];
   return db
     .select({ conversationId: messages.conversationId, id: messages.id })
     .from(messages)
@@ -369,7 +350,7 @@ export function pendingConversation(
       and(
         eq(conversationParticipants.agentId, agent.id),
         gt(messages.id, since),
-        inArray(messages.role, wakes),
+        eq(messages.role, 'user'),
         notSentBy(agent.name),
       ),
     )
@@ -379,47 +360,66 @@ export function pendingConversation(
 }
 
 /**
- * How many messages agents have passed between themselves since the owner last spoke to any of
- * them. The owner's word reaches an agent through its own thread as much as through the shared
- * one, so a post to either participant is what resets the count. In a shared thread an agent's
- * reply is one of them: every other agent is shown it as a message and answers it, which is how
- * two agents kept reacting to each other under a cap that counted only `send_message`.
+ * How many messages agents have passed between themselves in these threads since the owner last
+ * posted in any of them: requests, the replies routed back, and workers' reports. `send_message`
+ * hands it both agents' threads, because a request lands in one and its reply in the other.
  */
-export function agentChain(db: Db, conversationId: number): number {
-  const participants = participantAgents(db, conversationId).map((agent) => agent.id);
+export function agentChain(db: Db, conversationIds: readonly number[]): number {
   const spoke =
     db
       .select({ id: max(messages.id) })
       .from(messages)
-      .innerJoin(
-        conversationParticipants,
-        eq(conversationParticipants.conversationId, messages.conversationId),
-      )
       .where(
         and(
-          inArray(conversationParticipants.agentId, participants),
+          inArray(messages.conversationId, conversationIds),
           eq(messages.role, 'user'),
           isNull(messages.sender),
         ),
       )
       .get()?.id ?? 0;
   // Not listMessages: this runs per send_message, and parsing every stored screenshot blocks the loop.
-  const stored = db
-    .select({ role: messages.role, sender: messages.sender, toolCalls: messages.toolCalls })
+  return db
+    .select({ sender: messages.sender })
     .from(messages)
-    .where(and(eq(messages.conversationId, conversationId), gt(messages.id, spoke)))
+    .where(
+      and(
+        inArray(messages.conversationId, conversationIds),
+        gt(messages.id, spoke),
+        eq(messages.role, 'user'),
+      ),
+    )
+    .all()
+    // Only agents: a trigger firing or an idle note is not one agent answering another.
+    .filter((message) => message.sender !== null && AGENT_NAME.test(message.sender)).length;
+}
+
+/** The mark lives on the agent, not in the asker's thread, so clearing or rewinding that thread
+ * cannot make an old request look unanswered. */
+export function owedRequests(
+  db: Db,
+  agentId: number,
+  conversationId: number,
+  through: number,
+): { id: number; sender: string }[] {
+  const answered = db.select({ id: agents.answeredThrough }).from(agents).where(eq(agents.id, agentId)).get()?.id ?? 0;
+  return db
+    .select({ id: messages.id, sender: messages.sender })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.conversationId, conversationId),
+        eq(messages.kind, 'request'),
+        gt(messages.id, answered),
+        lte(messages.id, through),
+      ),
+    )
     .orderBy(asc(messages.id))
-    .all();
-  const shared = participants.length > 1;
-  return stored
-    .filter(
-      (message) =>
-        message.sender !== null &&
-        // Only agents: a trigger firing or an idle note is not one agent answering another.
-        AGENT_NAME.test(message.sender) &&
-        (message.role === 'user' ||
-          (shared && message.role === 'assistant' && message.toolCalls === null)),
-    ).length;
+    .all()
+    .flatMap((row) => (row.sender === null ? [] : [{ id: row.id, sender: row.sender }]));
+}
+
+export function markAnswered(db: Db, agentId: number, through: number): void {
+  db.update(agents).set({ answeredThrough: through }).where(eq(agents.id, agentId)).run();
 }
 
 export function parseSendMessage(
@@ -444,11 +444,11 @@ export function sendMessageToolDef(): ToolDef {
   return {
     name: 'send_message',
     description:
-      'Write to another agent on this machine. The message arrives in the thread you two ' +
-      'share and starts that agent working, even if it is already busy. Your turn keeps going ' +
-      'after this; the reply arrives later and wakes you. Only for asking another agent to do ' +
-      'or tell you something. Never to thank, confirm, acknowledge or report back: the owner ' +
-      'and everyone in the thread already read your reply.',
+      'Ask another agent on this machine to do or tell you something. The message lands in ' +
+      'its thread with the owner and starts it working, even if it is already busy. Your turn ' +
+      'keeps going after this; its final answer comes back to you as a message from it and ' +
+      'wakes you. Never use this to answer a message from another agent, or to thank, confirm ' +
+      'or acknowledge: your final answer to a request goes back to whoever sent it on its own.',
     parameters: {
       type: 'object',
       properties: {

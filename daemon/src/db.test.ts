@@ -89,3 +89,31 @@ test('a migrated database still enforces its foreign keys', () => {
     (error: Error) => /FOREIGN KEY/.test(String((error as { cause?: unknown }).cause)),
   );
 });
+
+test('upgrading deletes every thread two agents shared and everything hanging off it', () => {
+  const file = dbFile();
+  const old = openDb(file, migrationsUpTo(30));
+  old.run(sql`INSERT INTO agents (name, display, state, created_at) VALUES ('alpha', 1, 'idle', 1), ('bravo', 2, 'idle', 1)`);
+  old.run(sql`INSERT INTO conversations (id, created_at) VALUES (1, 1), (2, 1), (3, 1)`);
+  old.run(sql`INSERT INTO conversation_participants (conversation_id, agent_id) VALUES (1, 1), (2, 2), (3, 1), (3, 2)`);
+  old.run(sql`INSERT INTO messages (conversation_id, role, content, sender, created_at) VALUES (1, 'user', 'mine', NULL, 1), (3, 'user', 'ours', 'alpha', 2)`);
+  old.run(sql`INSERT INTO summaries (conversation_id, sender, content, from_message_id, through_message_id, created_at) VALUES (3, 'alpha', 's', 2, 2, 3)`);
+  old.run(sql`INSERT INTO approvals (agent_id, conversation_id, kind, target, reason, created_at) VALUES (1, 3, 'action', 'x', 'r', 4), (1, 1, 'conversation', '3', 'r', 4), (1, 1, 'agent', 'bravo', 'r', 4)`);
+  old.run(sql`INSERT INTO forms (agent_id, conversation_id, call_id, origin, reason, fields, unfillable, created_at) VALUES (1, 3, 'c', 'https://a', 'r', '[]', '[]', 5)`);
+  old.run(sql`INSERT INTO read_marks (thread, message_id) VALUES ('conversation:3', 2), ('agent:alpha', 1)`);
+  old.run(sql`INSERT INTO agents (name, display, state, parent_id, parent_conversation_id, created_at) VALUES ('alpha-w1', 1001, 'completed', 1, 3, 1)`);
+  old.$client.close();
+
+  const db = openDb(file, MIGRATIONS);
+  const count = (query: ReturnType<typeof sql>) => (db.get(query) as { n: number }).n;
+  assert.deepEqual(db.all(sql`SELECT id FROM conversations ORDER BY id`), [{ id: 1 }, { id: 2 }]);
+  assert.equal(count(sql`SELECT COUNT(*) AS n FROM conversation_participants WHERE conversation_id = 3`), 0);
+  assert.deepEqual(listMessages(db, 1).map((m) => m.content), ['mine']);
+  assert.equal(count(sql`SELECT COUNT(*) AS n FROM messages WHERE conversation_id = 3`), 0);
+  assert.equal(count(sql`SELECT COUNT(*) AS n FROM summaries`), 0);
+  assert.deepEqual(db.all(sql`SELECT kind FROM approvals`), [{ kind: 'agent' }]);
+  assert.equal(count(sql`SELECT COUNT(*) AS n FROM forms`), 0);
+  assert.deepEqual(db.all(sql`SELECT thread FROM read_marks`), [{ thread: 'agent:alpha' }]);
+  assert.equal(findAgent(db, 'alpha-w1')?.parentConversationId, undefined);
+  assert.equal(count(sql`SELECT COUNT(*) AS n FROM messages_fts WHERE messages_fts MATCH 'ours'`), 0);
+});

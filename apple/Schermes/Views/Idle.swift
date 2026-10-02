@@ -152,75 +152,124 @@ private struct IdleOutputRow: View {
 
     @State private var acting = false
     @State private var trouble: String?
+    @State private var expanded = false
 
     @Environment(AgentLooks.self) private var looks
     @Environment(\.colorScheme) private var scheme
 
+    private var palette: AgentPalette { looks[agent].palette(dark: scheme == .dark) }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 10) {
+            header
             content
-            HStack(spacing: 8) {
-                Spacer(minLength: 0)
-                if let word = output.resolvedWord {
-                    Text(word)
-                        .font(.canvas(12, .caption, weight: .semibold))
-                        .foregroundStyle(Theme.muted)
-                } else {
+                .opacity(output.resolved == nil ? 1 : 0.6)
+            if output.resolved == nil, hasButtons {
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
                     buttons.disabled(acting)
                 }
+                .controlSize(.small)
             }
-            .controlSize(.small)
             if let trouble {
                 Text(trouble)
                     .font(.canvas(13, .footnote))
                     .foregroundStyle(Theme.failed)
             }
         }
-        .padding(10)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.ground, in: .rect(cornerRadius: 12))
+        .background(Theme.ground, in: .rect(cornerRadius: 14))
+        .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(Theme.hairline) }
+        .animation(.snappy(duration: 0.25), value: expanded)
+        .animation(.snappy(duration: 0.25), value: output.resolved)
     }
 
-    private func heading(_ text: String) -> some View {
-        Text(text).font(.canvas(13, .subheadline, weight: .bold))
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(palette.softText.color)
+                .frame(width: 24, height: 24)
+                .background(palette.soft.color, in: .circle)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    titleText
+                    Text(Date(timeIntervalSince1970: Double(output.createdAt) / 1000), format: .dateTime.hour().minute())
+                        .font(.canvas(12, .caption))
+                        .foregroundStyle(Theme.muted)
+                        .monospacedDigit()
+                        .fixedSize()
+                }
+                titleText
+            }
+            Spacer(minLength: 8)
+            if let word = output.resolvedWord {
+                Label(word, systemImage: "checkmark")
+                    .labelStyle(.titleAndIcon)
+                    .font(.canvas(11, .caption2, weight: .semibold))
+                    .foregroundStyle(Theme.muted)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Theme.ink.opacity(0.06), in: .capsule)
+                    .fixedSize()
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+            }
+        }
+    }
+
+    private var titleText: some View {
+        Text(title)
+            .font(.canvas(13, .subheadline, weight: .bold))
+            .foregroundStyle(Theme.ink)
+            .lineLimit(1)
+    }
+
+    private var symbol: String {
+        switch output.kind {
+        case .memory: "brain"
+        case .routine: "clock.arrow.circlepath"
+        case .note: "lightbulb"
+        case .cleanup: "trash"
+        case .other: "sparkles"
+        }
+    }
+
+    private var title: String {
+        switch output.kind {
+        case .memory: "Tidied its memory"
+        case .routine: "Suggests a routine"
+        case .note: "Noticed something"
+        case .cleanup: "Proposes a cleanup"
+        case .other(let raw): "Left a \(raw)"
+        }
+    }
+
+    private var hasButtons: Bool {
+        switch output.kind {
+        case .memory, .routine, .note: true
+        case .cleanup, .other: false
+        }
     }
 
     @ViewBuilder private var content: some View {
         switch output.kind {
         case .memory(let before, let after):
-            heading("Tidied its memory")
-            let lines = memoryDiff(before: before, after: after)
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(lines.prefix(8).enumerated()), id: \.offset) { _, line in
-                    Text("\(line.added ? "+" : "−") \(line.text)")
-                        .foregroundStyle(line.added ? Theme.done : Theme.failed)
-                        .lineLimit(2)
-                }
-                if lines.count > 8 {
-                    Text("and \(lines.count - 8) more lines")
-                        .foregroundStyle(Theme.muted)
+            MemoryChanges(lines: memoryDiff(before: before, after: after), expanded: $expanded)
+        case .routine(let cron, let prompt):
+            VStack(alignment: .leading, spacing: 6) {
+                Label(cadence(cron) ?? cron, systemImage: "calendar")
+                    .font(.canvas(12, .caption, weight: .semibold))
+                    .foregroundStyle(palette.accentText.color)
+                Folded(expanded: $expanded, long: prompt.count > 220) {
+                    MarkdownText(content: prompt)
                 }
             }
-            .font(.canvas(11, .caption).monospaced())
-        case .routine(let cron, let prompt):
-            heading("Suggests a routine")
-            Text(cadence(cron) ?? cron)
-                .font(.canvas(12, .caption, weight: .semibold))
-                .foregroundStyle(Theme.secondary)
-            Text(prompt)
-                .font(.canvas(13, .footnote))
-                .foregroundStyle(Theme.secondary)
-                .lineLimit(4)
-                .fixedSize(horizontal: false, vertical: true)
         case .note(let text):
-            heading("Noticed something")
-            Text(text)
-                .font(.canvas(13, .footnote))
-                .foregroundStyle(Theme.secondary)
-                .lineLimit(6)
-                .fixedSize(horizontal: false, vertical: true)
+            Folded(expanded: $expanded, long: text.count > 220 || text.split(separator: "\n").count > 4) {
+                MarkdownText(content: text)
+            }
         case .cleanup(let approvalId):
-            heading("Proposes a cleanup")
             Group {
                 if let approval = approvals.first(where: { $0.id == approvalId }) {
                     Text("It \(approval.asks(titles)). Answer it in Needs you.")
@@ -230,8 +279,8 @@ private struct IdleOutputRow: View {
             }
             .font(.canvas(13, .footnote))
             .foregroundStyle(Theme.secondary)
-        case .other(let raw):
-            heading("Left a \(raw)")
+        case .other:
+            EmptyView()
         }
     }
 
@@ -265,6 +314,141 @@ private struct IdleOutputRow: View {
             acting = false
         }
     }
+}
+
+/// Long prose cut to a few lines that fade out, with a toggle to read the rest.
+private struct Folded<Content: View>: View {
+    @Binding var expanded: Bool
+    let long: Bool
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            content
+                .font(.canvas(13, .footnote))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxHeight: long && !expanded ? 88 : nil, alignment: .top)
+                .clipped()
+                .mask {
+                    LinearGradient(
+                        stops: [.init(color: .black, location: 0.6), .init(color: .black.opacity(long && !expanded ? 0 : 1), location: 1)],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                }
+            if long {
+                FoldToggle(expanded: $expanded, more: "Show more", less: "Show less")
+            }
+        }
+    }
+}
+
+private struct FoldToggle: View {
+    @Binding var expanded: Bool
+    let more: String
+    let less: String
+
+    var body: some View {
+        Button {
+            expanded.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Text(expanded ? less : more)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .rotationEffect(.degrees(expanded ? 180 : 0))
+            }
+            .font(.canvas(12, .caption, weight: .semibold))
+            .foregroundStyle(Theme.muted)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// A memory rewrite as readable change rows: the list marker the diff would double up is dropped
+/// and the line is rendered as inline markdown.
+private struct MemoryChanges: View {
+    let lines: [DiffLine]
+    @Binding var expanded: Bool
+
+    private static let collapsedCount = 3
+
+    private var shown: [DiffLine] { expanded ? lines : Array(lines.prefix(Self.collapsedCount)) }
+
+    private var tally: String {
+        let added = lines.filter(\.added).count
+        let removed = lines.count - added
+        return [
+            removed > 0 ? "\(removed) removed" : nil,
+            added > 0 ? "\(added) added" : nil,
+        ].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if lines.isEmpty {
+                Text("No visible changes.")
+                    .font(.canvas(13, .footnote))
+                    .foregroundStyle(Theme.muted)
+            } else {
+                Text(tally)
+                    .font(.canvas(12, .caption, weight: .semibold))
+                    .foregroundStyle(Theme.muted)
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(shown.enumerated()), id: \.offset) { _, line in
+                        MemoryChangeRow(line: line, expanded: expanded)
+                    }
+                }
+                if lines.count > Self.collapsedCount {
+                    FoldToggle(
+                        expanded: $expanded,
+                        more: "Show all \(lines.count) changes",
+                        less: "Show fewer"
+                    )
+                }
+            }
+        }
+    }
+}
+
+private struct MemoryChangeRow: View {
+    let line: DiffLine
+    let expanded: Bool
+
+    private var tint: Token { line.added ? Theme.done : Theme.failed }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: line.added ? "plus" : "minus")
+                .font(.system(size: 8, weight: .heavy))
+                .foregroundStyle(tint)
+                .frame(width: 16, height: 16)
+                .background(tint.opacity(0.14), in: .circle)
+                .padding(.top, 1)
+            Text(memoryLineText(line.text))
+                .font(.canvas(13, .footnote))
+                .foregroundStyle(line.added ? Theme.ink : Theme.muted)
+                .strikethrough(!line.added, color: .secondary.opacity(0.4))
+                .lineLimit(expanded ? nil : 2)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(line.added ? "Added" : "Removed"): \(line.text)")
+    }
+}
+
+func memoryLineText(_ raw: String) -> AttributedString {
+    var text = raw.trimmingCharacters(in: .whitespaces)
+    for marker in ["- ", "* ", "+ "] where text.hasPrefix(marker) {
+        text = String(text.dropFirst(marker.count))
+        break
+    }
+    while text.hasPrefix("#") { text.removeFirst() }
+    text = text.trimmingCharacters(in: .whitespaces)
+    let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+    return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
 }
 
 /// When the agent works on its own while nobody is waiting on it. Every change is written straight

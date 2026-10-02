@@ -167,14 +167,6 @@ private func agent(_ id: Int, _ name: String, label: String? = nil, parentId: In
     #expect(activeWorkers(of: agents[1], in: agents).map(\.name) == ["two-w1"])
 }
 
-@Test func anAgentsOwnThreadIsNotListedBesideTheOnesItShares() {
-    let conversations = [
-        Conversation(id: 1, participants: ["one"], createdAt: 1),
-        Conversation(id: 2, participants: ["one", "two"], createdAt: 2),
-    ]
-    #expect(sharedConversations(conversations, "one").map(\.id) == [2])
-}
-
 @Test func aThreadSourceNamesItselfTheSameWayTwice() {
     #expect(ThreadSource.agent("one").key == "agent:one")
     #expect(ThreadSource.conversation(4).key == "conversation:4")
