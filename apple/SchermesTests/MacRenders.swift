@@ -49,7 +49,7 @@ func renderMacScreens() async throws {
             useLaunchArguments(open: open)
             let session = try checkedSession()
             let window = makeWindow(size: size, dark: dark) {
-                RootView(session: session)
+                RootView(session: session).environment(AgentFeed(session: session))
             }
             try await settle(window, sheet: open.map(opensSheet) ?? false)
             try save(window, to: dir.appending(path: "mac-\(name)-\(mode).png"))
@@ -60,7 +60,7 @@ func renderMacScreens() async throws {
             useLaunchArguments(open: "settings", tab: category.rawValue)
             let session = try checkedSession()
             let window = makeWindow(size: CGSize(width: 1440, height: 900), dark: dark) {
-                RootView(session: session)
+                RootView(session: session).environment(AgentFeed(session: session))
             }
             try await settle(window, sheet: true)
             try save(window, to: dir.appending(path: "mac-settings-\(category.rawValue)-\(mode).png"))
@@ -73,8 +73,8 @@ func renderMacScreens() async throws {
         await session.start()
         try #require(session.phase == .ready)
         let looks = AgentLooks()
-        let feed = MenuBarFeed()
-        feed.start(session: session, looks: looks)
+        let feed = AgentFeed(session: session, looks: looks)
+        try await feed.refresh()
         let window = makeWindow(size: CGSize(width: 370, height: 620), dark: dark, chrome: false) {
             MenuBarPanel(session: session, looks: looks, feed: feed)
         }

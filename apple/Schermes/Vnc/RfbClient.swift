@@ -74,15 +74,21 @@ nonisolated enum WheelDirection: UInt8, Sendable {
 ///
 /// An actor rather than anything on the main actor: this reads a socket, inflates and walks
 /// millions of bytes per second, and only the finished `CGImage` has any business on the actor
-/// that draws. `KeyEvent` (4) and `PointerEvent` (5) leave here only while `hold(true)` has been
-/// called, because the daemon's proxy filters nothing and this gate is the whole of the promise.
-/// `ClientCutText` (6) is still never written: the app has no clipboard bridge to feed it.
+/// that draws. `KeyEvent` (4), `PointerEvent` (5) and `ClientCutText` (6) leave here only while
+/// `hold(true)` has been called, because the daemon's proxy filters nothing and this gate is the
+/// whole of the promise. The desktop's `ServerCutText` (3) is surfaced on `cuts` under the same
+/// gate: a viewer that only watches has no business with the agent's clipboard.
 actor RfbClient {
     /// Frames and the one failure that ends the connection. Finishes when `run()` returns.
     nonisolated let events: AsyncStream<RfbEvent>
+    /// The desktop's clipboard, each time it changes while this viewer holds the desktop. Its own
+    /// stream keeping only the newest: a clipboard is a value, not a log, and a burst of frames on
+    /// `events` must not push it out.
+    nonisolated let cuts: AsyncStream<String>
 
     private nonisolated let transport: RfbTransport
     private nonisolated let feed: AsyncStream<RfbEvent>.Continuation
+    private nonisolated let cutFeed: AsyncStream<String>.Continuation
 
     private var buffer: [UInt8] = []
     private var offset = 0
@@ -98,6 +104,7 @@ actor RfbClient {
     init(transport: RfbTransport) {
         self.transport = transport
         (events, feed) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(4))
+        (cuts, cutFeed) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
     }
 
     /// Runs until the socket dies or the task is cancelled. Leaving the desktop cancels the task
@@ -114,6 +121,7 @@ actor RfbClient {
             }
             transport.close()
             feed.finish()
+            cutFeed.finish()
         } onCancel: {
             transport.close()
         }
@@ -144,9 +152,7 @@ actor RfbClient {
             case 2:
                 break // Bell.
             case 3:
-                // ServerCutText: the desktop's clipboard, which a view-only client has no use for.
-                _ = try await take(3)
-                _ = try await take(try await u32())
+                try await readCutText()
             case let other:
                 throw RfbError.malformed("server message \(other)")
             }
@@ -182,6 +188,21 @@ actor RfbClient {
 
     private func failureReason() async throws -> String {
         String(decoding: try await take(try await u32()), as: UTF8.self)
+    }
+
+    // MARK: - Clipboard
+
+    /// RFB 6.5.6: three bytes of padding, a length, then that much Latin-1. Anything longer than
+    /// Xvnc would itself accept is stepped over without being kept.
+    private func readCutText() async throws {
+        _ = try await take(3)
+        let length = try await u32()
+        guard length <= maxCutText else {
+            try await skip(length)
+            return
+        }
+        let text = latin1Text(try await take(length))
+        if holds { cutFeed.yield(text) }
     }
 
     // MARK: - Updates
@@ -378,8 +399,8 @@ actor RfbClient {
     // MARK: - Client messages
 
     /// The one way bytes leave this client. Everything above it writes freely; `input` is the only
-    /// caller that has a gate in front of it, and `KeyEvent` and `PointerEvent` are the only
-    /// messages that go through it.
+    /// caller that has a gate in front of it, and `KeyEvent`, `PointerEvent` and `ClientCutText`
+    /// are the only messages that go through it.
     private func write(_ message: Data) async throws {
         do {
             try await transport.send(message)
@@ -427,6 +448,24 @@ actor RfbClient {
         await input(keyMessage(keysym, down: down))
     }
 
+    /// A Control chord pressed and let go in one call, which is what a Mac's Command shortcut
+    /// becomes on the agent's Linux desktop.
+    func shortcut(_ keysym: UInt32) async {
+        await input(keyMessage(Keysym.control, down: true))
+        await input(keyMessage(keysym, down: true))
+        await input(keyMessage(keysym, down: false))
+        await input(keyMessage(Keysym.control, down: false))
+    }
+
+    /// The owner's clipboard onto the desktop's, then the paste chord, so what lands is what the
+    /// owner copied rather than whatever the agent copied last. A text that cannot be sent is not
+    /// pasted at all, for the same reason: the caller checks `canCarry` first and says so.
+    func paste(_ text: String, keysym: UInt32 = Keysym.v) async {
+        guard let message = clientCutText(text) else { return }
+        await input(message)
+        await shortcut(keysym)
+    }
+
     private func releaseEverything() async {
         if buttons != 0 {
             buttons = 0
@@ -442,6 +481,22 @@ actor RfbClient {
         message.append(contentsOf: [UInt8(truncatingIfNeeded: x >> 8), UInt8(truncatingIfNeeded: x)])
         message.append(contentsOf: [UInt8(truncatingIfNeeded: y >> 8), UInt8(truncatingIfNeeded: y)])
         await input(message)
+    }
+
+    /// Whether a paste of this text can be sent: Xvnc drops a `ClientCutText` past its own limit.
+    nonisolated static func canCarry(_ text: String) -> Bool {
+        latin1Bytes(text).count <= maxCutText
+    }
+
+    private nonisolated func clientCutText(_ text: String) -> Data? {
+        let bytes = latin1Bytes(text)
+        guard bytes.count <= maxCutText else { return nil }
+        var message = Data([6, 0, 0, 0])
+        for shift in stride(from: 24, through: 0, by: -8) {
+            message.append(UInt8(truncatingIfNeeded: bytes.count >> shift))
+        }
+        message.append(contentsOf: bytes)
+        return message
     }
 
     private nonisolated func keyMessage(_ keysym: UInt32, down: Bool) -> Data {
@@ -491,6 +546,27 @@ actor RfbClient {
         return slice
     }
 
+    /// Steps over bytes as they arrive instead of buffering them, for a length nobody should be
+    /// trusted to allocate.
+    private func skip(_ count: Int) async throws {
+        let buffered = min(count, buffer.count - offset)
+        offset += buffered
+        var left = count - buffered
+        guard left > 0 else { return }
+        buffer.removeAll(keepingCapacity: true)
+        offset = 0
+        while left > 0 {
+            let chunk = try await transport.receive()
+            guard !chunk.isEmpty else { throw RfbError.closed }
+            if chunk.count <= left {
+                left -= chunk.count
+            } else {
+                buffer.append(contentsOf: chunk.dropFirst(left))
+                left = 0
+            }
+        }
+    }
+
     private func u8() async throws -> Int { Int(try await take(1)[0]) }
 
     private func u16() async throws -> Int {
@@ -507,6 +583,9 @@ actor RfbClient {
 // MARK: - Constants
 
 private nonisolated let securityNone: UInt8 = 1
+/// Xvnc's own `MaxCutText` default. It ignores a longer `ClientCutText`, so neither direction
+/// carries more.
+nonisolated let maxCutText = 256 * 1024
 private nonisolated let tileSide = 64
 private nonisolated let frameInterval = Duration.milliseconds(1000 / 60)
 
@@ -578,4 +657,30 @@ nonisolated final class Inflate {
         if let failure { throw failure }
         return output
     }
+}
+
+// MARK: - Latin-1
+
+/// Cut text is Latin-1 with `\n` line ends (RFB 6.5.6). Each byte is its own code point.
+nonisolated func latin1Text(_ bytes: [UInt8]) -> String {
+    var text = String.UnicodeScalarView()
+    for byte in bytes { text.append(Unicode.Scalar(byte)) }
+    return String(text)
+}
+
+/// One `?` for each character Latin-1 cannot carry, an emoji of several scalars included. Line
+/// ends are folded first, because Swift reads `\r\n` as one character that would fail the test,
+/// and the text is composed so an accent typed as a combining mark still fits.
+nonisolated func latin1Bytes(_ text: String) -> [UInt8] {
+    let lines = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+    var bytes: [UInt8] = []
+    for character in lines.precomposedStringWithCanonicalMapping {
+        let scalars = character.unicodeScalars
+        if scalars.allSatisfy({ $0.value <= 0xff }) {
+            bytes.append(contentsOf: scalars.map { UInt8($0.value) })
+        } else {
+            bytes.append(UInt8(ascii: "?"))
+        }
+    }
+    return bytes
 }

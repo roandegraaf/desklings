@@ -27,7 +27,7 @@ per agent, and no orchestrator.
   server in one process, so a desktop is a single thing to spawn, adopt and kill.
 - **Requirement** — VNC binds loopback only (`-localhost -rfbport $((5900 + display))`), plus
   `-nolisten tcp` so the X protocol itself is reachable only over the Unix socket. The daemon
-  proxies VNC to the browser over its own WebSocket, which is where ownership is enforced.
+  proxies VNC to the app over its own WebSocket, which is where ownership is enforced.
 - **Requirement** — desktops are spawned detached with `setsid` as the agent user and adopted
   on daemon restart by probing the display with `xdpyinfo`. No per-agent systemd units, so the
   same code path works in Docker and on a bare host.
@@ -62,28 +62,404 @@ maximized window stops above it. The launchers are `.desktop` files beside the s
 
 ## Privilege model
 
-**Requirement** — plain sudoers rules, no setuid helper. This was the other open question from
-the overview, and a helper binary turned out to buy nothing: everything the daemon needs is
-expressible as two sudoers lines, and a helper would be one more thing to audit.
+**Requirement** — plain sudoers rules, no setuid helper. A helper binary turned out to buy
+nothing: everything the daemon needs is expressible as two sudoers lines, and a helper would be
+one more thing to audit.
 
-`/etc/sudoers.d/schermes`:
+`/etc/sudoers.d/schermes`, where `$d` is `/opt/schermes/infra/desktop`:
 
 ```
-schermes ALL=(root) NOPASSWD: /opt/schermes/infra/desktop/create-agent-user.sh, /usr/bin/apt-get
-schermes ALL=(%agents) NOPASSWD: ALL
+schermes ALL=(root) NOPASSWD: $d/create-agent-user.sh, $d/rename-agent-user.sh, $d/delete-agent-user.sh
+schermes ALL=(%agents) NOPASSWD: $d/sandbox.sh start, $d/sandbox.sh stop, $d/sandbox.sh forward *, $d/sandbox.sh unforward *, $d/sandbox.sh enter *, /usr/bin/pkill
 ```
 
 - The daemon runs as the unprivileged system user `schermes`.
-- It may become any member of the `agents` group. A `%group` entry in a runas list matches every
-  member of that group, which is how one rule covers every present and future agent user.
-- Its only root powers are creating an agent user and installing packages. `create-agent-user.sh`
-  lives under `/opt/schermes`, is owned by root, and validates its argument against
-  `^[a-z0-9][a-z0-9-]{0,30}$`, so the rule is not a path to arbitrary root.
+- **Root** only to create, rename and delete an agent's user. The three scripts live under
+  `/opt/schermes`, are owned by root, and validate their arguments against
+  `^[a-z0-9][a-z0-9-]{0,30}$`, so the rule is not a path to arbitrary root. The earlier grant of
+  `/usr/bin/apt-get` as root is gone: nothing used it, and `apt-get -o APT::Update::Pre-Invoke=…`
+  runs any command.
+- **As an agent** only through the sandbox script, plus `pkill`. A `%group` runas entry matches
+  every member of the group, so one rule covers every present and future agent user.
+  - `sandbox.sh enter <cmd>` is how every command reaches an agent, and it runs inside the
+    agent's sandbox. `start`, `forward`, `unforward` and `stop` manage the sandbox itself.
+  - `pkill` is `stopDisplay`, which stops one helper display's Xvnc. Run as the agent outside
+    its sandbox, it can signal only that agent's own processes.
+  - `sudo -u agent-<name> <anything else>` is refused. Even unrestricted, the agent's uid
+    outside owns only its home, so this is defence in depth against a compromised daemon.
+- `check.sh` uses the same two routes as the daemon. `smoke.sh` runs as container root through
+  `docker compose exec`, outside both rules.
 
-`/etc/sudoers.d/agents` gives agent users passwordless sudo. That is intentional: an agent is
-the operator of its own machine and needs to install packages and edit system files to be
-useful. The isolation boundary of schermes is the machine, not the agent user. Deploy it
-somewhere you would be comfortable giving a person root.
+**Agents have no host sudo.** An agent is the operator of its own machine and needs to install
+packages and edit system files to be useful, so it gets passwordless `sudo` — the sandbox's own
+(below): root over its own writable layer, not over the container. The old
+`/etc/sudoers.d/agents` (`%agents ALL=(ALL) NOPASSWD: ALL`) is gone. `install.sh` deletes the
+file rather than just no longer writing it, because a host provisioned before still has it.
+`smoke.sh` asserts that no host sudoers rule grants anything to `%agents`, and that `sudo -n true` as an agent
+user outside its sandbox is refused.
+
+### Per-agent sandbox
+
+**Status:** wired in. Every agent's desktop, Chromium, terminal, commands, MCP servers and task
+workers run inside its sandbox. The production script is `infra/desktop/sandbox.sh`. The owner
+decided two points on 2026-10-02:
+- **Root inside the sandbox:** the agent keeps its own uid and gets uid 0 through passwordless
+  `sudo`; it does not log in as uid 0.
+- **Compose:** the container gets `devices: [/dev/fuse, /dev/net/tun]` and a
+  `schermes-sandboxes` named volume.
+
+It was proven in the Docker harness: Docker Desktop, kernel 7.0.14-linuxkit, cgroup v2,
+`seccomp=unconfined`, not `--privileged`, on the default bridge and again on a user-defined
+network. `smoke.sh` and `check.sh` pass with it.
+
+**Decision:** an unprivileged user namespace with a subordinate-id map, with fuse-overlayfs
+over the container root, private mounts, pasta for networking, and `nsenter` for the daemon.
+
+The sandbox is built in this order:
+
+1. **Start as the agent.** `sandbox.sh start`, run as `agent-<name>`, runs `unshare --user
+   --mount --net --uts --ipc`. `newuidmap` writes the map:
+   - inner `0-999` → the agent's subuid block (sandbox root and system users);
+   - inner `<agent uid>` → itself;
+   - inner `60000-65534` → the rest of the block;
+   - gids the same way, plus the `agents` gid, which needs a one-id `/etc/subgid` entry.
+
+   The agent therefore keeps its own uid inside, and its home has the same owner on both
+   sides. Root is the agent's subuid, a uid that owns nothing outside.
+
+   The block is deterministic: `create-agent-user.sh` picks the lowest free one on first use,
+   records it in `<layer>/subid` on the sandboxes volume, and rewrites the agent's
+   `/etc/subuid` and `/etc/subgid` lines from that record every time. Recreating the container
+   resets `/etc/subuid`, and the upper layer is owned by ids from the block, so the record is
+   what keeps the layer readable. `useradd` is told not to assign subordinate ids of its own.
+
+   The agent's own uid is not deterministic: a recreated container hands uids out afresh, in
+   reconcile order. `create-agent-user.sh` therefore re-owns the layer's files from the old uid
+   and gid to the new ones. The old pair is read from `<layer>/lock`, which is always created as
+   the agent. The home gets the same `chown -R` when its user is recreated.
+2. **Root filesystem.** In mount namespace A, run `fuse-overlayfs -o
+   lowerdir=/,upperdir=<layer>/upper,squash_to_root,nosuid`. The upper layer lives on a new
+   named volume, `/var/lib/schermes-sandboxes/<name>`.
+3. **Private mounts.** On top of that root:
+   - binds: the agent's own home and `/srv/schermes/shared`;
+   - fresh `tmpfs` mounts over `/home`, `/srv`, `/tmp`, `/run`, `/var/lib/schermes`,
+     `/var/lib/schermes-sandboxes` and `/opt/schermes`;
+   - a read-only bind of `/opt/schermes/infra/desktop` back into that tmpfs, because tint2's
+     config and the dock's launchers live there. The scripts in it are public;
+   - `/tmp/.X11-unix`, mode 1777, because an unprivileged Xvnc cannot create it;
+   - a private `/dev/shm` and a `newinstance` devpts;
+   - `rbind` of `/proc`, `/sys` and `/dev`.
+4. **sudo.** A setuid copy of `sudo` on the sandbox's own `/run` tmpfs is bind-mounted over
+   `/usr/bin/sudo`. The sandbox gets its own `/etc/sudoers` (`%agents ALL=(ALL:ALL) NOPASSWD:
+   ALL`). The container's `sudoers.d` grants are never read inside.
+5. **Pivot.** A nested mount namespace B does `pivot_root` and detaches the old root, then
+   execs a holder process. Its pid goes in `<layer>/pid`.
+6. **Network.** One pasta per sandbox gives it a network: `--config-net --no-map-gw
+   --dns-forward 169.254.1.1 -t none -u none -T none -U none`.
+7. **Ports.** One more pasta per display, ports only: `--host-lo-to-ns-lo -I fwd<n> -t
+   127.0.0.1/5900+n -t 127.0.0.1/9222+n` (`sandbox.sh forward <n>`). A helper display on the
+   agent's user is just another forwarder in the same sandbox, so ports can be added and
+   removed while the sandbox runs. Each extra pasta leaves a `DOWN` tap device inside, which is
+   harmless.
+
+**Inside, the agent is not literally uid 0 at login (decided).** It is its own uid, and `sudo`
+makes it uid 0. Chromium refuses to run as root unless it gets `--no-sandbox`, and the `sudo`
+path is exactly what agents use today.
+
+#### Evidence
+
+Command output from the harness, captured in slice 1 with the prototype `sandbox-proto.sh`.
+`sandbox.sh` has since replaced it: `run <name>` is now `enter`, run as the agent.
+
+```
+$ sandbox-proto.sh run b sh -s < isolation.sh          # from inside agent b's sandbox
+uid inside: 1001   sudo -n id -u inside: 0
+ok (denied):    read master.key as agent
+ok (denied):    read master.key as sandbox root
+ok (denied):    list /var/lib/schermes (non-empty)
+ok (denied):    list other agent home
+ok (denied):    sudo: list other agent home
+ok (denied):    other sandbox layer
+ok (denied):    daemon fs via /proc/800/root
+ok (denied):    container fs via /proc/1/root
+ok (denied):    agent-a fs via /proc/194/root
+ok (denied):    signal agent-a chromium
+ok (denied):    signal stand-in daemon
+ok (denied):    agent-a VNC 127.0.0.1:5901
+ok (denied):    agent-a CDP 127.0.0.1:9223
+ok (denied):    agent-a VNC via 172.17.0.2:5901
+ok (denied):    agent-a CDP via 172.17.0.2:9223
+ok (denied):    agent-a VNC via gateway 172.17.0.1
+ok (denied):    /run/secrets visible
+ok (denied):    host sudoers.d grants visible
+own home rw:   yes
+shared rw:     yes
+egress https:  200
+
+$ sandbox-proto.sh run a sh -c 'sudo -n apt-get install -y cowsay'   # inside a
+Setting up cowsay (3.03+dfsg2-8) ...
+$ ls /usr/games/cowsay; dpkg -s cowsay                                 # container root
+ls: cannot access '/usr/games/cowsay': No such file or directory
+dpkg-query: package 'cowsay' is not installed and no information is available
+$ ls -ln /var/lib/schermes-sandboxes/a/upper/usr/games/
+-rwxr-xr-x 1 100000 100000 4664 May 11  2020 cowsay
+# after sandbox stop/start, after `docker restart`, and in a new container on the same
+# volumes on a user-defined network (resolver 127.0.0.11):
+< survived-container-restart >
+< recreated-container >
+Status: install ok installed
+
+$ ps -o user,cmd   # outside: the sandbox root is a bare subuid
+100000   sleep infinity
+100000   fuse-overlayfs -o lowerdir=/,upperdir=/var/lib/schermes-sandboxes/a/upper,...
+agent-a  pasta --config-net --no-map-gw --no-netns-quit --host-lo-to-ns-lo ...
+agent-a  Xvnc :1 -geometry 1920x1200 -depth 24 -SecurityTypes None -localhost -rfbport 5901 ...
+agent-a  /usr/lib/chromium/chromium --show-component-extension-options ...
+
+$ chromium (no --no-sandbox; 0 matches in its argv)
+browser pid 352 userns user:[4026532950]  netns net:[4026532966]
+renderer pid 469 userns user:[4026533238]  netns net:[4026533242]
+NoNewPrivs: 1   Seccomp: 2
+
+$ as schermes on the container loopback (daemon ports unchanged)
+   "Browser": "Chrome/152.0.7977.82",            # curl 127.0.0.1:9223/json/version
+RFB 003.008                                      # 127.0.0.1:5901
+
+$ SANDBOX_DISPLAY=1 sandbox-proto.sh run a sh -c 'xdotool ...; scrot ...'
+x:640 y:480 screen:0 window:2097525
+PNG image data, 1920 x 1200, 8-bit/color RGB, non-interlaced
+
+$ sandbox-proto.sh start a 1          # a second start, as after a daemon restart
+adopted sandbox a (pid 44)
+```
+
+#### Rejected and why
+
+| Mechanism | Blocker |
+|---|---|
+| Kernel overlayfs over `/` (plain `unshare`, or bwrap `--overlay`) | `overlayfs: failed to clone lowerpath` (EINVAL). `clone_private_mount` refuses a lower that is the parentless namespace root, or one with locked child mounts. Every mount inherited into an unprivileged userns is locked, and Docker bind-mounts `/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf` and the volumes under `/var`. A non-recursive bind of `/usr`, `/etc` or `/var` is refused as well. |
+| Kernel overlayfs over a bindfs view of `/` | It mounts, but overlayfs opens lower files with `O_NOATIME`, and bindfs passes that to `open()` on host-root files, which fails with EPERM. With a non-owner mounter, exec through the suid overlay fails with EINVAL (see below). |
+| bubblewrap alone | It runs (`--ro-bind / /` works), but it has no persistent writable root apart from the kernel overlay above. It also maps only a single uid, so dpkg cannot chown to system users. `--proc` fails (see "No PID namespace"). |
+| systemd-nspawn | As container root it fails at its first mount, `Failed to mount tmpfs ... /run/systemd/nspawn/unix-export: Operation not permitted`, because there is no `CAP_SYS_ADMIN`. As the agent it gives `Invoking container from plain directory tree is currently not supported if called without privileges`. |
+| slirp4netns | Works like pasta (it also needs `/dev/net/tun`), but it has no host-loopback→ns-loopback port forwarding. VNC and CDP would then need socat or socket plumbing. |
+
+Kernel findings that shaped the design:
+
+- **newuidmap.** Setuid-root `newuidmap` fails with `write to uid_map failed: Operation not
+  permitted`. Opening `uid_map` as euid 0 requires `CAP_SYS_ADMIN` over the target namespace,
+  and Docker drops it. Switching `newuidmap`/`newgidmap` to file capabilities
+  (`chmod u-s; setcap cap_setuid+ep` / `cap_setgid+ep`) keeps euid at the namespace owner.
+- **FUSE exec.** On kernel 7.0.14, `execve` of any file on a FUSE mount made inside a userns
+  fails with EINVAL unless the mount is `nosuid`. The same fs with `-o suid` fails, and
+  without it exec works. Reads and `mmap(PROT_EXEC)` are fine. It is likely recent FUSE/suid
+  hardening, but I'm not sure. The root is therefore `nosuid`, and `sudo` is the one setuid
+  binary, served from tmpfs.
+- **Pivot in a nested namespace.** `pivot_root` in the same mount namespace as the
+  fuse-overlayfs daemon moves the daemon's root onto its own mount. It deadlocks in D state.
+  That is why the pivot happens in nested namespace B.
+- **`chroot` doesn't work.** The kernel refuses `CLONE_NEWUSER` inside a chroot, and Chromium
+  needs that. The sandbox uses `pivot_root`.
+- **Unreadable lower files.** fuse-overlayfs reads the lower layer as the sandbox root's
+  outside uid. Root-only files are therefore unreadable through it: shadow, gshadow, sudoers,
+  the apt and dpkg locks, and `partial/`. Setup copies these into the upper layer with mapped
+  owners (`sandbox.sh setup`).
+
+#### VNC and CDP access path
+
+The per-display pasta (`-t 127.0.0.1/<port> --host-lo-to-ns-lo`) listens on the container's
+loopback and splices each connection into the sandbox's own loopback. The daemon keeps
+connecting to `127.0.0.1:5900+n` and `9222+n` as before, so `vnc.ts` and `browser.ts` did not
+change. `stopDisplay` kills that display's forwarder and waits for it to exit. Display numbers
+are recycled, and a leftover listener would keep the next agent's forwarder from binding.
+
+The same private loopback means nothing on the container's loopback is reachable from inside:
+not the daemon, and not a test server. `check.sh` therefore serves its test page inside each
+sandbox.
+
+Isolation comes from the network namespaces:
+
+- A sandbox's `127.0.0.1` is its own.
+- `--no-map-gw` stops the gateway from aliasing the container's loopback.
+- pasta gives the sandbox the container's own IP, so `172.17.0.2:<port>` from inside hits the
+  sandbox itself.
+
+Unix sockets were the alternative. Xvnc has `-rfbunixpath`, but CDP has no unix-socket mode
+and would need a socat relay, so unix sockets were not chosen. Note that without
+`--host-lo-to-ns-lo`, pasta splices to the namespace's eth0 address, which `-localhost` Xvnc
+and Chromium don't listen on.
+
+#### Daemon, workers, restart
+
+- **Commands.** `asAgent()` in `agents.ts` builds `sudo -n -u agent-<name>
+  /opt/schermes/infra/desktop/sandbox.sh enter env --chdir=… HOME=… DISPLAY=… <cmd>`. Every
+  `exec('sudo', asAgent(…))` call site therefore runs inside the sandbox without changing. This
+  covers the terminal, computer use, the browser, home, search, snapshots, recording,
+  triggers, idle, MCP and uploads.
+  - `enter`, running as the agent, reads its own `<layer>/pid` and validates the holder. It
+    then execs `nsenter -t <pid> --user --mount --net --uts --ipc setpriv --reuid <uid> --regid
+    <gid> --init-groups --inh-caps=-all`.
+  - `--root/--wd` are not used, because the FUSE root admits only callers already inside the
+    namespace, and `setns` into the mount namespace sets the root anyway.
+  - If the sandbox isn't running, `enter` starts it first. It never falls back to running
+    outside: a sandbox that will not start fails the command.
+- **Workers.** A worker's target is its parent's user, so its commands enter the parent's
+  sandbox, starting in the worker's own directory. A goal's screen helper gets a display and a
+  forwarder in that same sandbox.
+- **Locking.** `start`, `forward`, `stop` and `setup` hold `flock` on `<layer>/lock`, so a boot
+  reconcile and an API call cannot start two fuse-overlayfs daemons on one upper layer, which
+  corrupts it. Every process the sandbox starts gets the lock fd closed. An inherited one would
+  hold the lock for the sandbox's lifetime.
+- **Stop.** `DesktopOps.stop` runs `sandbox.sh stop`, which kills everything the agent runs
+  (as the old `pkill -u` did) plus every process in its id block. It waits until the
+  fuse-overlayfs daemon has exited. "Restart desktop" uses it as it is.
+- **Retire: stopping for good.** `enter` starts a stopped sandbox on demand, and the daemon
+  keeps calling it (search, idle, triggers). An `enter` landing between a plain `stop` and the
+  end of a rename or delete would bring the holder, fuse-overlayfs and pasta straight back.
+  `sandbox.sh retire <name>`, run as root, closes that window:
+  1. Under the layer lock, it writes a root-owned `<layer>/disabled`, which every start
+     refuses. Holding the lock means no start is half-way through.
+  2. It releases the lock and runs `stop` as the agent.
+  3. It kills whatever agent-uid or id-block process is left, until none is.
+
+  `create-agent-user.sh` removes the marker, because an agent it runs for is wanted.
+- **Rename.** `rename-agent-user.sh` retires the sandbox, then moves the user, the home and
+  `<layer>`, and clears the marker under the new name. A move that fails clears it under the
+  old name, and the daemon brings the desktop back.
+- **Delete.** `DesktopOps.remove` runs `delete-agent-user.sh` as root. It retires the
+  sandbox, then removes:
+  - the user (`userdel --force`, because a racing `enter` is briefly an agent-uid process);
+  - its group and `/home/agent-<name>`;
+  - `<layer>`, `<layer>/subid` included, under the subid lock;
+  - its `/etc/subuid` and `/etc/subgid` lines.
+
+  Every step tolerates having been done, so a failed `DELETE /api/agents/:name` answers 500,
+  keeps the row and is finished by deleting again. A goal's temporary helper goes the same way.
+  An agent recreated under the name starts with an empty home and a fresh layer.
+- **Daemon restart.** `start-desktop.sh` runs `sandbox.sh start`, which adopts a running sandbox
+  from `<layer>/pid` after checking two things:
+  - the process belongs to the agent's subuid;
+  - it is in a different userns.
+
+  Then `start-desktop.sh` probes the display inside it, as before. A pasta whose pid file names
+  something that is not pasta (pids recycle) is restarted.
+- **Container restart.** A container restart loses the processes but keeps the upper layer.
+  Boot starts every sandbox again. A fresh start first kills anything the agent still runs in
+  another mount namespace and everything in its id block, and waits until it is gone.
+- **Inspecting from outside.** Container root has no `CAP_SYS_PTRACE`, so `readlink
+  /proc/<pid>/ns/user` on a sandboxed process works only as the agent (`sudo -u agent-<name>`),
+  which owns the namespace.
+
+#### What the container and image need
+
+Compose:
+
+- `devices: [/dev/fuse, /dev/net/tun]` (decided). `mknod` of `/dev/net/tun` works under Docker's
+  default device rules; `/dev/fuse` gives `Operation not permitted`.
+- A new named volume for `/var/lib/schermes-sandboxes`.
+- `seccomp=unconfined` stays. No added capabilities, no `--privileged`.
+
+`install.sh`:
+
+- packages: `uidmap`, `fuse-overlayfs`, `fuse3`, `passt` and `libcap2-bin`;
+- `setcap` on `newuidmap`/`newgidmap` in place of the setuid bit;
+- no host sudo for `%agents`: `/etc/sudoers.d/agents` is deleted. Agents get root only inside
+  their sandbox;
+- the daemon's `schermes` rule narrowed to the sandbox script and `pkill` as an agent. See
+  [privilege model](#privilege-model).
+
+#### Unraid (to verify, user-gated)
+
+- **User namespaces.** `kernel.unprivileged_userns_clone=1` (Debian-style kernels) or
+  `user.max_user_namespaces > 0`. Whether Unraid's stock kernel allows this is unverified.
+- **AppArmor/SELinux.** No AppArmor or SELinux profile may deny `mount` or userns. Unraid ships
+  none by default (to confirm), and Docker Desktop has none (`docker info` lists only seccomp
+  and cgroupns). Under AppArmor's `docker-default`, mounts are
+  denied, and the container would need `apparmor=unconfined`.
+- **User xattrs.** The `/var/lib/schermes-sandboxes` volume must sit on a filesystem with user
+  xattrs (fuse-overlayfs stores whiteouts and ownership there). A `docker.img` on btrfs or xfs
+  is fine. A bind mount onto `/mnt/user` (shfs, FUSE) is unverified and should be avoided.
+- **The FUSE exec rule.** The EINVAL rule above is kernel-specific. `nosuid` works either way.
+
+#### Migration of existing agents
+
+1. **Prepare.** Boot reconciles every agent through `create-agent-user.sh`, which now does
+   three more things for each one:
+   - assign the deterministic subuid/subgid block;
+   - add the `agents` subgid;
+   - run `sandbox.sh setup`.
+
+   An agent created before the sandbox build has `useradd`'s automatic block in
+   `/etc/subuid`. That line is replaced by the recorded one.
+2. **Start.** The desktop starts inside the sandbox. Home, `.chromium-profile`, `memory` and
+   `skills` are the same bind-mounted directory, with the same owner on both sides, so they
+   carry over intact. The hostname stays `schermes`, so Chromium's profile lock still matches.
+3. **Packages.** Packages an agent installed on the host root before this change live in the
+   image layer, and a rebuild already loses them today. Nothing extra needs migrating.
+
+`smoke.sh` proves it on every run, under "an agent made before the sandbox":
+- **Setup.** It creates a plain `useradd` user with `useradd`'s automatic subuid line, which
+  overlaps a sandboxed agent's block. It seeds a memory note and a Chromium profile, the profile
+  written by a real headless Chromium run as that user outside any sandbox.
+- **Migration.** It then creates the agent through the API, which runs the same
+  `create-agent-user.sh` pass boot does.
+- **Assertions.**
+  - the automatic subuid line is replaced by the recorded block;
+  - commands run inside a new userns as the same uid;
+  - the profile's file hashes are unchanged;
+  - the memory reads back through the API;
+  - a headless Chromium inside the sandbox opens the profile.
+
+#### Residual risks and open points
+
+- **No PID namespace.** A fresh `/proc` cannot be mounted: `mount_too_revealing` fires
+  because Docker masks `/proc/kcore` and other paths. So `ps` inside shows every process and
+  cmdline in the container, including other agents' and the daemon's argv.
+  - ptrace, `/proc/<pid>/root` and signals across sandboxes and to the daemon are denied (see
+    the evidence above).
+  - `systempaths=unconfined` would allow a PID namespace, but it unmasks `/proc/sys` for
+    container root. Not recommended.
+- **Agent-uid helpers.** The identity-mapped agent uid can signal pasta and the `nsenter`
+  helpers that run outside as that uid. The only harm is to the agent's own network.
+- **Setuid binaries.** Every setuid binary except `sudo`, and every file capability (`ping`),
+  is inert in the sandbox because the root is `nosuid`.
+- **Ownership display.** `squash_to_root` shows every non-home file as owned by root, so
+  `chown` to service users inside does not stick. apt's `_apt` download sandbox falls back to
+  root (a warning only).
+- **Stale upper copies (decided).** Copies in the upper layer shadow later image changes to the
+  same paths. `sandbox.sh setup` runs on every boot reconcile, and only while the sandbox is
+  down, because writing into a live upper layer is undefined. It then handles three cases:
+  - **Root-only files.** Each one setup copied is recorded with its sha256 in
+    `<layer>/setup.sums`. A copy the agent has not changed is refreshed from the image. One it
+    changed is left as its own.
+  - **Account files.** `passwd`, `group`, `shadow` and `gshadow` are merged whenever the upper
+    layer has a copy. The container's entries win for every name it has, so renames and uid
+    changes after a recreate reach the sandbox. Entries only the sandbox has (system users a
+    package added) are kept, and stale `agent-*` entries are dropped. An agent's own edits to
+    the container's entries, such as root's shell inside, are reverted at the next cold start.
+  - **`/var/lib/dpkg/status`.** Not merged (open). Once an agent installs anything, its copy
+    shadows the image's, so packages a later image adds look not-installed to dpkg inside that
+    sandbox, although their files are there. The planned fix is a version-aware merge at
+    setup: per package, the higher version wins, and the sandbox's stanza wins on a tie.
+- **The lower layer crosses every container mount.** Any new volume or bind must be added to
+  the hidden list. A deny-by-default layout (bind only known system dirs) would be safer for
+  the production version.
+- **Local build context (fixed).** `.dockerignore` now excludes `data/` and `state/`. Before,
+  a local `docker compose up --build` copied `data/AuthKey_*.p8` into `/opt/schermes/data`.
+- **Setup never copies `/run`.** The APNs key is a file bind mount under `/run/secrets`, and
+  `find -xdev` still reports a file mount point, so setup prunes `/run` explicitly.
+- **pasta from inside.** pasta runs outside as the agent's uid, but it is non-dumpable and
+  under seccomp. From inside, `ptrace` attach gives EPERM, and `/proc/<pasta>/environ` and
+  `mem` are denied. Signals reach it, which only takes down the agent's own network.
+- **The daemon over the network.** The daemon's port is unreachable from inside on
+  `127.0.0.1` and on the container's IP, both of which are the sandbox's own. The egress path
+  through the gateway reaches whatever the host publishes. On a server with `SCHERMES_BIND=0.0.0.0`
+  that includes the web port, so an agent reaches the API the way any machine on the network
+  does, without a session. smoke accepts no answer or a 401 there.
+- **A concurrent ensure re-enables a retiring sandbox.** `create-agent-user.sh` clears
+  `<layer>/disabled`, so an `ensure` for the same agent running during its delete could start
+  the sandbox again. The realistic case is a delete in the first seconds after boot, while
+  reconcile, which runs alongside the API, reaches that agent. The delete could then leave
+  orphaned sandbox processes behind until the next container restart.
 
 ## File model
 
@@ -153,16 +529,108 @@ setup and login needs a session.
   daemon. It claims the owner row with a conditional insert rather than a read-then-write, so
   it cannot be raced, and it fails with 409 once an owner exists. Otherwise it would be an
   unauthenticated password reset.
+- **Requirement** — setup also needs the **first-run setup token**. A daemon that boots with no
+  owner makes up a random one, keeps it in memory, and logs it once as
+  `{"msg":"first-run setup token","code":"…"}`. The field is `code` because the log redacts any
+  field whose name says token. `POST /api/auth/setup` takes it as `setupToken` beside the
+  password, and refuses a missing or wrong one with a 403 that says to look in the daemon log.
+  The 409 for an existing owner comes first. Every boot without an owner prints a fresh one, and
+  a successful setup forgets it. Without the token, whoever reached the port first would become
+  the owner.
 - The guard is registered before any route and denies by default. A path that is not on the
   short public allowlist needs a session, including paths that do not exist.
 - Passwords are scrypt from `node:crypto`. `N=16384` is chosen to stay inside Node's default
   32 MiB `maxmem`; a larger cost parameter throws instead of hashing. Comparison is
   `timingSafeEqual` after a length check, which that function requires.
-- **Requirement** — the session cookie is `HttpOnly` and `SameSite=Lax` but deliberately not
-  `Secure`. schermes speaks plain HTTP by design and TLS terminates in a proxy in front of it.
-  A `Secure` cookie would be dropped over plain HTTP and login would fail with no visible error.
+- **Requirement** — scrypt runs **asynchronously**, on libuv's thread pool. Each hash takes tens
+  of milliseconds of CPU, and the synchronous call held the event loop for all of it, so a burst
+  of wrong passwords stalled every other route. The stored format is unchanged
+  (`scrypt$N$r$p$salt$hash`), so existing hashes verify.
+- **Requirement** — failed logins and failed setup-token guesses **back off per address**.
+  - The first five failures are free. Each one after that locks the address out for 1 s,
+    doubling, capped at 5 minutes. A locked-out attempt gets a 429 with `Retry-After` in whole
+    seconds, even with the right password. A success clears the address.
+  - The table lives in memory: a restart forgets it. It is bounded at 10,000 addresses, and the
+    one that failed longest ago is dropped first.
+  - The address is the TCP peer. `X-Forwarded-For` is trusted **only from a loopback peer**,
+    where its rightmost entry is the one that proxy appended. From anywhere else the header is
+    ignored, because a remote caller could name a fresh address per attempt and never back off.
+  - Known limit: the compose `domain` profile's Caddy reaches the daemon over the compose
+    network, not loopback, so every client behind it shares one count. Another client's
+    failures can then delay the owner's next login, by 5 minutes at most. Existing sessions are
+    unaffected. A trusted-proxy setting is the upgrade path if that ever bites. The same is true
+    of Docker Desktop's port forwarding, which shows every client as the VM's gateway.
+- **Requirement** — every login, and setup, writes **its own session row**. Logging in sweeps
+  expired rows first. A row records `created_at`, `last_seen_at` (refreshed at most once a
+  minute by the guard) and the `User-Agent`, so the sessions can be listed. Logout deletes the
+  row and clears the cookie with `Max-Age=0`.
+- **Requirement** — the session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` **only
+  when the request came over TLS**. That means a TLS socket, or `X-Forwarded-Proto: https`
+  from the proxy that terminated it; Caddy sends that header by default. That header is trusted
+  from anyone: a forged `https` only makes the forger's own cookie Secure, and their
+  plain-HTTP client then drops it. A cookie that was always Secure would be dropped over the
+  plain HTTP the daemon speaks, and login would fail with no visible error.
+- **Requirement** — one `bodyLimit` covers all of `/api/*`, before the session guard, and
+  answers **413** above **40 MB**. The largest legitimate body is a share-extension upload at
+  `MAX_FILE_BYTES` (25 MB). That is 33.3 MB of base64, about 33.9 MB on the wire, because the
+  app's `JSONEncoder` escapes every `/` as `\/`. A message image is 5 MB, so 6.7 MB of base64.
+  `/hooks/:token` keeps its own 64 KiB limit.
 - Sessions live in SQLite rather than daemon memory, so restarting the daemon does not log the
   owner out, and later slices get session rows they can reason about.
+
+#### Account security
+
+- **Requirement** — **password change** is `POST /api/auth/password {current, next}`. It checks
+  `current` through the same per-address backoff as login, so a stolen cookie cannot use it to
+  guess the password; a wrong one is a 403 (not a 401, which a client takes as "signed out").
+  `next` must meet `MIN_PASSWORD_LENGTH`. On success every other session row is deleted and the
+  caller's is kept, and the answer says how many were signed out.
+- **Requirement** — `GET /api/auth/sessions` lists the live sessions newest-seen first:
+  `handle`, `createdAt`, `lastSeenAt`, `userAgent`, and `current` for the caller's own. The
+  **handle is the first 16 characters of the base64url SHA-256 of the id**. The raw id is the
+  cookie, so it is never returned. `DELETE /api/auth/sessions/:handle` revokes one; revoking
+  your own clears the cookie the way logout does.
+- **Requirement** — **TOTP** is RFC 6238 with HMAC-SHA-1, 30 s steps, 6 digits, accepted one
+  step either side of now. It is `node:crypto` only (`daemon/src/account.ts`), checked against
+  the RFC's own vectors.
+  - Enrolment: `POST /api/auth/totp/setup {password}` returns a base32 `secret` and an
+    `otpauth://` `uri`, and stores the secret in `owner.totp_pending`, encrypted with the master
+    key. `POST /api/auth/totp/confirm {code}` moves it to `owner.totp_secret` and returns ten
+    recovery codes (`xxxx-xxxx-xxxx-xxxx`, 80 random bits each). They are shown once; only their
+    SHA-256 is kept, in `recovery_codes`. `GET /api/auth/totp` says `enabled`, `pending` and
+    `recoveryCodesLeft`.
+  - **Setup needs the password**, unlike the brief's first sketch. Otherwise a stolen cookie
+    could turn TOTP on with the thief's phone, and every new login, and turning it off, would
+    then need the thief's codes.
+  - `DELETE /api/auth/totp {password, code | recoveryCode}` turns it off and deletes the
+    recovery codes. Both checks share the login backoff.
+  - **Login with TOTP on**: the right password alone answers `401 {error, totpRequired: true}`
+    and issues no session. That half is not counted as a failure, since it is the first step of
+    every normal login. The same request plus `totp` or `recoveryCode` signs in. A wrong code
+    or a wrong recovery code counts in the backoff. A wrong password says nothing about TOTP.
+  - **No step is accepted twice.** `owner.totp_last_step` is advanced with a conditional
+    update (`… WHERE totp_last_step IS NULL OR totp_last_step < step`), so the confirm code
+    cannot be replayed into a login and two requests with one code cannot both get in. A
+    recovery code is spent by a `DELETE … WHERE hash = ?` that must change a row. Input is
+    case-, dash- and space-insensitive.
+  - Lost the phone and every recovery code: there is no reset route, by design. Clear
+    `owner.totp_secret` in the database (see troubleshooting).
+- **Requirement** — the **audit log** is `audit_events`: `at`, `action`, `ip` (the same
+  `clientIp` as the backoff), `user_agent` and a small `detail` JSON of names and handles,
+  never a value the owner typed. `GET /api/audit?before=<id>&limit=<1-200>` pages it newest
+  first (default 50).
+  - Recorded, and nothing else: `setup`, `login` (`detail.method`: password, totp or recovery),
+    `login_failed` (`detail.reason`), `logout`, `password_changed`, `password_change_failed`,
+    `session_revoked` (handle and whether it was the caller's own), `totp_enabled`,
+    `totp_disabled`, `recovery_code_used` (codes left), and these owner writes when they
+    succeed: `settings_changed` (`PUT /api/settings`, with the **field names** only, because the
+    values include keys), `provider_changed`, `model_changed` (the registry, default, backup and
+    an agent's model), `mcp_changed`, `rules_changed`. The writes go through one table,
+    `AUDITED_WRITES` in `app.ts`. Reads are never recorded.
+  - A login failure is recorded only after the backoff check, so a flood is answered 429 and
+    adds rows at the backoff's pace, not the attacker's.
+  - **Bounded on every write**: rows past the newest 10,000, or older than 90 days, are
+    deleted. A quiet install keeps its last entries until the next write.
 
 ### Agents and their desktops
 
@@ -191,6 +659,10 @@ with a `description` the desktop follows in the background (see
   and a Mac draw the same agent: a look kept in one device's defaults was a different agent on
   the other. The client owns the format (`shape:colour` today) and ignores a token it cannot read
   rather than overwriting it.
+- **Requirement** — the desktop runs inside the agent's sandbox. `start-desktop.sh` starts or
+  adopts the sandbox and the display's port forwarder, then probes and starts Xvnc, openbox,
+  the wallpaper and tint2 through `sandbox.sh enter`. See
+  [Per-agent sandbox](#per-agent-sandbox).
 - **Requirement** — the daemon shells out to `create-agent-user.sh` and `start-desktop.sh`
   rather than reimplementing them. `start-desktop.sh` probes the display with `xdpyinfo` and
   prints `adopted` or `started`; the daemon reads that word and does not run a probe of its own.
@@ -199,6 +671,10 @@ with a `description` the desktop follows in the background (see
   when creating one. Desktops outlive the daemon, so a restart adopts the ones still answering
   and respawns the rest. A desktop that will not come up is logged and skipped; it does not stop
   the daemon or the other agents.
+- **Requirement** — deleting an agent removes its Linux user, its home and its sandbox layer
+  before the row, so a new agent with the same name starts empty. One that would not go
+  answers 500 and keeps its row; deleting it again finishes the job. See
+  [Per-agent sandbox](#per-agent-sandbox), "Delete".
 - Creating an agent without a description whose desktop fails to start drops the row again
   (one created from a description is kept, and its desktop comes up later). The Linux user and its
   home survive, so a retry reuses them, and the display goes back in the pool rather than being
@@ -271,6 +747,15 @@ all end up here rather than shelling out for themselves.
 - `start-desktop.sh` adopts a running desktop only at the configured geometry and restarts one at
   any other size, because the mapping assumes it. xdotool clamps, so a coordinate that rounds
   past the edge lands on it.
+- **Decision (hardening pass, slice 12)** — `POST /api/agents/:name/computer` stays. It is the
+  owner's direct handle on the same tool layer the model uses, and `infra/smoke.sh` drives
+  screenshots, clicks, drags, keys, scrolling and the clipboard read through it, as the API
+  tests do; removing it would leave the computer-use path with no end-to-end check that skips a
+  model. The app does not call it: the owner acts on a desktop through VNC takeover. It is
+  owner-authenticated, validated like a tool call, and refused with a 409 while a human holds
+  the desktop, so it adds no reach the owner's VNC session lacks. Its body is a `computer` tool
+  action (`{"action":"screenshot"}`, `{"action":"click","x":…,"y":…}`, …) and the answer is the
+  action result, screenshots as base64 PNG.
 - **Deferred** — persistent terminals. One command at a time is the contract; a tmux-backed
   session is a later slice if it is ever needed.
 
@@ -341,6 +826,70 @@ The `browser` tool fills it through the DevTools Protocol of the Chromium alread
   immediately by one tool message per call id and nothing else, so with two tool calls in a
   turn an image placed inline would split the pair and a strict endpoint would reject the whole
   transcript. Every tool result for a turn is emitted first, then the images.
+- **Requirement** — **a model without vision never receives an image.** `ProviderConfig.vision`
+  comes from the model's row (absent means it can see), and the request builder in
+  `openAiProvider` turns every message carrying an image into its text plus `NO_VISION`. That
+  line says a picture is left out and points at the text routes (the browser tool's page text,
+  `run_command`). The transcript is not touched, so an agent switched onto such a model keeps
+  its history, and the backup, which has its own config, is covered mid-turn too. The computer
+  tool's result already said "Screenshot taken; it is in the next message", and that next
+  message is now the placeholder, so the model still learns what happened.
+- **Requirement** — **a context overflow is classified where the whole body is in hand.** A 400
+  or 413, or an in-stream error with code 400, whose body matches a known overflow wording sets
+  `ProviderError.overflow`, before the message is clipped to 500 characters. It is not
+  retryable, so `withRetries` passes it on as it came, and the loop decides what to do with it
+  (see [Context compaction](#context-compaction)).
+- **Requirement** — **`finish_reason` is read and `length` is honoured.** Both the streamed path
+  (the last non-null `finish_reason` of any chunk, including one with no `delta`, which the final
+  `choices: []` usage chunk does not reset) and the plain path set `ChatReply.finish`. A reply
+  that stopped at the output token limit (`length`) is handled in the loop:
+  - **Text only:** the reply is stored, delivered and reported with `CUT_OFF` appended
+    ("[cut off: this reply reached the model's output token limit]"), even when the text is
+    empty, which is how a reasoning model that spent the whole budget thinking arrives. It is not
+    continued automatically. The owner sees the marker and can say "go on", and nothing loops.
+  - **With tool calls:** none of them runs, because their arguments are whatever the model got
+    out before the cut. The assistant row is stored with each call's arguments replaced by `{}`,
+    so no partial JSON is replayed to an endpoint that parses it, and each call is answered with
+    `CALL_CUT_OFF`, a tool result telling the model the call was not run and to ask again with
+    shorter arguments or smaller steps. Every call still has its answer. The loop then asks
+    again. A second cut-off tool call in the same turn answers its calls the same way and then
+    fails the turn (`CUT_OFF_AGAIN`), so a model capped too low by `extraBody` cannot spin.
+  - `infra/provider-stub.py` has a `STUB_FINISH=length` mode for this, and
+    `provider-stub.test.ts` runs it.
+- **Requirement** — **real endpoints' wire quirks are handled in `provider.ts`**, each with a
+  mode in `infra/provider-stub.py` that refuses or streams the way that endpoint does, and a
+  test in `provider-stub.test.ts`:
+  - **Empty `data:` lines** (`STUB_BARE_DATA`): skipped like comment lines, never parsed.
+  - **Streamed tool calls without `index`** (`STUB_NO_INDEX`): an id that differs from the open
+    call's starts a new call; a chunk with no id, or the same id, continues the open one. The
+    array position is never used, since it is 0 in every chunk.
+  - **What an endpoint wants back.** `ChatReply.echo` collects it, the loop stores it in the
+    row's `echo` column (migration 0034, JSON), and `transcript` puts it back on the replayed
+    assistant message. Clients never see it: only `listMessages`, the loop's reader, maps the
+    column. `projectedChars` counts it. The echo is tagged with the base URL and model that
+    produced it and is sent to that pair only, so a backup or a newly chosen model never gets
+    fields it may refuse or signatures it did not make.
+    - **DeepSeek `reasoning_content`** (`STUB_DEEPSEEK`). DeepSeek's thinking-mode docs require
+      it back on **every earlier assistant message**, not only the current turn's, whenever the
+      request carries `tools` (which an agent's always does), and answer 400 otherwise. So it is
+      sent on every replayed reply that has it. Rows without it (older rows, `STOPPED`, other
+      models' replies) go out without it; whether DeepSeek accepts that is unverified.
+    - **Gemini thought signatures** (`STUB_SIGNATURES=gemini`): `tool_calls[].extra_content`,
+      stored by call id and sent back on the same call. On a Google host (not a proxy matched by
+      model name) a replayed step with no signature (made by another model) gets
+      `UNSIGNED_CALL`, Gemini's documented stand-in, on its first call.
+    - **OpenRouter `reasoning_details`** (`STUB_SIGNATURES=openrouter`): streamed pieces with
+      the same `index` are joined into one detail, and the array goes back unchanged.
+  - **Strict alternating roles** (`STUB_ALTERNATE`): `alternate` merges consecutive `user` or
+    `system` messages after `wire`, joining text with a blank line and switching to content
+    parts only when an image is involved. `tool` messages are never merged or moved.
+  - **Gemini's schema subset** (`STUB_STRICT_SCHEMA`): `geminiSchema` copies each tool's
+    parameters down to Gemini's OpenAPI keywords. It inlines local `$ref`s up to 8 deep, turns
+    `oneOf` into `anyOf`, a `null` in a type list into `nullable`, and `const` into `enum`,
+    and drops non-string enums and formats Gemini lacks. It applies when the base URL's host is
+    `generativelanguage.googleapis.com` or `*aiplatform.googleapis.com`, or the model id
+    contains `gemini`. Keying on the model name catches proxies such as OpenRouter or LiteLLM;
+    there is no per-model flag. The validators still check input against the full schema.
 
 ### Model registry and recovery
 
@@ -348,6 +897,10 @@ The `browser` tool fills it through the DevTools Protocol of the Chromium alread
 `provider.*` setting became a `models` table: a name, a base URL, a model id, an extra request
 body, and a key encrypted with the master key. The default and an optional backup are two
 settings rows holding a model id; `agents.model_id` is the agent's own, null meaning the default.
+Each model also has a `contextWindow` in tokens (null is unknown) and a `vision` flag (default
+true), added by migration 0032. Both are optional on the routes: a body that leaves them out keeps
+what is stored, so an older app neither breaks nor resets them, and `contextWindow: null` clears
+the window. The app has no controls for them yet.
 
 - **Requirement** — `providerConfig` in `models.ts` is **the one resolver**: the agent's model,
   else the default, and a worker runs on its parent's. Every model call — a turn, the interview
@@ -375,6 +928,23 @@ settings rows holding a model id; `agents.model_id` is the agent's own, null mea
   go differently. It is recorded as one settings row per model, first refusal kept, and shown as
   one `provider-auth` item under [Needs you](#needs-you) that hides the per-agent failures behind
   it. A changed key, a delete, a passing test or any call that answers clears it.
+- **Requirement** — **the backup rules** (`withRetries`, `backupConfig`):
+  - **The backup gets its own count.** After "Use backup model" the attempt counter, and so the
+    backoff, restarts. Without the restart, a switch at the primary's fourth wait left the
+    backup a single attempt.
+  - **A backup's refused key fails the turn**, like any 401/403: it is not retried, it is not
+    handed back to the primary, and it is recorded against the *backup's* model. That model is
+    then **not offered** as a backup (`backupConfig` skips a model with a recorded refusal) until
+    the refusal clears, so the owner is not handed a lever that can only fail.
+  - **The budget follows the model that answers.** Every reply and every `ProviderError` from
+    `withRetries` carries the `modelId` it came from. When a reply comes from a model other than
+    the one the turn's compaction budget was sized for, the loop resizes the budget to that
+    model's window and, if the replay is now over it, compacts once more before the next step,
+    with the forced cut's rules. An overflow error resizes the budget the same way before
+    `overflowBudget` is taken, so a big primary's quarter-budget is never what a small backup is
+    retried with.
+  - What stays as it was: the switch is only ever the owner's, it moves the rest of the turn,
+    and the next turn starts on the agent's own model again.
 
 ### The agent loop
 
@@ -401,6 +971,49 @@ settings rows holding a model id; `agents.model_id` is the agent's own, null mea
   the model, and not an event.
 - One turn per agent at a time, owned by a runner rather than a route closure: both the HTTP
   routes and `send_message` inside a turn start turns through it.
+- **Requirement** — **a rename mid-turn is safe.** The runner's `busy` set, its `stops` map and
+  the live-reply map are keyed by agent **id**, not name. `set_name` renames at the end of a
+  turn, while that turn's drain still holds the loop, so a start under the new name finds the
+  agent busy rather than starting a second concurrent turn. The drain re-reads the agent row by
+  id before every round and again before it looks for unread input, so the next round runs
+  under the new name and Linux user. `runner.running(name)` and `runner.stop(name)` still take a
+  name and resolve it to an id, and `liveReply` takes the id; no route changed shape.
+- **Requirement** — **no turn is dropped at the loop cap.** `runner.start` launches at once when
+  a loop is free and nothing is waiting. Otherwise it writes a `turn_queue` row (agent id,
+  thread, kind: `message`, `request`, `reply`, `report`, `schedule`, `trigger`, `approval`,
+  `answer`, `kickoff`, `requeue`) and returns. Every release starts the oldest waiting entry
+  whose agent is not running, so a chatty agent cannot starve the rest, and an agent that used
+  up its `MAX_ROUNDS` goes to the back of the line rather than being let go with input unread.
+  The queue is keyed by agent id, so a rename cannot strand an entry, and it is one row per agent
+  and thread, since a second arrival is read by the same turn as the first.
+  - Owner messages, forwards, retries, the interview kickoff, worker reports, replies and requests
+    between agents, schedules, triggers, approval outcomes and the owner's answers all queue. None
+    of them is refused at the cap any more; the routes that answered 429 now answer 202.
+  - A worker or helper **spawn** is still refused at the cap, as an observation, before the worker
+    exists: the agent is told and can retry. What it starts once it exists, and its report, queue.
+    At `SCHERMES_MAX_LOOPS=1` a spawning agent therefore cannot spawn, because its own turn fills
+    the cap.
+  - An **idle pass** never queues: its end callback cannot live in a row. The idle tick checks for
+    room first and keeps the pass `due`; a pass that loses the race is ended unrun.
+  - A popped entry whose thread has nothing unread (rewound or cleared while it waited) is
+    dropped rather than run, so an old message is never answered twice.
+- **Requirement** — **a read mark.** Each round of a turn writes `agents.read_through`, the newest
+  message id, as it starts and before the model is called. Unread input is a `user` row not
+  written by the agent and past both that mark and the agent's own last message. Migration 0031
+  set every existing agent's mark to the newest message at upgrade time. A message dropped at
+  the cap before the upgrade therefore stays unanswered: that is the trade for never re-running a
+  prompt the owner rewound without retrying.
+- **Requirement** — **the sweep** (`runner.sweep`, at boot and every `SWEEP_MS`, one minute) is
+  the backstop for anything a path above still misses:
+  - Agents in `waiting_for_agent` or `waiting_for_task_worker` that wait on nobody move to
+    `waiting_for_user`. Waiting on workers counts while one is live. Waiting on an agent counts
+    while one it asked has not answered (past its `answered_through`) and is still on it:
+    running, queued, waiting itself, holding unread input, or waiting on the owner for a
+    question, form, hand-over or approval. A stopped turn never answers, which is the usual way
+    an asker strands. The reply or report still wakes the agent whatever its state.
+  - Each agent that is not running or queued, has a model, and holds unread input gets a
+    `requeue` entry. An agent with no model is skipped until one is set.
+  - Then free loops are filled from the queue.
 - **Requirement** — the transcript carries a **bounded number of screenshots**. Only the last
   few images are sent; older ones stay in the transcript as text saying they are no longer
   visible, so an agent knows the screen it remembers is stale rather than reasoning about a
@@ -429,7 +1042,39 @@ window on its text alone.
   the contract, and its other half is that no kept tool result is left orphaned.
 - **Requirement** — once per turn, in front of the first step, at the same point as the home
   load, and the summary rides after the stable system text as a message of its own. Compacting
-  between steps would change the request head mid-turn and throw away the prompt cache.
+  between steps would change the request head mid-turn and throw away the prompt cache. The one
+  exception is the overflow retry below.
+- **Requirement** — **the budget comes from the turn's model.** `compactionBudget` turns the
+  `contextWindow` of the model the turn runs on (an idle pass's own pick, else the agent's, else
+  the default) into characters, at `CHARS_PER_TOKEN` = 3. It first reserves room for the reply
+  (a quarter of the window, at most 8 192 tokens), three replayed images and the tool schemas.
+  The result is capped at the fixed 400k and floored at 8k. An unknown window is the fixed
+  400k/260k. The tail keeps the fixed share, 65 %, but never more than the budget minus the
+  system text and the summary, so a small window is not full again straight after a pass. A
+  summary is clipped to an eighth of the budget, at most 16k. The summariser's own input is
+  clipped to the budget, and so is the owner's `/compact`, since no tools or images ride on it.
+  `contextFullness` is measured against the same budget.
+- **Requirement** — **a context overflow compacts once and asks again.** When a step's model call
+  fails with `ProviderError.overflow`, the loop compacts within the turn to `overflowBudget`, a
+  quarter of each part, rebuilds the replay and asks the same step again. That retry does not
+  count as a step. A second overflow in the turn, a summary that cannot be written, or no legal
+  cut fails the turn as before.
+  - The forced cut still lands between turns, and only where the covered stretch ends at or before
+    the newest row the turn started with. Another sender's row that arrived mid-turn is not in the
+    turn's history, so a summary reaching past it would hide that message from every later replay.
+  - The cost is the prompt cache for the rest of that turn, which an overflow had already lost.
+- **Requirement** — **summariser tokens are counted.** Every summariser call reports its usage
+  to the turn: the start-of-turn pass, the overflow retry's forced pass and the pass after a
+  switch to a smaller backup. Its tokens land in the turn's `usage`, so in the `turn` event
+  (which also gets `summaries: n` when there were any) and in what an idle pass hands
+  `idle.end`, and they count toward the idle pass's token limit mid-turn. The owner's
+  `/compact` is not a turn and no idle budget is involved: `compactNow` answers its usage and
+  the route logs it (`owner compaction tokens`). It is recorded nowhere else, because a `turn`
+  event with no model calls would read wrong in the app.
+- **Known limit** — what no cut can remove still has to fit. Within one turn, the last
+  `MAX_FULL_OBSERVATIONS` tool results, each clipped to 16k per stream, can exceed a 32k model's
+  budget by themselves, and so can very large MCP tool schemas. Such a turn overflows twice and
+  fails, the same as before this work.
 - **Recommendation** — the budget measures the characters `transcript` would send after the
   trimming, not the row count: trimmed is what the request costs. Screenshot bytes are left out
   because `MAX_REPLAYED_IMAGES` already bounds them and counting them would put every
@@ -440,7 +1085,9 @@ window on its text alone.
   turn: the same rule the home load follows. The request that follows is oversized, which is the
   endpoint's answer to give, and the next turn tries again. The summariser runs on the turn's own
   provider with its own system text and no `onDelta`, so what it writes is never mistaken for the
-  agent speaking.
+  agent speaking. It is handed the turn's stop signal: a stop while it writes aborts the call,
+  no summary row is written (the row only lands after a complete reply), and the turn ends as
+  stopped at the loop's first check.
 - **Requirement** — the owner can compact on demand, `POST /api/agents/:name/compact` or
   `POST /api/conversations/:id/compact`, budget or no budget. It is the same summariser with a
   different cut: **everything** since the newest summary is folded in and nothing is kept
@@ -454,6 +1101,20 @@ window on its text alone.
   characters its own thread would replay since its newest summary, measured the way the budget
   above measures them, against that budget. It is a reading of rows the daemon already has, only
   on the list route, so the app can show how close the next compaction is without a model call.
+- **Requirement** — the list route does not project every thread on every poll. The projected
+  size is memoised per thread under `threadFingerprint`: the newest row id and the row count
+  (ids are `AUTOINCREMENT`, so a rewind or clear never repeats a pair), the agent's newest
+  summary id, every agent's id and name, because other agents' names are part of the text
+  and a rename edits rows in place, and the thread's `imageEpoch`, an in-memory counter the image
+  pruner bumps when a screenshot in the thread expires, which changes the line the transcript
+  carries for it. Those are the only in-place edits that change the projection: moving a
+  picture's bytes into a file also rewrites the row, but the transcript reads only whether a
+  picture is there. An unchanged thread costs three small queries. The budget is applied on
+  every read, so a model switch shows at once.
+- **Recommendation** — a memo, not a stored column. A column would have to be kept right by
+  every path that appends, deletes, rewinds, clears, compacts or renames, and several of those
+  are bulk deletes in other modules; the fingerprint is correct by construction and lives in one
+  place. The cost is one projection per changed thread per daemon process, after a restart too.
 - **Deferred** — compacting an agent's memory files, and any retention of the summarised rows.
   Nothing is deleted; the summary is a shorter *reading* of rows that all stay.
 
@@ -540,8 +1201,8 @@ asleep. A heartbeat is a schedule with a fixed prompt, **not a second mechanism*
   agents once each. The same rule makes an expression finer than the tick fire once per tick.
 - **Requirement** — delivery is **the existing messaging path and nothing else**: `appendMessage`
   into the agent's own thread with the owner, then `runner.start`. A busy agent picks the row up
-  through the same drain a peer's message goes through, which is why this needs no queue and no
-  second runner.
+  through the same drain a peer's message goes through, and one that finds every loop taken waits
+  in the runner's [turn queue](#the-agent-loop), so this needs no queue or runner of its own.
 - **Requirement** — the delivered row is written as **the owner's**, with no sender. An
   agent-authored one is excluded by `notSentBy` in `pendingConversation`, so the agent would
   never wake on it, and it would be counted by `agentChain`, so a handful of fired jobs would
@@ -557,6 +1218,15 @@ asleep. A heartbeat is a schedule with a fixed prompt, **not a second mechanism*
   week *and* day-of-month — are exactly what a scheduler is judged on.
 - **Requirement** — an expression with no next run (`0 0 30 2 *`, February the 30th) is refused
   at validation, and a row that stops having one is dropped rather than left permanently due.
+- **Requirement** — **cron is read in the owner's timezone**: the `timezone` setting, an IANA
+  name, through croner's `timezone` option. Unset means the daemon's own zone, so an install from
+  before the setting keeps its clock. `0 9 * * *` in `Europe/Amsterdam` fires at 07:00 UTC in
+  summer and at 08:00 UTC after the last Sunday of October. A zone is accepted only if both
+  `Intl.DateTimeFormat` and croner take it, and a stored one the runtime no longer knows reads as
+  the daemon's zone: a zone croner refused would give every row no next run, and the tick drops
+  such rows. Changing the zone recomputes `next_run_at` for every unpaused row (`rescheduleAll`),
+  and never drops one; a paused row is recomputed when it resumes. The zone is named in the
+  agent's schedule list each turn, so the model writes its crons for the right clock.
 - **Requirement** — the agent's own schedules ride in the **same once-per-turn tail** as memory
   and the skills index, so it knows what it has already set up. `homeTail` is the one place; a
   second per-step load would change the request head mid-turn and throw the prompt cache away.
@@ -682,7 +1352,9 @@ SDK is the only reason this is one piece of work rather than three.
   to get wrong. The close is in a `finally` around the whole turn, because a failed turn leaks a
   child process just as happily as a successful one.
 - **Requirement** — connecting happens **once, in front of the first step**, with the system text
-  and the compaction: every step of a turn is handed the same tool list, so the request head the
+  and the compaction, and after the turn's [workspace snapshot](#snapshots-and-putting-files-back),
+  because the server runs as the agent and may write into its home (`deps.mcp` is handed a
+  `homeReady` gate and awaits it only when a server is configured): every step of a turn is handed the same tool list, so the request head the
   prompt cache keys on does not change between them. The tools are sorted by name inside each
   server and appended after every built-in tool, so the order is the same turn after turn.
 - **Requirement** — a server that is down, slow or misconfigured **costs the agent that server's
@@ -704,13 +1376,12 @@ SDK is the only reason this is one piece of work rather than three.
 - **Recommendation** — a **task worker is offered no MCP tools**. A worker has no Linux user of its own, so a
   stdio server would run as its parent, and it is one job that reports back and is never started
   again.
-- **Deferred** — running as the agent's user is **a separation of duties, not a boundary**, for
-  the same reason the SSRF guard is defence in depth. `%agents ALL=(ALL) NOPASSWD: ALL` is in the
-  [privilege model](#privilege-model) on purpose, so a server started as `agent-alpha` can become
-  any other user on the machine. What the rule buys is that the daemon does not hand its own
-  process, environment and file ownership to third-party code by default. The env block travelling
-  in argv is visible in `/proc` to every user on the box and folds into the same ceiling. Closing
-  either one means the agent users stop being able to sudo, which is its own task.
+- **Requirement** — a stdio server runs inside the agent's sandbox, like every other command.
+  Its `sudo` is the sandbox's root, so it cannot reach the daemon, its database or another
+  agent (see [privilege model](#privilege-model)).
+- **Deferred** — the env block travels in argv, and there is no PID namespace, so it is visible
+  in `/proc` to every process in the container, other sandboxes included (see the sandbox's
+  residual risks).
 - **Deferred** — no OAuth. An http server is reached with the headers the owner configured and
   nothing else; the SDK's `authProvider` needs a redirect the daemon has nowhere to send.
 - **Deferred** — resources and prompts. Only `tools/list` and `tools/call` are used, because a
@@ -779,9 +1450,10 @@ SDK is the only reason this is one piece of work rather than three.
   be stored at any point of a turn and stays there, so on the next read it would otherwise sit
   between an assistant message and its tool results.
 - **A message to a busy agent is taken, not refused.** There is no 409 left: nothing would
-  retry it, because the sender may be another agent inside a turn. The message rows are the
-  queue — a running turn looks for arrivals before it releases the agent, and the check and the
-  release are one synchronous block so nothing can land in the gap. A message that arrives
+  retry it, because the sender may be another agent inside a turn. For a busy agent the message
+  rows are the queue — a running turn looks for arrivals before it releases the agent, and the
+  check and the release are one synchronous block so nothing can land in the gap. For an agent
+  that is not running but finds the loop cap full, `turn_queue` holds its place. A message that arrives
   mid-turn is excluded from the transcript of the turn already under way and answered by the
   next one.
 - **An agent that wrote to another one ends its turn** in `waiting_for_agent` rather than
@@ -830,8 +1502,9 @@ SDK is the only reason this is one piece of work rather than three.
   that can multiply. The **loop cap** is the number of turns running at once and lives in the
   runner, which holds the only process-local view of what is running; it is per process, so two
   daemons against one database allow twice as many. The **worker cap** is the number of live
-  workers and is a query over the rows. A request above a cap fails with the cap named: a 429
-  for the owner over HTTP, an observation the model can act on for a tool call. Spawning also
+  workers and is a query over the rows. A spawn above either cap fails with the cap named, as an
+  observation the model can act on. Every other turn above the loop cap
+  [waits in the queue](#the-agent-loop) instead of failing; a worker's report among them. Spawning also
   passes through the runaway guard `send_message` uses, since a worker's result counts as an
   agent-authored message in that thread.
 - **Requirement** — boot marks every worker that was still running as `failed` and writes its
@@ -872,8 +1545,8 @@ SDK is the only reason this is one piece of work rather than three.
   Closing that means gating on what a command does rather than on which tool asked.
 - Known ceiling: the proxy is a byte pipe with no backpressure and no RFB parsing, so a viewer
   that sends pointer and key events while it does not hold control is stopped by its own client
-  rather than by the daemon. Enforcing view-only would need to filter RFB message types 4 and 5
-  out of a stream that is not message-framed. The recorder behind "Show how" does frame the
+  rather than by the daemon. Enforcing view-only would need to filter RFB message types 4, 5
+  and 6 out of a stream that is not message-framed. The recorder behind "Show how" does frame the
   viewer's bytes, but only reads a copy of them; it filters nothing.
 
 ### Stopping a turn
@@ -894,8 +1567,15 @@ SDK is the only reason this is one piece of work rather than three.
   through `exec` as SIGTERM to `sudo`, which relays it to GNU `timeout`, which signals the whole
   process group; the command's exit code becomes its tool result and the turn ends after it.
   The computer tool is bounded at seconds and is not interrupted; an MCP call is not either.
+- **Requirement** — a stop reaches the work in front of the first step too. The summariser call
+  is aborted like any model call (see [compaction](#context-compaction)). A tool call waiting on
+  the workspace snapshot is answered `error: stopped by the owner` at once and the turn halts
+  after the reply's results. The snapshot itself gets SIGTERM through `exec`; the turn then gives
+  it up to two seconds to exit before it lets go of the agent, so a stuck one cannot hold the
+  loop.
 - **Requirement** — every turn ends with a `turn` event carrying the number of model calls and,
-  when the endpoint reported it, the prompt and completion tokens. The request asks for usage
+  when the endpoint reported it, the prompt and completion tokens, the summariser's included
+  (see [compaction](#context-compaction)). The request asks for usage
   with `stream_options`, and an endpoint that reports none leaves the count of calls, which is
   still a cost.
 
@@ -1085,7 +1765,20 @@ owner knows that the agent must never see.
   Fill; nothing is ever filled on the agent's say-so.
 - **Requirement** — secret values just typed are replaced by `[hidden]` in every tool result
   before it is stored, so an agent reading the field back does not put it in its transcript.
-  Known ceiling: that list lives in memory, so after a restart a read-back is not hidden.
+  **This survives a restart.** The values are kept per agent in `hidden_values` (migration 0033)
+  as one JSON array encrypted with the master key. `loadHidden` reads them back when the app is
+  created, and redaction itself is an in-memory `replaceAll` over a cache keyed by the `Db`.
+  - **Decision: encrypted values, not keyed hashes.** Hashes would never store the secret
+    itself, but finding a hashed value inside arbitrary tool output means hashing every window
+    of every result, for every distinct length, for as long as the hash is kept. Encrypted
+    values match exactly and cheaply. They get the same protection as the vault and the API
+    keys: the master key, which no sandbox can read.
+  - `form_vault` alone could not do this job: it only holds values the owner ticked Remember
+    for. `hidden_values` is never served by a route and never used to fill anything. A
+    non-remembered value is therefore never typed again, but it is still kept so it can be
+    hidden.
+  - At most the newest 200 values are kept per agent, and the row goes when the agent is
+    deleted.
 - **Recommendation** — **teaching a skill**: `POST /api/agents/:name/recording` takes the screen
   and records the owner's hands by tapping the bytes the viewer sends through the VNC proxy. The
   parser skips the fixed handshake and stops trusting the stream at a message type it does not
@@ -1133,6 +1826,15 @@ not do anything the owner has to undo.
   approval).
 - `GET /api/idle/passes?since=` and `POST /api/idle/outputs/:id`. Three dismissed notes in a row
   pause idle work with the reason shown, so an agent that keeps leaving noise stops by itself.
+- **Requirement** — the window's hours and the budget's "today" are wall-clock time in the owner's
+  [timezone](#scheduled-tasks). A window across a DST change is an hour longer or shorter.
+- **Requirement** — **a pass's tokens are on its row as they are spent**, written after every
+  metered model call, the summariser's included, as a running total. `endPass` writes the same
+  total at the end. The budget counts a pass that a restart cut short, because there is nothing
+  left to reconcile from at boot: the turn's `turn` event is written in the same `finally` that a
+  dead daemon never reaches. At boot, `closeInterruptedPasses` marks a pass still `due` with no
+  reason and no end as `interrupted`, with a reason saying why. That is a new `IdlePassOutcome`
+  value. The app decodes outcomes tolerantly and shows an unknown one as its raw text.
 
 ### Triggers
 
@@ -1161,6 +1863,13 @@ turns it on.**
   look: one that deletes, installs or mails is refused at proposal, it runs under a 30-second
   timeout, and it fires on a change of exit code and output, never on its first run. The row is
   read again after every await, so one turned off meanwhile neither fires nor moves its cursor.
+- **Requirement** — **one hung check delays no other.** A pass starts every due check at once
+  (`Promise.allSettled`), each under its own limit (`TRIGGER_CHECK_LIMIT_MS`, 45 s: above the
+  command's own 30 s, so a killed command reports its exit). A check that runs out of time is
+  that trigger's `lastError`, like any other failure. Its cursor stays where it was, and an answer
+  that arrives later changes nothing. The rate window and the cursor rules are unchanged. The
+  pass still ends only when every check has settled or timed out, so the scheduler's
+  one-pass-at-a-time guard is bounded by the limit.
 - **Requirement** — **an IMAP login never passes through the model.** A config key that looks like
   a login is refused with that reason. The login is asked for with the forms flow, a `forms` row
   pointing at the trigger, and stored encrypted on the trigger; filling it writes no thread line.
@@ -1219,6 +1928,14 @@ agents' files and the text in stored pictures.
   hard-links the previous tar. A snapshot is named after the newest message id when the turn
   began, which is how a rewind finds the one from just before the cut. A failed snapshot is
   logged and the turn goes on.
+- **Requirement** — **the snapshot runs alongside the first model call, never ahead of it.**
+  Everything that can write into the home waits for it: **every** tool call (not a list, since
+  `remember`, `spawn_task_worker` and others write there too) and the MCP session start, which
+  runs as the agent. A home could otherwise change before the snapshot that a rewind restores
+  from had read it. The turn also waits for it before it ends, so a reply with no tool call can't
+  leave it running into the next round's snapshot or into a `set_name` rename. Known limit: with
+  an MCP server configured, the first call still waits, because the tool list must be fixed
+  before it and the server cannot start until the snapshot is done.
 - **Requirement** — `GET .../rewind?from=` is the preview: the rows that would go, each agent's
   changed, deleted and new files, which agents have no snapshot, and what **cannot** be undone —
   messages sent, mail, installs, approved actions, filled forms, trigger fires — read off the rows
@@ -1227,8 +1944,26 @@ agents' files and the text in stored pictures.
   participant needs a snapshot, or it is a 409 with nothing touched. Files go back **first**,
   because they can fail and deleting rows cannot, then the rows go, then one owner line per agent
   says what was put back, before any retry turn reads the thread.
-- Snapshots older than seven days are pruned hourly. Known ceiling: a changed home is a full tar
-  per turn; a home of many gigabytes wants `rsync --link-dest`.
+- **Requirement** — retention is bounded three ways: snapshots older than seven days go, then the
+  oldest until an agent keeps at most 50 and they take at most 2 GiB on disk
+  (`KEEP_SNAPSHOTS_COUNT`, `KEEP_SNAPSHOT_BYTES`). A hard-linked tar counts once, so dropping a
+  snapshot that shares its tar with a newer one frees only its manifest. The caps never take the
+  newest snapshot, the one a rewind of the latest turn restores from; age can, because
+  `pickSnapshot` would not offer it either. The script only lists (`sizes`: inode, size, name)
+  and deletes (`remove`); `snapshotsToPrune` decides, so the policy is unit-tested.
+- **Recommendation** — both caps, not one. Age alone let a busy agent with a big home pile up a
+  week of full tars. Bytes bound what actually fills the disk; the count bounds the many tiny
+  snapshots of a home that rarely changes, each a manifest plus a link that `list` and `diff`
+  walk. A byte cap alone would let those grow without end, and a count alone means 50 tars of a
+  large home.
+- **Requirement** — a prune runs after every snapshot, from the listing the `snapshot` mode ends
+  with, so it costs a second shell call only when something has to go; a stopped turn skips it.
+  The hourly pass catches agents that have not run a turn. Bursts of turns on a big home are
+  why the hourly pass alone was not enough.
+- Known ceiling: a changed home is still a full tar per turn. Per-file sharing between
+  snapshots (`rsync --link-dest` style) would mean a tree of files per snapshot instead of one
+  tar, and a different restore; that was not cheap, so it is left for when a home of many
+  gigabytes needs it.
 
 ### Forwarding and new agents
 
@@ -1252,7 +1987,8 @@ agents' files and the text in stored pictures.
 
 `main.ts` owns the boot order and every clock. Before the server starts: migrations, the old
 provider settings moved into the registry, restart recovery, the APNs key seeded from a file.
-Then the server starts, the desktop reconcile runs once it is listening, and five timers start.
+Then the server starts, the desktop reconcile runs once it is listening, the image move starts,
+and the timers below start.
 
 | Timer | Every | Does |
 | --- | --- | --- |
@@ -1260,12 +1996,17 @@ Then the server starts, the desktop reconcile runs once it is listening, and fiv
 | Idle work | the tick, one pass at boot | pre-checks and starts idle passes |
 | Triggers | the tick, one pass at boot | polls folder, command and mail triggers that are due |
 | Search index | 10 minutes, one pass at boot | rescans homes, reads a few pictures |
-| Snapshot pruner | hourly | deletes snapshots older than seven days |
+| Snapshot pruner | hourly | deletes snapshots past seven days, 50 per agent or 2 GiB per agent (a turn also prunes after its own snapshot) |
+| Turn sweep | `SWEEP_MS` (a minute), one pass at boot | repairs agents waiting on nobody, queues unread input, fills free loops from `turn_queue` |
+| Image pruner | hourly, one pass at boot | expires agent screenshots past `imageRetentionDays` (default 30), then deletes every image file no row points at |
+
+The image move is not a timer: it runs once per boot, a batch of 50 rows per event-loop turn,
+until no row holds inline base64 (see [Persistence model](#persistence-model)).
 
 - **Requirement** — the idle, trigger and index passes await shell work, so each carries a
   `running` flag and skips a tick that lands while the last pass is still going. The schedule
-  tick stays synchronous for the reason under [scheduled tasks](#scheduled-tasks); the hourly
-  pruner has none.
+  tick and the turn sweep stay synchronous for the reason under [scheduled tasks](#scheduled-tasks); the hourly
+  pruners have none. The image pruner is synchronous on purpose (below).
 - **Requirement** — every timer is `unref`'d and every pass catches its own errors: a failed pass
   is a log line, never a dead daemon.
 
@@ -1294,11 +2035,19 @@ Then the server starts, the desktop reconcile runs once it is listening, and fiv
   The observation is already in the transcript, so the next message the owner sends carries the
   restart into the model call. `waiting_for_user` also means the agent resumes from persisted,
   repaired history, which is what the restart-recovery requirement asks for.
-- **Requirement** — boot also rescues an agent stranded in `waiting_for_agent`. The reply it is
-  waiting for wakes it only from inside a live turn, so an answer written before the daemon died
-  would never reach it. Boot moves such an agent to `waiting_for_user`; an agent whose reply has
-  genuinely not been written yet is left where it stands, because that state is what lets the
-  answer wake it later.
+- **Requirement** — boot also rescues an agent stranded in `waiting_for_agent` or
+  `waiting_for_task_worker`, with the same `repairWaiting` the [sweep](#the-agent-loop) runs,
+  after every interrupted agent has come to rest, because whether an asker is stranded depends on
+  where the agent it asked was left. Nothing runs or waits in line at that point. An agent whose
+  answer can still come, because the agent it asked holds unread input or waits on the owner, is
+  left where it stands. A rescued one gets a `restart` event.
+- **Requirement** — **the queue survives a restart and is drained at boot.** `startSweeper` runs
+  in `main.ts` before the schedule tick. It pops what the dead daemon left in `turn_queue`,
+  oldest first, and queues unread input, which includes the message boot writes for a failed
+  worker's parent. A turn the dead daemon was running is not among it: that turn marked its
+  input read when it started, so only what arrived after it runs.
+- **Requirement** — boot closes an idle pass the dead daemon was running as `interrupted`
+  (see [Idle work](#idle-work)). Its tokens up to the restart already count against the day.
 - Because a restart ends a turn from wherever the dead daemon was standing, `using_computer` and
   `using_terminal` reach `waiting_for_user` in the transition table. The loop itself still only
   ends a turn from `thinking`.
@@ -1329,22 +2078,24 @@ Then the server starts, the desktop reconcile runs once it is listening, and fiv
 ## Persistence model
 
 **Requirement** — one SQLite database at `$SCHERMES_DATA_DIR/schermes.db`, through
-better-sqlite3, with Drizzle for the schema and the migrations. There is no second store, no
-cache and no queue: the rows are the queue.
+better-sqlite3, with Drizzle for the schema and the migrations. There is no second store and no
+cache. The only queue is `turn_queue`, which holds turns waiting for a free loop.
 
-Twenty-two tables are defined in `daemon/src/schema.ts`, and three full-text tables live beside
+Twenty-seven tables are defined in `daemon/src/schema.ts`, and three full-text tables live beside
 them outside the drizzle schema.
 
 | Table                       | Holds                                                                 |
 | --------------------------- | --------------------------------------------------------------------- |
-| `owner`                     | One row: the scrypt hash of the owner password                        |
+| `owner`                     | One row: the scrypt hash of the owner password, and the TOTP secret (encrypted), any pending one and the last step accepted |
+| `recovery_codes`            | SHA-256 of each unspent TOTP recovery code                            |
+| `audit_events`              | Owner actions: when, what, address, user agent, a small detail JSON; bounded at 10,000 rows and 90 days |
 | `sessions`                  | Session ids and their expiry, so a restart does not log you out       |
 | `settings`                  | Key/value with an `encrypted` flag: search, push, MCP, the default and backup model ids, refused-key markers |
 | `models`                    | The model registry: name, base URL, model id, extra body, encrypted key |
 | `agents`                    | Name, label, look, profile, X display, state, a worker's parent and thread, and JSON columns for rules, one-shot grants and idle settings, plus its model |
 | `conversations`             | A thread, identified only by its id                                   |
 | `conversation_participants` | The one agent a thread belongs to. The owner is in every one and is never listed |
-| `messages`                  | Role, content, sender, tool calls, tool call id, an optional image, and `kind` (`request`/`reply`) on agent-to-agent rows |
+| `messages`                  | Role, content, sender, tool calls, tool call id, an optional image (`image_ref` naming a file; legacy inline `image`), and `kind` (`request`/`reply`) on agent-to-agent rows |
 | `summaries`                 | A compacted stretch of a thread, for one agent, and the ids it covers  |
 | `schedules`                 | A standing job for one agent: cron, prompt, paused, and when it is next due |
 | `events`                    | The structured record of what an agent did                            |
@@ -1358,12 +2109,14 @@ them outside the drizzle schema.
 | `triggers`                  | A proposed or live trigger, its rate window, cursor, last error, webhook token and encrypted secret or login |
 | `goals`                     | A goal: lead, state, steps, results, next from the owner              |
 | `goal_helpers`              | Which agents help which goal, of which kind, and whether kept         |
+| `turn_queue`                | A turn waiting for a free loop: agent id, thread, kind, when queued   |
 | `messages_fts`, `files_fts`, `screenshots_fts` | FTS5 indexes for [search](#search), created by hand-written SQL in migration 0024 |
 
 - **Requirement** — durable state is the database, not the process. An agent's `state` column is
   the truth and the loop is a process that can be killed. What is deliberately *not* persisted
   is the one-turn-per-agent set and the desktop input hold: both are properties of a live
-  process, and a daemon that dies takes the thing they describe with it.
+  process, and a daemon that dies takes the thing they describe with it. A turn *waiting* for a
+  loop is persisted, in `turn_queue`, because nothing else would bring it back.
 - **Requirement** — migrations are committed under `daemon/migrations/` and applied on boot, so
   the deployed code and the schema move together and there is no separate migration step.
 - **Requirement** — foreign keys are **off across the migrations and on for everything after**,
@@ -1386,18 +2139,59 @@ them outside the drizzle schema.
   named volume is seeded from the image with its ownership and modes, which is what keeps
   `master.key` at 0600 owned by `schermes`. Agent home directories are deliberately outside it:
   a recreated container rebuilds the Linux users and desktops from the surviving agent rows.
+- **Requirement** — **message pictures live in files, not in SQLite.** `images.ts` writes each
+  picture once to `$SCHERMES_DATA_DIR/images/<sha256[0:2]>/<sha256>`, named by the sha256 of its
+  bytes. The row's `image_ref` holds `{mediaType, sha256}`. A screenshot taken twice, or the same
+  picture on several rows, is one file. The write is a temp file, `fsync`, then a rename, so a
+  file that exists is complete. Every writer goes through `appendMessage`. Readers get the bytes
+  back as base64 exactly as before, so the wire did not change. The data volume holds the files,
+  and the agent sandbox cannot see `/var/lib/schermes`.
+  - **Column shape: a new nullable `image_ref` beside the legacy `image`** (migration 0038, one
+    `ADD COLUMN`), not new JSON variants in `image`. A rolled-back daemon reads `image` as NULL
+    for a moved row and shows no picture. Reusing `image` would hand it `{mediaType, sha256}`
+    with no `base64`, which fails the app's decode of the whole page. A row has at most one of
+    the two set.
+  - **The move is resumable.** At boot, `startImageMover` walks rows with inline base64 by id, 50
+    per batch. For each one it writes the file first, then sets `image_ref` and nulls `image` in
+    one `UPDATE`. A crash in between leaves the old base64 and a file nobody references, never a
+    reference without its file. The next boot starts again from id 0 and skips nothing. A write
+    error such as a full disk stops the move with a log line instead of retrying the same row.
+  - **Requirement** — **retention prunes agent screenshots, never the owner's pictures.** The
+    hourly pruner expires a picture older than `imageRetentionDays` (setting, default 30, 0 keeps
+    everything) on every row except `role = 'user'` with no sender. Those are the owner's, which
+    includes a recording hand-over's picture. Expiring sets `image_ref` to
+    `{mediaType, expired: true}`. The same pass then deletes every file no `image_ref` names. That
+    covers a file shared by several rows (it goes only with the last one), threads cleared or
+    rewound, and the leftovers of a crash between a file and its row. Writing a file and inserting
+    its row happen in one synchronous tick, and so do reading the live set and unlinking, which is
+    what makes the sweep race-free. Both must stay synchronous.
+  - **A missing or unreadable file reads as expired.** `resolveImage` never throws. The loop reads
+    every row of a thread every round, and one bad file must not end an agent's turns.
+  - **The model never gets an expired picture.** The transcript writes a line saying the
+    screenshot expired, and an expired one does not take one of the `MAX_REPLAYED_IMAGES` places.
+    The provider also refuses to send an image with empty bytes as an `image_url`. OCR marks an
+    expired row as read with no text. Text read from a screenshot before it expired stays
+    searchable.
+  - The database file does not shrink after the move: SQLite keeps the freed pages for reuse.
+    `VACUUM` gives them back, but it needs free disk the size of the database, so it is never run
+    automatically. See [troubleshooting](troubleshooting.md).
+- `messages.sender` is indexed (`messages_sender_idx`, migration 0037): the queue's own-row
+  mark, the idle pre-check, owed requests and `agentChain` all filter on it across every thread.
 - **Requirement** — `messages_fts` is kept by SQLite triggers on `messages`, not by the code that
   writes rows. A migration that recreates `messages` has to recreate those triggers too.
 - **Deferred** — retention and trimming. Deletes happen only when someone asks — an agent or a
   thread deleted, a rewind, a finished goal's helpers — and workspace snapshots are pruned after
-  seven days; the event log and old conversations otherwise grow for the life of the install.
+  seven days or past the per-agent count and byte caps, and agent screenshots after the image
+  retention window; the event log and old conversations otherwise grow for the life of the install.
   Reads are paged and model requests are bounded, so this is disk, not correctness.
 
 ## Security model
 
-The isolation boundary of schermes is **the machine**, not the agent user. Agents have
-passwordless sudo because an agent is the operator of its own computer. Deploy it somewhere you
-would be comfortable giving a person root.
+Each agent is isolated in **its own sandbox**: it has passwordless sudo, because an agent is the
+operator of its own computer, but that root is over its own writable layer, not over the
+container, the daemon or the other agents (see [privilege model](#privilege-model)). The
+sandbox still shares the kernel and the container's network egress, so deploy it somewhere you
+would be comfortable running untrusted code.
 
 What that leaves the product responsible for is the perimeter, and there is exactly one:
 
@@ -1420,16 +2214,16 @@ What that leaves the product responsible for is the perimeter, and there is exac
   model chose is checked against loopback, link-local and private ranges before it does. See
   [web search and fetch](#web-search-and-fetch), which also says why that is defence in depth
   rather than a boundary: `run_command` and `curl` share this network namespace already.
-- **Requirement** — third-party code the owner configures runs as the **agent's** Linux user and
-  never as `schermes`. See [MCP](#mcp), which also says why that is a separation of duties rather
-  than a boundary: the agent users have passwordless sudo already.
+- **Requirement** — third-party code the owner configures runs as the **agent's** Linux user,
+  inside its sandbox, and never as `schermes`. See [MCP](#mcp).
 - **Requirement** — **the owner's secrets stay out of the model.** A form is read and filled by
   the daemon over CDP, the origin comes from Chromium rather than the model, a secret field is
   offered only on HTTPS or loopback, and the agent learns which fields were filled, never a value.
   An IMAP login is entered the same way and stored encrypted. A recording drops what was typed
   into a secret field. See [hand-over, forms and teaching](#hand-over-forms-and-teaching). Known
-  ceiling: the agent still drives the browser the values were typed into, and has sudo; this keeps
-  secrets out of prompts, transcripts and the model provider, not away from a hostile agent.
+  ceiling: the agent still drives the browser the values were typed into, and is root in its own
+  sandbox. This keeps secrets out of prompts, transcripts and the model provider, not away from
+  a hostile agent.
 - **Requirement** — the rules ladder's hard limits (passwords are always the owner's, a delete or
   install through `run_command` needs the level or a grant) and idle work's fence are enforced in
   the daemon; the rest of the ladder is prompt text. See
@@ -1438,17 +2232,16 @@ What that leaves the product responsible for is the perimeter, and there is exac
   network from the app. The port itself is the perimeter, so put a firewall or an authenticating proxy in
   front of anything not on a trusted network.
 
-**First boot is claim-once, and that is the whole of the story.** A fresh image ships with no
-owner password and no provider settings, so between the first boot and the first visit, whoever
-reaches the port becomes the owner. The window is closed rather than guarded: setup succeeds
-exactly once and every later attempt is refused, which `infra/smoke.sh` asserts on every run.
-There is no out-of-band claim token and no console-printed secret, because either would be a
-second secret to distribute for a machine that is meant to be claimed from the browser thirty
-seconds after it boots. Boot it on a network you trust and claim it promptly.
+**First boot is claim-once, and it needs the token in the daemon log.** A fresh image ships
+with no owner password and no provider settings. Setup succeeds exactly once and every later
+attempt is refused, which `infra/smoke.sh` asserts on every run. Until then it also needs the
+first-run setup token, which the daemon prints in its own log
+(`docker compose logs schermes | grep 'setup token'`). Reaching the port first is therefore not
+enough: you also need the host's console. This replaced an earlier "whoever reaches the port
+first" stance, because a daemon reached by IP is often on a network you don't fully control.
 
-- **Requirement** — the session cookie is `HttpOnly`, `SameSite=Lax`, and deliberately **not**
-  `Secure`: a `Secure` cookie is dropped over the plain HTTP the daemon speaks, so setting it
-  would break login for every deployment without a TLS proxy.
+- **Requirement** — the session cookie is `HttpOnly`, `SameSite=Lax`, and `Secure` only when the
+  request arrived over TLS. Details are in [Owner authentication](#owner-authentication).
 - **Deferred** — TLS inside the product, a password manager beyond the per-site form vault, and
   any notion of a second user. See [deployment](deployment.md) for the proxy.
 
@@ -1477,11 +2270,83 @@ WebSocket and `/hooks/:token`. [`apple/README.md`](../apple/README.md) owns the 
   resume where it stopped instead of skipping the middle. An idle poll is an empty array rather
   than a page of base64 screenshots. `before` and `after` are alternatives; asking for both is a
   400. A reader that only shows *that* a row has a screenshot — the sidebar preview, polled for
-  every agent — adds `images=0`, which keeps each image's media type and drops its bytes.
+  every agent — adds `images=0`, which keeps each image's media type (and `expired`) and drops
+  its bytes.
+- **Requirement** — the app's polls slow down when nobody is looking and back off when they fail.
+  An active scene polls at the base rate: 2 s for the agent list and the thread, 1 s for the live
+  reply. An inactive scene polls five times slower, which is 10 s for the list. That keeps the
+  `x-schermes-attending` header inside the daemon's 30 s presence window. On a Mac, "inactive" also
+  covers an app that is not in front and a window that is occluded. An iPhone pauses in the
+  background. A Mac in the background keeps the inactive rate, because its poll is what announces
+  a turn that finished there. Each failure doubles the wait, capped at 60 s. Only one poll reads
+  `/api/agents` (`AgentFeed`), and callers asking in the same moment share its request. A network
+  failure, or a proxy answering 502/503/504, shows a "Can't reach the daemon" banner with Retry
+  now. A 4xx from the daemon is an answer, not an outage.
+- **Requirement** — `POST /api/auth/setup` takes the first-run `setupToken` beside the
+  password. The app's setup screen has a field for it and shows the 403's `error` text when it is
+  wrong. An older build without the field cannot claim a fresh daemon and needs curl. See
+  [Owner authentication](#owner-authentication).
+- **Requirement** — login has a new field, `totpRequired: true` on a 401, once the owner turns
+  TOTP on. A client sends `totp` or `recoveryCode` beside the password. Consequences, accepted:
+  - An app build without the field shows the 401's `error` text ("enter the code from your
+    authenticator app") and cannot sign in, so **once TOTP is on, older builds are locked out**
+    until updated. Sessions they already hold keep working until they expire (30 days).
+  - The current app shows a code field and a recovery-code switch on `totpRequired`.
+  - **Decision** — the share extension and notification actions **spend the app's session
+    cookie** rather than ask for a code. On an iPhone the app's cookie store is the app group's,
+    so the extension sees it. Notification actions run in the app process and share it anyway.
+    Their Keychain-password re-login still covers a daemon without TOTP. With TOTP on, an expired
+    session makes them say "Open Schermes and sign in again". A code field inside the share sheet
+    was rejected: the session lasts a fixed 30 days from sign-in, so the fallback is rare.
+- **Contract** — `GET /api/settings` has a new field, `timezone`, and `PUT` accepts it. An older
+  app ignores it, so its owner keeps the daemon's zone until a build can set one. The idle
+  outcome `interrupted` is new too, and is shown as its raw text by the app's tolerant decoding.
+- **Contract** — `GET /api/settings` has `imageRetentionDays`, and `PUT` accepts a whole number
+  from 0 (keep forever) to 3650. Anything else is a 400. An older app ignores it and the owner
+  keeps the 30-day default.
+- **Contract** — a pruned screenshot is served as
+  `image: {mediaType, base64: "", expired: true}`, from every route that returns messages. An
+  older app decodes it, since the extra key is ignored and `base64` is still a string, and draws
+  no picture, because empty bytes decode to nothing. With `images=0` the bytes are empty either
+  way, so `expired` is the only thing that tells "omitted" from "gone".
+- **Requirement** — a client shows an expired image as a "screenshot expired" placeholder and does
+  not refetch the row for its bytes. The app does this in `ScreenshotView`.
+- **Requirement** — a client decodes every enum the daemon sends tolerantly: an unknown value
+  costs that field (`.unknown` or `.other(raw)` in the app), never the page. A new state, role or
+  kind therefore needs no lockstep app release.
+- **Requirement** — a client's re-login after a 401 is **single-flight**. Concurrent 401s share one
+  login, because each wrong stored password counts toward the per-address backoff. After a log
+  out, a request that was in flight writes nothing back and never signs back in. Log out and
+  "use a different daemon" unregister the device for push first, then end the session.
+- **Requirement** — the app's Settings ▸ Account page drives every
+  [account security](#account-security) route: password change, sessions and revoke, TOTP
+  enrolment (a CoreImage QR of the `uri` plus the base32 secret; the recovery codes shown once
+  with copy and share), turning TOTP off, and the audit log paged with `before`. Its rules:
+  - A changed password replaces the stored one only after the daemon accepts it, so the silent
+    re-login keeps working. A wrong current password is a 403 and leaves the session alone.
+  - Revoking the session the app itself holds is a log out (`Session.revoke` → `logOut()`), not
+    a `DELETE` of its handle. A `DELETE` first would leave the device on the push list, because
+    unregistering needs the session.
+  - A handle is base64url and the daemon compares it exactly, so the app escapes it with upper
+    case allowed. The name escape it uses for agents would turn `A` into `%41` and miss.
+- **Decision** — the Daemon page shows the daemon's `timezone` as it was reported. It does not
+  prefill this device's zone: the daemon always reports one, so the app cannot tell "unset" from
+  "set", and a prefill would make the page dirty on open and move the zone on an unrelated save.
+  A "Use this device's" button sets it explicitly. The address and the exits sit outside the
+  settings load, so an unreachable daemon still offers Log out.
+- **Requirement** — the model editor sends `contextWindow` and `vision`. Blank is `null` on an
+  edit, which clears the window, and is left out on a create. A daemon from before capabilities
+  sends neither field, and the app reads that as vision on.
 - **Requirement** — view-only is enforced by the **client**. The VNC proxy is a byte pipe that
-  filters nothing, so a viewer that does not hold control must not send pointer or key events; the
-  client suppresses input before the socket is opened and allows it only when the daemon says
-  this client holds the desktop. Unknown ownership is view-only.
+  filters nothing, so a viewer that does not hold control must not send pointer, key or clipboard
+  (`ClientCutText`) messages; the client suppresses input before the socket is opened and allows
+  it only when the daemon says this client holds the desktop. Unknown ownership is view-only. The
+  desktop's `ServerCutText` reaches the local clipboard under the same gate.
+- **Requirement** — the clipboard bridge speaks plain RFB cut text: Latin-1, at most 256 KiB
+  (Xvnc's own `MaxCutText`) in either direction. A longer `ServerCutText` is skipped without being
+  buffered; a longer paste is refused with a message rather than sent as a bare Ctrl+V, which
+  would paste the agent's own clipboard. Characters Latin-1 lacks become `?`. Known limit: no
+  UTF-8 until the client speaks the extended-clipboard pseudo-encoding.
 - A **task worker** is nested under the agent that spawned it, opening a read-only transcript. It
   has no desktop and no composer: the owner *can* post to one over HTTP, which starts a fresh
   turn on a finished worker, and a client declines to offer that and says to write to the parent
@@ -1491,7 +2356,7 @@ WebSocket and `/hooks/:token`. [`apple/README.md`](../apple/README.md) owns the 
   reader walks back one more page.
 - The **settings screen is the owner-wide one**, and it is **one entry point with categories**
   rather than several exits from the sidebar: the model, web search, notifications, plugins, the
-  daemon connection and about. Each category is its own page with its own Save, sending only the
+  account, the daemon (its connection, clock and screenshot retention) and about. Each category is its own page with its own Save, sending only the
   fields it owns — `PUT /api/settings` keeps every field a body leaves out — and each follows the
   platform's own convention for a settings surface rather than a look of its own. Every
   write-only field takes blank as "keep the stored one", the model key's rule, and that rule
@@ -1529,8 +2394,9 @@ WebSocket and `/hooks/:token`. [`apple/README.md`](../apple/README.md) owns the 
   **goals** section in the sidebar, a **search** panel, restore and forward sheets, the form sheet,
   and "Show how" on the desktop. Beyond the app itself there are actionable notifications and a
   share extension on iOS, and a menu bar panel and a Services entry on
-  the Mac. A notification button or a share runs without a logged-in window, so each signs in
-  with the stored address and Keychain password on its own.
+  the Mac. A notification button or a share runs without a logged-in window. Each uses the stored
+  address and the app's session cookie, and on a 401 signs in with the Keychain password on its
+  own; with TOTP on it sends the owner to the app instead.
 
 ## Docker
 
@@ -1551,7 +2417,7 @@ path does it twice.
 The container command drops to the `schermes` user with `setpriv` rather than `su`. It execs in
 place, so signals from `docker compose stop` reach the daemon instead of a shell.
 
-Five container settings are load-bearing:
+Seven container settings are load-bearing:
 
 - `volumes: schermes-data:/var/lib/schermes` — without it every `docker compose up --build`
   silently started on an empty database. It is also what makes the migrations run against a
@@ -1567,6 +2433,11 @@ Five container settings are load-bearing:
   Chromium there, and takes the lock over.
 - `init: true` — `setsid` reparents detached Xvnc and Chromium processes to PID 1. Without an
   init that reaps them, dead browsers linger as zombies and process checks misfire.
+- `devices: [/dev/fuse, /dev/net/tun]` — each agent's sandbox needs fuse-overlayfs for its root
+  and pasta for its network (see [Per-agent sandbox](#per-agent-sandbox)). Devices only: no
+  capabilities, not `--privileged`.
+- `volumes: schermes-sandboxes:/var/lib/schermes-sandboxes` — every sandbox's writable layer
+  and its recorded id block, so what an agent installed survives a recreated container.
 - `security_opt: seccomp=unconfined` — Chromium's own sandbox needs `unshare(CLONE_NEWNET)`,
   which Docker's default seccomp profile denies. Relaxing the container is the better trade:
   the alternative is `--no-sandbox`, which would also weaken Chromium on bare-host deployments

@@ -35,6 +35,10 @@ function fakeDesktop(alive: Set<number>, broken = new Set<string>()) {
     rename() {
       return Promise.resolve();
     },
+    remove(name) {
+      alive.delete(calls.findLast((call) => call.name === name)?.display ?? -1);
+      return Promise.resolve();
+    },
     stopDisplay(_name, display) {
       alive.delete(display);
       return Promise.resolve();

@@ -1,8 +1,18 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
+import type { Agent } from '@schermes/shared';
+import { deleteAgent, insertAgent } from './agents.ts';
 import { fillForm, readForm } from './browser.ts';
-import { filledLine, redactSecrets, hideFromAgent, secureOrigin, shapeForm } from './forms.ts';
+import { openDb } from './db.ts';
+import { filledLine, redactSecrets, hideFromAgent, loadHidden, secureOrigin, shapeForm } from './forms.ts';
+import { hiddenValues } from './schema.ts';
+import { loadMasterKey } from './secrets.ts';
 import { formPage } from './testpage.ts';
+
+const MIGRATIONS = resolve(import.meta.dirname, '../migrations');
 
 const LOGIN = [
   { id: 't-0', label: 'Email', type: 'email', name: 'email', autocomplete: 'username', required: true },
@@ -87,7 +97,41 @@ test('the owner line names the fields and hides secret ones; typed secrets are r
     filledLine('https://bank.example', [{ label: 'Email', secret: false }, { label: 'Password', secret: true }]),
     'I filled the form on https://bank.example: Email, Password (hidden). Nothing was submitted; carry on from there.',
   );
-  hideFromAgent(7, ['hunter2-secret', 'abc']);
-  assert.equal(redactSecrets(7, 'value: hunter2-secret, abc'), 'value: [hidden], abc');
-  assert.equal(redactSecrets(8, 'hunter2-secret'), 'hunter2-secret');
+  const db = openDb(':memory:', MIGRATIONS);
+  const masterKey = loadMasterKey(join(mkdtempSync(join(tmpdir(), 'schermes-forms-')), 'master.key'));
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const beta = insertAgent(db, 'beta') as Agent;
+  hideFromAgent(db, masterKey, alpha.id, ['hunter2-secret', 'abc']);
+  assert.equal(redactSecrets(db, alpha.id, 'value: hunter2-secret, abc'), 'value: [hidden], abc');
+  assert.equal(redactSecrets(db, beta.id, 'hunter2-secret'), 'hunter2-secret');
+});
+
+test('a hidden value stays hidden after a restart, stored encrypted and deleted with its agent', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'schermes-forms-'));
+  const path = join(dir, 'schermes.db');
+  const masterKey = loadMasterKey(join(dir, 'master.key'));
+  const before = openDb(path, MIGRATIONS);
+  const alpha = insertAgent(before, 'alpha') as Agent;
+  hideFromAgent(before, masterKey, alpha.id, ['hunter2-secret']);
+
+  const after = openDb(path, MIGRATIONS);
+  assert.equal(redactSecrets(after, alpha.id, 'pw=hunter2-secret'), 'pw=hunter2-secret', 'a fresh process starts with nothing in memory');
+  loadHidden(after, masterKey);
+  assert.equal(redactSecrets(after, alpha.id, 'pw=hunter2-secret'), 'pw=[hidden]', 'and boot reads it back');
+  const stored = after.select().from(hiddenValues).all();
+  assert.equal(stored.length, 1);
+  assert.ok(!stored[0]?.values.includes('hunter2'), 'never in plain text');
+
+  deleteAgent(after, alpha);
+  assert.deepEqual(after.select().from(hiddenValues).all(), []);
+});
+
+test('only the newest hidden values are kept', () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const masterKey = loadMasterKey(join(mkdtempSync(join(tmpdir(), 'schermes-forms-')), 'master.key'));
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  hideFromAgent(db, masterKey, alpha.id, Array.from({ length: 205 }, (_, n) => `secret-${String(n).padStart(3, '0')}`));
+  loadHidden(db, masterKey);
+  assert.equal(redactSecrets(db, alpha.id, 'secret-004'), 'secret-004');
+  assert.equal(redactSecrets(db, alpha.id, 'secret-005 secret-204'), '[hidden] [hidden]');
 });

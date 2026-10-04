@@ -34,6 +34,8 @@ struct ConnectView: View {
                 .controlSize(.large)
                 .disabled(working || Session.parse(session.address) == nil)
 
+            if let url = Session.parse(session.address) { CleartextWarning(url: url) }
+
             if let trouble = session.trouble {
                 Text(trouble)
                     .font(.footnote)
@@ -57,19 +59,62 @@ struct ConnectView: View {
     }
 }
 
-/// Setup on a daemon with no owner yet, login on one that has one.
+/// Nothing at all for HTTPS or this device's own loopback.
+struct CleartextWarning: View {
+    let url: URL
+
+    var body: some View {
+        if Session.isCleartext(url) {
+            Label {
+                Text("Plain HTTP: your password and session cross the network unencrypted. Put the daemon behind HTTPS unless this network is yours alone.")
+            } icon: {
+                Image(systemName: "lock.open.fill").foregroundStyle(Theme.needsYou)
+            }
+            .font(.footnote)
+            .foregroundStyle(Theme.muted)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// Setup on a daemon with no owner yet, login on one that has one. Setup takes the code the daemon
+/// printed in its log; a login with TOTP on asks for the authenticator code once the password is
+/// right, or a recovery code instead.
 struct GateView: View {
     @Bindable var session: Session
     @State private var password = ""
+    @State private var setupCode = ""
+    @State private var code = ""
+    @State private var needsCode = false
+    @State private var usingRecovery = false
     @State private var trouble: String?
     @State private var working = false
+    /// The daemon's backoff: nothing is sent before this, since it would only extend the wait.
+    @State private var lockedUntil: Date?
 
     private var isSetup: Bool { session.phase == .setup }
 
     /// The daemon's own floor, checked here so setup does not spend a round trip to be told it.
     /// A login is whatever was already chosen, so anything non-empty may be tried.
-    private var longEnough: Bool {
-        isSetup ? password.count >= MIN_PASSWORD_LENGTH : !password.isEmpty
+    private var ready: Bool {
+        if isSetup { return password.count >= MIN_PASSWORD_LENGTH && !blank(setupCode) }
+        return !password.isEmpty && (!needsCode || !blank(code))
+    }
+
+    private func blank(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var prompt: String {
+        if isSetup {
+            return "First visit. Choose the owner password — at least \(MIN_PASSWORD_LENGTH) characters — and enter the setup code from the daemon's log."
+        }
+        if needsCode {
+            return usingRecovery
+                ? "Enter one of the recovery codes you saved when you turned on two-factor sign-in."
+                : "Enter the 6-digit code from your authenticator app."
+        }
+        return "Log in to reach your agents."
     }
 
     var body: some View {
@@ -81,9 +126,7 @@ struct GateView: View {
                 .font(.pageTitle)
                 .foregroundStyle(Theme.ink)
 
-            Text(isSetup
-                 ? "First visit. Choose the owner password — at least \(MIN_PASSWORD_LENGTH) characters."
-                 : "Log in to reach your agents.")
+            Text(prompt)
                 .font(.callout)
                 .foregroundStyle(Theme.muted)
                 .multilineTextAlignment(.center)
@@ -93,15 +136,45 @@ struct GateView: View {
                 .gateField()
                 .onSubmit(submit)
 
+            if isSetup {
+                TextField("setup code", text: $setupCode)
+                    .codeField()
+                    .onSubmit(submit)
+            } else if needsCode {
+                TextField(usingRecovery ? "xxxx-xxxx-xxxx-xxxx" : "123456", text: $code)
+                    .codeField(digits: !usingRecovery)
+                    .onSubmit(submit)
+            }
+
             Button(action: submit) { Text(isSetup ? "Set password" : "Log in").frame(maxWidth: .infinity) }
                 .buttonStyle(.pill(.primary))
                 .controlSize(.large)
-                .disabled(working || !longEnough)
+                .disabled(working || !ready || lockedUntil != nil)
 
-            Button("Use a different daemon") { session.forgetServer() }
+            if let url = session.client?.baseURL { CleartextWarning(url: url) }
+
+            if needsCode && !isSetup {
+                Button(usingRecovery ? "Use the authenticator code" : "Use a recovery code") {
+                    usingRecovery.toggle()
+                    code = ""
+                    trouble = nil
+                }
                 .buttonStyle(.plain)
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(Theme.secondary)
+            }
+
+            Button("Use a different daemon") {
+                needsCode = false
+                usingRecovery = false
+                code = ""
+                setupCode = ""
+                trouble = nil
+                session.forgetServer()
+            }
+            .buttonStyle(.plain)
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(Theme.secondary)
 
             if let trouble {
                 Text(trouble)
@@ -114,18 +187,40 @@ struct GateView: View {
         .frame(maxWidth: 420)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.ground)
+        .task(id: lockedUntil) {
+            guard let lockedUntil else { return }
+            try? await Task.sleep(for: .seconds(max(lockedUntil.timeIntervalSinceNow, 0)))
+            if !Task.isCancelled { self.lockedUntil = nil }
+        }
     }
 
     private func submit() {
-        guard !working, longEnough else { return }
+        guard !working, ready, lockedUntil == nil else { return }
         working = true
         trouble = nil
+        let sentCode = needsCode
         Task {
             do {
-                try await session.enter(password: password)
+                try await session.enter(
+                    password: password,
+                    setupToken: setupCode,
+                    totp: sentCode && !usingRecovery ? code : nil,
+                    recoveryCode: sentCode && usingRecovery ? code : nil
+                )
                 password = ""
+                setupCode = ""
+                code = ""
+                needsCode = false
+                usingRecovery = false
+            } catch SchermesError.totpRequired(let message) {
+                needsCode = true
+                code = ""
+                if sentCode { trouble = message }
+            } catch SchermesError.tooManyAttempts(let wait, let message) {
+                lockedUntil = .now.addingTimeInterval(TimeInterval(wait))
+                trouble = message
             } catch {
-                trouble = error.localizedDescription
+                if !error.isCancellation { trouble = error.localizedDescription }
             }
             working = false
         }
@@ -141,5 +236,19 @@ private extension View {
             .frame(minHeight: 44)
             .background(Theme.panel, in: .rect(cornerRadius: 12))
             .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.ink.opacity(0.12)) }
+    }
+
+    /// A code is pasted or read off another screen: no capitals, no corrections, and on a phone
+    /// the one-time-code keyboard, which offers the code from Passwords.
+    func codeField(digits: Bool = false) -> some View {
+        textFieldStyle(.plain)
+            .autocorrectionDisabled()
+            #if os(iOS)
+            .textInputAutocapitalization(.never)
+            .keyboardType(digits ? .numberPad : .asciiCapable)
+            .textContentType(digits ? .oneTimeCode : nil)
+            #endif
+            .font(.body.monospaced())
+            .gateField()
     }
 }

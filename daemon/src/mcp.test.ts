@@ -6,6 +6,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { MAX_MCP_SERVERS, openMcp, parseMcpServers, stdioArgv } from './mcp.ts';
 import type { MakeTransport, McpServerSpec, McpStdioServer } from './mcp.ts';
+import { SANDBOX } from './agents.ts';
 import type { AgentTarget } from './agents.ts';
 
 const TARGET: AgentTarget = { user: 'agent-alpha', home: '/home/agent-alpha', display: 1 };
@@ -117,10 +118,12 @@ test('a stdio server runs as the agent Linux user, with its env block in front o
   };
   const argv = stdioArgv(spec, TARGET);
 
-  assert.deepEqual(argv.slice(0, 5), [
+  assert.deepEqual(argv.slice(0, 7), [
     '-n',
     '-u',
     'agent-alpha',
+    SANDBOX,
+    'enter',
     'env',
     '--chdir=/home/agent-alpha',
   ]);

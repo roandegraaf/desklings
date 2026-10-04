@@ -3,16 +3,17 @@ import test from 'node:test';
 import { resolve } from 'node:path';
 import { sql } from 'drizzle-orm';
 import { AGENT_STATES } from '@schermes/shared';
-import type { Agent, Message } from '@schermes/shared';
+import type { Agent, Message, Schedule } from '@schermes/shared';
 import { openDb } from './db.ts';
 import { insertApproval, listApprovals } from './approvals.ts';
 import { grantOnce, readRules, updateRules } from './rules.ts';
 import { listGoals } from './goals.ts';
-import { findAgent, insertAgent, insertWorker, listAgents, setAgentState } from './agents.ts';
+import { findAgent, insertAgent, insertWorker, listAgents, renameAgent, setAgentState } from './agents.ts';
 import {
   MAX_AGENT_CHAIN,
   agentChain,
   appendMessage,
+  appendSummary,
   conversationFor,
   deleteConversation,
   existingConversation,
@@ -25,7 +26,12 @@ import {
 } from './conversations.ts';
 import type { Db } from './db.ts';
 import {
+  CALL_CUT_OFF,
+  CHARS_PER_TOKEN,
   COMPACTION_TAIL_CHARS,
+  CUT_OFF,
+  CUT_OFF_AGAIN,
+  IMAGE_RESERVE_TOKENS,
   MAX_FULL_OBSERVATIONS,
   MAX_REPLAYED_IMAGES,
   MAX_TRANSCRIPT_CHARS,
@@ -34,13 +40,16 @@ import {
   TRANSITIONS,
   canTransition,
   compactNow,
+  compactionBudget,
+  contextFullness,
+  overflowBudget,
   createRunner,
   describe,
   reconcileAgents,
   runAgent,
   transcript,
 } from './loop.ts';
-import type { LoopDeps, RunnerDeps } from './loop.ts';
+import type { LoopDeps, RunnerDeps, TurnRunner } from './loop.ts';
 import type { McpSession } from './mcp.ts';
 import { CONTROL_HELD, createControl } from './control.ts';
 import {
@@ -52,10 +61,13 @@ import {
 } from './schedules.ts';
 import { HOME_APPEND, HOME_LOAD, homePrompt, parseHome } from './home.ts';
 import { SNAPSHOTS } from './snapshots.ts';
-import { withoutKey } from './provider.ts';
+import { NO_VISION, ProviderError, openAiProvider, withoutKey } from './provider.ts';
+import { randomBytes } from 'node:crypto';
+import { assignModel, createModel, createProvider, modelConfig } from './models.ts';
 import { STOPPED, WORKER_FAILED } from './loop.ts';
 import { workerPrompt } from './workers.ts';
-import type { ChatReply, Provider, ProviderMessage } from './provider.ts';
+import { enqueueTurn, queuedTurns } from './queue.ts';
+import type { ChatReply, Provider, ProviderMessage, ToolDef } from './provider.ts';
 import type { Exec } from './exec.ts';
 import { BROWSER_HUNG } from './browser.ts';
 import type { Session } from './browser.ts';
@@ -99,11 +111,7 @@ function scriptedProvider(script: Record<string, readonly Partial<ChatReply>[]>)
     used.set(name, index + 1);
     const reply = script[name]?.[index];
     if (reply === undefined) return Promise.reject(new Error('the script ran out of replies'));
-    return Promise.resolve({
-      text: reply.text ?? '',
-      toolCalls: reply.toolCalls ?? [],
-      ...(reply.usage === undefined ? {} : { usage: reply.usage }),
-    });
+    return Promise.resolve({ ...reply, text: reply.text ?? '', toolCalls: reply.toolCalls ?? [] });
   };
   return { provider, seen, offered, summarised };
 }
@@ -618,9 +626,10 @@ test('a conversation that lost nothing is left exactly as it was', async () => {
   assert.deepEqual(f.events().filter((e) => e.type === 'restart'), []);
 });
 
-test('the boot reconcile moves every interrupted agent and no settled one', () => {
+test('the boot reconcile moves every interrupted agent, and every one waiting on nobody, and no settled one', () => {
   const db = openDb(':memory:', MIGRATIONS);
-  const interrupted = ['thinking', 'using_computer', 'using_terminal'];
+  // Nothing was asked and no worker exists, so the two waiting states wait on nobody.
+  const interrupted = ['thinking', 'using_computer', 'using_terminal', 'waiting_for_agent', 'waiting_for_task_worker'];
   const nameFor = (state: string) => state.replaceAll('_', '-');
 
   for (const state of AGENT_STATES) {
@@ -1156,9 +1165,10 @@ test('a spawn above the worker cap is refused with a message that names the cap'
   assert.equal(p.state('alpha'), 'waiting_for_user', 'a refused tool is an observation, not a failure');
 });
 
-test('a turn above the loop cap is refused rather than run', () => {
+test('a turn above the loop cap waits in the queue instead of running', async () => {
   const db = openDb(':memory:', MIGRATIONS);
   const alpha = insertAgent(db, 'alpha') as Agent;
+  const bravo = insertAgent(db, 'bravo') as Agent;
   // A turn that never finishes, so the one loop this runner allows stays taken.
   const runner = createRunner({
     db,
@@ -1173,10 +1183,248 @@ test('a turn above the loop cap is refused rather than run', () => {
   });
 
   assert.equal(runner.atCapacity('alpha'), undefined, 'nothing is running yet');
+  appendMessage(db, conversationFor(db, alpha.id), { role: 'user', content: 'go' });
   runner.start(alpha, conversationFor(db, alpha.id));
   assert.equal(runner.atCapacity('alpha'), undefined, 'an agent already running is not a new loop');
   assert.match(String(runner.atCapacity('bravo')), /at most 1 agent loops can run at once/);
   assert.match(String(runner.atCapacity()), /at most 1 agent loops can run at once/);
+
+  appendMessage(db, conversationFor(db, bravo.id), { role: 'user', content: 'and you' });
+  runner.start(bravo, conversationFor(db, bravo.id), undefined, 'schedule');
+  await tick();
+  assert.equal(runner.running('bravo'), false);
+  assert.deepEqual(
+    queuedTurns(db).map((entry) => [entry.agentId, entry.kind]),
+    [[bravo.id, 'schedule']],
+  );
+});
+
+/** A runner on one loop whose agents answer from a script, and whose `gated` agents' first
+ * call waits for `open()`. Every request is counted by agent. */
+function capped(db: Db, script: Record<string, readonly Partial<ChatReply>[]>, gated: readonly string[] = []) {
+  const { provider: scripted } = scriptedProvider(script);
+  const calls = new Map<string, number>();
+  let open: () => void = () => {};
+  const gate = new Promise<void>((done) => {
+    open = () => done();
+  });
+  const provider: Provider = async (messages, tools, onDelta, signal) => {
+    const name = askedAgent(messages);
+    const count = (calls.get(name) ?? 0) + 1;
+    calls.set(name, count);
+    if (count === 1 && gated.includes(name)) await gate;
+    return scripted(messages, tools, onDelta, signal);
+  };
+  const runner = createRunner({
+    db,
+    exec: fakeExec([]),
+    screen: SCREEN,
+    provider: () => provider,
+    control: createControl(),
+    search: noSearch,
+    mcp: noMcp,
+    maxLoops: 1,
+    maxWorkers: 2,
+  });
+  return { runner, calls, open };
+}
+
+const WAITING_STATES = ['waiting_for_agent', 'waiting_for_task_worker'];
+
+test('at a loop cap of 1, every turn started past the cap runs eventually and nobody is left waiting', async () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const bravo = insertAgent(db, 'bravo') as Agent;
+  const charlie = insertAgent(db, 'charlie') as Agent;
+  const delta = insertAgent(db, 'delta') as Agent;
+  const echo = insertAgent(db, 'echo') as Agent;
+  const { runner, calls, open } = capped(
+    db,
+    {
+      alpha: [{ text: 'the worker says 42' }],
+      bravo: [{ text: 'bravo here' }],
+      charlie: [{ text: 'charlie here' }],
+      delta: [{ text: 'report written' }],
+      echo: [{ text: 'echo done' }],
+      'alpha-w1': [{ text: '42' }],
+    },
+    ['echo'],
+  );
+
+  appendMessage(db, conversationFor(db, echo.id), { role: 'user', content: 'take the loop' });
+  runner.start(echo, conversationFor(db, echo.id));
+  await tick();
+  assert.equal(runner.running('echo'), true, 'echo holds the only loop');
+
+  // Two owner messages, a worker, and a schedule, all while the loop is taken.
+  appendMessage(db, conversationFor(db, bravo.id), { role: 'user', content: 'hello bravo' });
+  runner.start(bravo, conversationFor(db, bravo.id));
+  appendMessage(db, conversationFor(db, charlie.id), { role: 'user', content: 'hello charlie' });
+  runner.start(charlie, conversationFor(db, charlie.id));
+  // Where a spawning turn leaves its agent. Spawning at the cap is refused before a worker
+  // exists, so this one is made the way a spawn in a freer moment would have: its brief stored
+  // and its start asked for. When it runs it holds the only loop, so its report's start on
+  // alpha is the one that used to be dropped.
+  const mine = conversationFor(db, alpha.id);
+  setAgentState(db, 'alpha', 'waiting_for_task_worker');
+  const worker = insertWorker(db, alpha, 'alpha-w1', mine);
+  appendMessage(db, conversationFor(db, worker.id), { role: 'user', content: 'count them', sender: 'alpha' });
+  runner.start(worker, conversationFor(db, worker.id));
+  const job = insertSchedule(db, delta, { cron: '0 8 * * *', prompt: 'write the report' }, Date.now()) as Schedule;
+  assert.equal(runDue(db, runner, job.nextRunAt), 1);
+  assert.deepEqual(queuedTurns(db).map((entry) => entry.kind), ['message', 'message', 'message', 'schedule']);
+
+  open();
+  await quiet(db);
+
+  assert.deepEqual(queuedTurns(db), []);
+  assert.equal(findAgent(db, 'alpha-w1')?.state, 'completed');
+  const said = (agent: Agent) => listMessages(db, conversationFor(db, agent.id)).filter((m) => m.sender === agent.name).map((m) => m.content);
+  assert.deepEqual(said(alpha), ['the worker says 42'], "the worker's report got a turn of its own");
+  assert.deepEqual(said(bravo), ['bravo here']);
+  assert.deepEqual(said(charlie), ['charlie here']);
+  assert.deepEqual(said(delta), ['report written'], 'the schedule got its turn');
+  assert.deepEqual(said(echo), ['echo done']);
+  for (const agent of listAgents(db)) {
+    assert.ok(!WAITING_STATES.includes(agent.state), `${agent.name} was left ${agent.state}`);
+  }
+  assert.equal(findAgent(db, 'alpha')?.state, 'waiting_for_user');
+  assert.equal(calls.get('alpha'), 1);
+});
+
+test('a queued turn survives a restart, and a turn the restart killed is not run again', async () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const bravo = insertAgent(db, 'bravo') as Agent;
+  const charlie = insertAgent(db, 'charlie') as Agent;
+
+  // First daemon: alpha's turn never ends; bravo and charlie wait in line behind it.
+  const first = capped(db, {}, ['alpha']);
+  appendMessage(db, conversationFor(db, alpha.id), { role: 'user', content: 'crash me' });
+  first.runner.start(alpha, conversationFor(db, alpha.id));
+  appendMessage(db, conversationFor(db, bravo.id), { role: 'user', content: 'for bravo' });
+  first.runner.start(bravo, conversationFor(db, bravo.id));
+  appendMessage(db, conversationFor(db, charlie.id), { role: 'user', content: 'for charlie' });
+  first.runner.start(charlie, conversationFor(db, charlie.id));
+  await tick();
+  assert.equal(queuedTurns(db).length, 2);
+
+  // Second daemon: the boot sweep pops bravo, whose turn dies with this daemon too.
+  reconcileAgents(db);
+  const second = capped(db, {}, ['bravo']);
+  second.runner.sweep();
+  await tick();
+  assert.equal(second.runner.running('bravo'), true, 'the oldest entry got the loop');
+  assert.equal(second.calls.get('alpha'), undefined, 'the turn the restart killed is not re-run');
+
+  // Third daemon: charlie is still queued; neither killed turn comes back.
+  reconcileAgents(db);
+  const third = capped(db, { charlie: [{ text: 'charlie answers' }] });
+  third.runner.sweep();
+  await quiet(db);
+  assert.deepEqual([...third.calls.keys()], ['charlie']);
+  assert.equal(listMessages(db, conversationFor(db, charlie.id)).at(-1)?.content, 'charlie answers');
+  assert.deepEqual(queuedTurns(db), []);
+  assert.equal(findAgent(db, 'alpha')?.state, 'waiting_for_user');
+  assert.equal(findAgent(db, 'bravo')?.state, 'waiting_for_user');
+});
+
+test('the sweep queues unread input, skips an agent with no model, and drops an entry with nothing to read', async () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const bravo = insertAgent(db, 'bravo') as Agent;
+  const charlie = insertAgent(db, 'charlie') as Agent;
+  const { provider } = scriptedProvider({ alpha: [{ text: 'read it' }] });
+  const runner = createRunner({
+    db,
+    exec: fakeExec([]),
+    screen: SCREEN,
+    provider: (agent) => (agent.name === 'bravo' ? undefined : provider),
+    control: createControl(),
+    search: noSearch,
+    mcp: noMcp,
+    maxLoops: 1,
+    maxWorkers: 1,
+  });
+  // Stored with no start, the way a dropped turn left it.
+  appendMessage(db, conversationFor(db, alpha.id), { role: 'user', content: 'nobody read this' });
+  appendMessage(db, conversationFor(db, bravo.id), { role: 'user', content: 'no model yet' });
+  // Queued, then its thread cleared while it waited.
+  enqueueTurn(db, charlie.id, conversationFor(db, charlie.id), 'message');
+
+  runner.sweep();
+  await quiet(db);
+
+  assert.equal(listMessages(db, conversationFor(db, alpha.id)).at(-1)?.content, 'read it');
+  assert.equal(findAgent(db, 'bravo')?.state, 'idle', 'no model, no turn: it waits for one');
+  assert.deepEqual(queuedTurns(db), []);
+  assert.equal(findAgent(db, 'charlie')?.state, 'idle', 'nothing to read, so no turn');
+
+  // Read means read: a second sweep over the same rows starts nothing.
+  runner.sweep();
+  await quiet(db);
+  assert.equal(listMessages(db, conversationFor(db, alpha.id)).length, 2);
+});
+
+test('the sweep hands back an agent waiting on nobody and leaves one still waited on', () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  insertAgent(db, 'asker');
+  const stopped = insertAgent(db, 'stopped') as Agent;
+  insertAgent(db, 'patient');
+  const busy = insertAgent(db, 'busy') as Agent;
+  const parent = insertAgent(db, 'parent') as Agent;
+  const done = insertAgent(db, 'done') as Agent;
+  const { runner } = capped(db, {});
+
+  // asker wrote to stopped, whose turn was stopped and never answered.
+  appendMessage(db, conversationFor(db, stopped.id), { role: 'user', content: 'q', sender: 'asker', kind: 'request' });
+  appendMessage(db, conversationFor(db, stopped.id), { role: 'assistant', content: STOPPED, sender: 'stopped' });
+  setAgentState(db, 'asker', 'waiting_for_agent');
+  setAgentState(db, 'stopped', 'waiting_for_user');
+  // patient wrote to busy, which is itself waiting on its worker.
+  appendMessage(db, conversationFor(db, busy.id), { role: 'user', content: 'q', sender: 'patient', kind: 'request' });
+  appendMessage(db, conversationFor(db, busy.id), { role: 'assistant', content: 'on it', sender: 'busy' });
+  setAgentState(db, 'patient', 'waiting_for_agent');
+  setAgentState(db, 'busy', 'waiting_for_task_worker');
+  const working = insertWorker(db, busy, 'busy-w1', conversationFor(db, busy.id));
+  setAgentState(db, working.name, 'using_terminal');
+  // parent's worker is still live; done's worker finished.
+  insertWorker(db, parent, 'parent-w1', conversationFor(db, parent.id));
+  setAgentState(db, 'parent', 'waiting_for_task_worker');
+  const finished = insertWorker(db, done, 'done-w1', conversationFor(db, done.id));
+  setAgentState(db, finished.name, 'completed');
+  setAgentState(db, 'done', 'waiting_for_task_worker');
+
+  runner.sweep();
+
+  assert.equal(findAgent(db, 'asker')?.state, 'waiting_for_user', 'a stopped turn will never answer');
+  assert.equal(findAgent(db, 'patient')?.state, 'waiting_for_agent');
+  assert.equal(findAgent(db, 'busy')?.state, 'waiting_for_task_worker');
+  assert.equal(findAgent(db, 'parent')?.state, 'waiting_for_task_worker');
+  assert.equal(findAgent(db, 'done')?.state, 'waiting_for_user', 'its worker is done');
+});
+
+test('an idle pass that finds the loop taken is ended unrun, never queued', async () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const bravo = insertAgent(db, 'bravo') as Agent;
+  const { runner } = capped(db, {}, ['alpha']);
+  appendMessage(db, conversationFor(db, alpha.id), { role: 'user', content: 'hold the loop' });
+  runner.start(alpha, conversationFor(db, alpha.id));
+  const ended: (number | undefined)[] = [];
+  runner.start(bravo, conversationFor(db, bravo.id), {
+    passId: 1,
+    modelId: null,
+    turnCap: 1,
+    tokenLimit: 1,
+    end: (tokens) => {
+      ended.push(tokens);
+      return Promise.resolve();
+    },
+  });
+  await tick();
+  assert.deepEqual(ended, [undefined]);
+  assert.deepEqual(queuedTurns(db), []);
 });
 
 test('a restart marks a running worker failed and tells its parent', () => {
@@ -1729,6 +1977,237 @@ test('a forced compaction the model refuses is an error and writes no summary', 
     error: 'the model would not summarise the thread for alpha',
   });
   assert.equal(latestSummary(f.db, f.conversationId, 'alpha'), undefined);
+});
+
+// ---------------------------------------------------------------- model capabilities
+
+/** Characters a request puts on the wire as text: every message and the tool schemas as sent. */
+function requestChars(messages: readonly ProviderMessage[], tools: readonly ToolDef[]): number {
+  const text = messages.reduce(
+    (total, m) => total + m.text.length + (m.role === 'assistant' ? JSON.stringify(m.toolCalls).length : 0),
+    0,
+  );
+  return text + JSON.stringify(tools.map((tool) => ({ type: 'function', function: tool }))).length;
+}
+
+test('a model with a 32k context window gets a transcript that fits, and an unknown window keeps the fixed budget', async () => {
+  const WINDOW = 32_768;
+  const run = async (contextWindow: number | null) => {
+    const f = fixture([]);
+    createModel(f.db, { name: 'small', model: 'small', contextWindow });
+    longThread(f.db, f.conversationId, 40, 3_000);
+    const asked: { messages: ProviderMessage[]; tools: readonly ToolDef[] }[] = [];
+    const summarised: string[] = [];
+    const provider: Provider = (messages, tools) => {
+      if (messages[0]?.role === 'system' && messages[0].text === SUMMARY_PROMPT) {
+        summarised.push(messages.map((m) => m.text).join(''));
+        return Promise.resolve({ text: SUMMARY, toolCalls: [] });
+      }
+      asked.push({ messages: [...messages], tools });
+      return Promise.resolve({ text: 'the logs are fine.', toolCalls: [] });
+    };
+    await runAgent({ ...f.deps, provider }, f.agent, f.conversationId);
+    return { f, asked, summarised };
+  };
+
+  const small = await run(WINDOW);
+  assert.equal(small.summarised.length, 1, 'a 120k-character thread does not fit 32k tokens, so it was compacted');
+  const request = small.asked[0];
+  assert.ok(request !== undefined);
+  assertEveryCallAnswered(request.messages);
+  const tokens =
+    requestChars(request.messages, request.tools) / CHARS_PER_TOKEN + 8_192 + MAX_REPLAYED_IMAGES * IMAGE_RESERVE_TOKENS;
+  assert.ok(tokens <= WINDOW, `the request, its tools and the reply reserve fit the window (${Math.round(tokens)})`);
+  assert.ok(
+    String(small.summarised[0]).length / CHARS_PER_TOKEN + 8_192 <= WINDOW,
+    'and so does the summariser request',
+  );
+  const budget = compactionBudget(WINDOW);
+  assert.ok(budget.transcript < MAX_TRANSCRIPT_CHARS && budget.tail < budget.transcript);
+  assert.ok(contextFullness(small.f.db, small.f.agent) <= 100);
+
+  const unknown = await run(null);
+  assert.deepEqual(unknown.summarised, [], 'the same thread is well under the fixed budget');
+  assert.deepEqual(compactionBudget(null), {
+    transcript: MAX_TRANSCRIPT_CHARS,
+    tail: COMPACTION_TAIL_CHARS,
+    summary: 16_000,
+  });
+  assert.equal(compactionBudget(10_000_000).transcript, MAX_TRANSCRIPT_CHARS, 'a huge window is capped');
+});
+
+test('a context overflow compacts between turns, asks again, and keeps a message that landed mid-turn', async () => {
+  // Two steps before the overflow, so there is a boundary inside this turn, after the arrival,
+  // that a cut chosen on size alone would take on a window this small.
+  const diskCall = { id: 'c3', name: 'run_command', arguments: '{"command":"df -h"}' };
+  let calls = 0;
+  const summarised: string[] = [];
+  const asked: ProviderMessage[][] = [];
+  const provider: Provider = (messages) => {
+    if (messages[0]?.role === 'system' && messages[0].text === SUMMARY_PROMPT) {
+      summarised.push(messages[1]?.text ?? '');
+      return Promise.resolve({ text: SUMMARY, toolCalls: [] });
+    }
+    calls += 1;
+    asked.push([...messages]);
+    if (calls === 1) return Promise.resolve({ text: '', toolCalls: [commandCall] });
+    if (calls === 2) return Promise.resolve({ text: '', toolCalls: [diskCall] });
+    if (calls === 3) {
+      return Promise.reject(
+        new ProviderError('provider returned HTTP 400: context_length_exceeded', false, 400, undefined, true),
+      );
+    }
+    return Promise.resolve({ text: 'done.', toolCalls: [] });
+  };
+  let landed = false;
+  const f = fixture([], noSearch, noMcp, (argv) => {
+    if (!landed && argv.includes('uname -a')) {
+      landed = true;
+      appendMessage(f.db, f.conversationId, { role: 'user', content: 'also check the disk' });
+    }
+  });
+  createModel(f.db, { name: 'small', model: 'small', contextWindow: 16_000 });
+  longThread(f.db, f.conversationId, 6, 1_000);
+  f.ask('go on');
+  const since = lastMessageId(f.db);
+
+  await runAgent({ ...f.deps, provider }, f.agent, f.conversationId);
+
+  assert.equal(calls, 4, 'the overflowing step was asked once more');
+  assert.equal(summarised.length, 2, 'the turn-start compaction, then one forced one');
+  assert.equal(f.messages().at(-1)?.content, 'done.');
+  assert.equal(f.state(), 'waiting_for_user');
+  const retry = asked[3] as ProviderMessage[];
+  assert.match(String(retry[1]?.text), new RegExp(`summarised:\\n${SUMMARY}$`));
+  assertEveryCallAnswered(retry);
+  assertNoOrphanResult(retry);
+  assert.ok(
+    retry.some((m) => m.role === 'tool' && m.toolCallId === commandCall.id) &&
+      retry.some((m) => m.role === 'tool' && m.toolCallId === diskCall.id),
+    "the turn's own calls and results stay in the tail",
+  );
+
+  const summary = latestSummary(f.db, f.conversationId, 'alpha');
+  assert.ok(Number(summary?.throughMessageId) <= since, 'the cut is before this turn began');
+  assert.ok(landed);
+  f.ask('anything else?');
+  const next = scriptedProvider({ alpha: [{ text: 'disk is fine.' }] });
+  await runAgent({ ...f.deps, provider: next.provider }, f.agent, f.conversationId);
+  assert.ok(
+    (next.seen[0] ?? []).some((m) => m.text.includes('also check the disk')),
+    'the message that landed mid-turn is still replayed',
+  );
+});
+
+test('a second context overflow in one turn fails it, after a single forced compaction', async () => {
+  const f = fixture([]);
+  longThread(f.db, f.conversationId, 6, 1_000);
+  f.ask('go on');
+  let summaries = 0;
+  const provider: Provider = (messages) => {
+    if (messages[0]?.role === 'system' && messages[0].text === SUMMARY_PROMPT) {
+      summaries += 1;
+      return Promise.resolve({ text: SUMMARY, toolCalls: [] });
+    }
+    return Promise.reject(new ProviderError('maximum context length', false, 400, undefined, true));
+  };
+
+  await runAgent({ ...f.deps, provider }, f.agent, f.conversationId);
+
+  assert.equal(summaries, 1);
+  assert.equal(f.state(), 'failed');
+  assert.match(String(f.messages().at(-1)?.content), new RegExp(`^${RUN_FAILED}: maximum context length`));
+});
+
+test('a summary written under a bigger budget still leaves the summariser request inside a small window', async () => {
+  const f = fixture([]);
+  createModel(f.db, { name: 'small', model: 'small', contextWindow: 32_768 });
+  longThread(f.db, f.conversationId, 3, 1_000);
+  appendSummary(f.db, {
+    conversationId: f.conversationId,
+    sender: 'alpha',
+    content: 'y'.repeat(16_000),
+    fromMessageId: 1,
+    throughMessageId: lastMessageId(f.db),
+  });
+  longThread(f.db, f.conversationId, 6, 1_000, { label: 'B' });
+  f.ask('go on');
+  const bodies: string[] = [];
+  let calls = 0;
+  const provider: Provider = (messages) => {
+    if (messages[0]?.role === 'system' && messages[0].text === SUMMARY_PROMPT) {
+      bodies.push(messages.map((m) => m.text).join(''));
+      return Promise.resolve({ text: SUMMARY, toolCalls: [] });
+    }
+    calls += 1;
+    return calls === 1
+      ? Promise.reject(new ProviderError('context_length_exceeded', false, 400, undefined, true))
+      : Promise.resolve({ text: 'done.', toolCalls: [] });
+  };
+
+  await runAgent({ ...f.deps, provider }, f.agent, f.conversationId);
+
+  const forced = overflowBudget(compactionBudget(32_768));
+  assert.equal(bodies.length, 1);
+  assert.ok(String(bodies[0]).length <= forced.transcript, `${String(bodies[0]).length} <= ${forced.transcript}`);
+  assert.equal(f.messages().at(-1)?.content, 'done.');
+});
+
+test('an agent with screenshots in its history keeps working after it switches to a model without vision', async () => {
+  const f = fixture([]);
+  const key = randomBytes(32);
+  const endpoint = createProvider(f.db, key, { name: 'stub', baseUrl: 'http://stub/v1', apiKey: 'k' });
+  const sees = createModel(f.db, { name: 'sees', providerId: endpoint.id, model: 'sees' });
+  const blind = createModel(f.db, { name: 'blind', providerId: endpoint.id, model: 'blind', vision: false });
+  assignModel(f.db, 'alpha', sees.id);
+
+  type Body = { model: string; messages: { content: unknown }[] };
+  const bodies: Body[] = [];
+  const hasImage = (body: Body) =>
+    body.messages.some((m) => Array.isArray(m.content) && m.content.some((part: { type?: string }) => part.type === 'image_url'));
+  const json = (status: number, payload: unknown) =>
+    new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } });
+  const original = globalThis.fetch;
+  globalThis.fetch = (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as Body;
+    bodies.push(body);
+    if (body.model === 'blind' && hasImage(body)) {
+      return Promise.resolve(json(400, { error: { message: 'this model does not support image input' } }));
+    }
+    const shoot = body.messages.length === 2;
+    const message = shoot
+      ? { content: '', tool_calls: [{ id: 'shot', type: 'function', function: { name: 'computer', arguments: '{"action":"screenshot"}' } }] }
+      : { content: 'looked.' };
+    return Promise.resolve(json(200, { choices: [{ message }] }));
+  };
+  try {
+    const turn = async (id: number) => {
+      const settings = modelConfig(f.db, key, id);
+      assert.ok(settings !== undefined);
+      await runAgent({ ...f.deps, provider: openAiProvider(settings) }, f.agent, f.conversationId);
+    };
+    f.ask('look at the screen');
+    await turn(sees.id);
+    assert.equal(f.messages().at(-1)?.content, 'looked.');
+    assert.ok(hasImage(bodies.at(-1) as Body), 'a model that sees is sent the screenshot');
+
+    assert.equal(modelConfig(f.db, key, blind.id)?.vision, false);
+    assignModel(f.db, 'alpha', blind.id);
+    f.ask('and now?');
+    const before = bodies.length;
+    await turn(blind.id);
+
+    assert.equal(f.state(), 'waiting_for_user');
+    assert.equal(f.messages().at(-1)?.content, 'looked.');
+    const sent = bodies.slice(before);
+    assert.ok(sent.length > 0 && sent.every((body) => body.model === 'blind' && !hasImage(body)), 'no image_url part');
+    assert.ok(
+      sent[0]?.messages.some((m) => typeof m.content === 'string' && m.content.includes(NO_VISION)),
+      'the screenshot is a line of text saying why it is missing',
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 // ---------------------------------------------------------------- scheduled tasks
@@ -2399,6 +2878,7 @@ test('a lead keeps a goal, brings in both kinds of helper, and finishing removes
       return Promise.resolve('started' as const);
     },
     stop: (name: string) => (desktop.push(`stop ${name}`), Promise.resolve()),
+    remove: (name: string) => (desktop.push(`remove ${name}`), Promise.resolve()),
     stopDisplay: (name: string, display: number) => (desktop.push(`stopDisplay ${name} :${display}`), Promise.resolve()),
     rename: () => Promise.resolve(),
   };
@@ -2498,7 +2978,7 @@ test('a lead keeps a goal, brings in both kinds of helper, and finishing removes
   await ask('finish it');
   assert.equal(findAgent(p.db, helper), undefined, 'the temporary agent is gone');
   assert.ok(listMessages(p.db, owner).some((m) => m.sender === helper && m.content === 'drafted'), 'its answer stays in the lead\'s thread');
-  assert.ok(desktop.includes(`stop ${helper}`));
+  assert.ok(desktop.includes(`remove ${helper}`));
   assert.ok(desktop.includes(`stopDisplay alpha :${worker.display}`), 'only the worker\'s own display is stopped');
   assert.ok(!desktop.includes('stop alpha'));
   const kept = findAgent(p.db, 'alpha-w1') as Agent;
@@ -2506,4 +2986,362 @@ test('a lead keeps a goal, brings in both kinds of helper, and finishing removes
   assert.ok(listMessages(p.db, owner).some((m) => m.sender === 'alpha-w1' && m.content === 'the page loads'), 'its report stays in the lead\'s thread');
   assert.match(String(listMessages(p.db, owner).find((m) => m.toolCallId === 'f1')?.content), /^Goal 1: Ship the site \(done\)/);
   assert.deepEqual(listNeedsYou(p.db).filter((needs) => needs.kind === 'goal'), [], 'a done goal needs nothing');
+});
+
+/** Rejects when `work` has not settled within `ms`, so a turn that ignores a stop fails the test
+ * instead of hanging the run. */
+async function settlesWithin<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`still running after ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([work, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** A provider call that only ends when the turn is stopped. */
+const untilAborted = (signal: AbortSignal | undefined): Promise<ChatReply> =>
+  new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
+
+test('a set_name rename mid-drain runs the next round under the new name and never a second turn', async () => {
+  const db = openDb(':memory:', MIGRATIONS);
+  const alpha = insertAgent(db, 'alpha') as Agent;
+  const conversationId = conversationFor(db, alpha.id);
+  const { provider: scripted, seen } = scriptedProvider({
+    alpha: [{ toolCalls: [{ id: 'n1', name: 'set_name', arguments: '{"name":"bravo"}' }] }, { text: 'From now on, bravo.' }],
+    bravo: [{ text: 'Bravo here.' }],
+  });
+  let inFlight = 0;
+  let most = 0;
+  let calls = 0;
+  const provider: Provider = async (messages, tools, onDelta, signal) => {
+    calls += 1;
+    if (calls === 1) appendMessage(db, conversationId, { role: 'user', content: 'Still there?' });
+    inFlight += 1;
+    most = Math.max(most, inFlight);
+    await tick();
+    try {
+      return await scripted(messages, tools, onDelta, signal);
+    } finally {
+      inFlight -= 1;
+    }
+  };
+  let runner: TurnRunner | undefined;
+  let startedUnderNewName = false;
+  const rename = (agent: Agent, name: string): Promise<void> => {
+    const moved = renameAgent(db, agent, name);
+    assert.equal(runner?.running('bravo'), true, 'the turn in flight is found under the new name');
+    runner?.start(moved, conversationId);
+    startedUnderNewName = true;
+    return Promise.resolve();
+  };
+  runner = createRunner({
+    db,
+    exec: fakeExec([]),
+    screen: SCREEN,
+    provider: () => provider,
+    control: createControl(),
+    search: noSearch,
+    mcp: noMcp,
+    rename,
+    ...CAPS,
+  });
+  appendMessage(db, conversationId, { role: 'user', content: 'Call yourself bravo.' });
+  runner.start(alpha, conversationId);
+  await quiet(db);
+
+  assert.ok(startedUnderNewName);
+  assert.equal(most, 1, 'one turn at a time');
+  assert.equal(askedAgent(seen.at(-1) ?? []), 'bravo', "the next round's system prompt carries the new name");
+  assert.deepEqual(
+    listMessages(db, conversationId).filter((m) => m.role === 'assistant').map((m) => [m.sender, m.content]),
+    [['bravo', ''], ['bravo', 'From now on, bravo.'], ['bravo', 'Bravo here.']],
+  );
+  assert.equal(findAgent(db, 'bravo')?.state, 'waiting_for_user');
+  assert.equal(runner.running('bravo'), false);
+  assert.deepEqual(queuedTurns(db), []);
+});
+
+test('a stop while the summariser is writing ends the turn within moments and stores no summary', async () => {
+  const f = fixture([]);
+  longThread(f.db, f.conversationId, LONG_TURNS, TURN_CHARS);
+  f.ask('and now?');
+  let summarising: () => void = () => {};
+  const asked = new Promise<void>((done) => {
+    summarising = done;
+  });
+  let agentCalls = 0;
+  const provider: Provider = (messages, _t, _d, signal) => {
+    if (messages[0]?.role === 'system' && messages[0].text === SUMMARY_PROMPT) {
+      summarising();
+      return untilAborted(signal);
+    }
+    agentCalls += 1;
+    return Promise.resolve({ text: 'never asked for', toolCalls: [] });
+  };
+  const controller = new AbortController();
+  const turn = runAgent({ ...f.deps, provider, signal: controller.signal }, f.agent, f.conversationId);
+  await settlesWithin(asked, 2_000);
+  controller.abort(new Error('stopped by the owner'));
+  await settlesWithin(turn, 2_000);
+
+  assert.equal(f.state(), 'waiting_for_user');
+  assert.equal(f.messages().at(-1)?.content, STOPPED);
+  assert.equal(latestSummary(f.db, f.conversationId, 'alpha'), undefined, 'no summary row, half-written or whole');
+  assert.equal(agentCalls, 0, 'the model was never asked to go on');
+  assert.ok(f.events().some((e) => e.type === 'stop'));
+  assert.ok(!f.events().some((e) => e.type === 'failure'));
+});
+
+/** An exec whose workspace snapshot only finishes on `finish()`, or never when it is not called;
+ * it ignores the stop, the worst case for a turn waiting on it. Everything else runs at once. */
+function slowSnapshot(ran: string[][], order: string[]) {
+  let finish: () => void = () => {};
+  const done = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const fast = fakeExec(ran);
+  const exec: Exec = async (file, args, options) => {
+    if (args.includes(SNAPSHOTS)) {
+      order.push('snapshot started');
+      await done;
+      order.push('snapshot done');
+      return { code: 0, stdout: Buffer.alloc(0), stderr: '', truncated: false };
+    }
+    if (args.some((arg) => arg.includes('uname -a'))) order.push('run_command');
+    return fast(file, args, options);
+  };
+  return { exec, finish };
+}
+
+test('the first model call does not wait for the snapshot, and the first tool call does', async () => {
+  const f = fixture([]);
+  const order: string[] = [];
+  const { exec, finish } = slowSnapshot(f.ran, order);
+  const { provider: scripted } = scriptedProvider({ alpha: [{ toolCalls: [commandCall] }, { text: 'done' }] });
+  const provider: Provider = (messages, tools, onDelta, signal) => {
+    order.push('model');
+    return scripted(messages, tools, onDelta, signal);
+  };
+  f.ask('go');
+  const turn = runAgent({ ...f.deps, exec, provider }, f.agent, f.conversationId);
+  for (let attempt = 0; attempt < 100 && !order.includes('model'); attempt += 1) await tick();
+  await tick();
+  assert.deepEqual(order, ['snapshot started', 'model'], 'the model was asked while the snapshot ran, and no tool ran yet');
+  finish();
+  await settlesWithin(turn, 2_000);
+
+  assert.deepEqual(order, ['snapshot started', 'model', 'snapshot done', 'run_command', 'model']);
+  assert.equal(f.state(), 'waiting_for_user');
+});
+
+test('a configured MCP server starts only once the snapshot is done', async () => {
+  const order: string[] = [];
+  const mcp: LoopDeps['mcp'] = async (_agent, homeReady) => {
+    await homeReady();
+    order.push('mcp started');
+    return undefined;
+  };
+  const f = fixture([{ text: 'done' }], noSearch, mcp);
+  const { exec, finish } = slowSnapshot(f.ran, order);
+  f.ask('go');
+  const turn = runAgent({ ...f.deps, exec }, f.agent, f.conversationId);
+  await tick();
+  assert.deepEqual(order, ['snapshot started']);
+  finish();
+  await settlesWithin(turn, 2_000);
+  assert.deepEqual(order, ['snapshot started', 'snapshot done', 'mcp started']);
+});
+
+test('a stop while a tool waits on a snapshot that never returns lands within seconds', async () => {
+  const f = fixture([]);
+  const order: string[] = [];
+  const { exec } = slowSnapshot(f.ran, order);
+  let runner: TurnRunner | undefined;
+  const { provider: scripted } = scriptedProvider({ alpha: [{ toolCalls: [commandCall] }, { text: 'never asked for' }] });
+  const provider: Provider = async (messages, tools, onDelta, signal) => {
+    const reply = await scripted(messages, tools, onDelta, signal);
+    setTimeout(() => runner?.stop('alpha'), 20);
+    return reply;
+  };
+  runner = createRunner({ ...f.deps, exec, provider: () => provider, maxLoops: 4 });
+  f.ask('go');
+  const started = Date.now();
+  runner.start(f.agent, f.conversationId);
+  while (runner.running('alpha') && Date.now() - started < 4_000) await tick();
+
+  assert.equal(runner.running('alpha'), false, 'the loop was let go within seconds');
+  assert.equal(f.state(), 'waiting_for_user');
+  const rows = f.messages();
+  assert.deepEqual(rows.map((m) => m.role), ['user', 'assistant', 'tool', 'assistant']);
+  assert.equal(rows[2]?.content, 'error: stopped by the owner');
+  assert.equal(rows.at(-1)?.content, STOPPED);
+  assert.ok(!order.includes('run_command'), 'the command never ran over a home with no snapshot');
+  assert.ok(!f.events().some((e) => e.type === 'failure'));
+});
+
+test('a reply cut off at the token limit is kept, marked and delivered as cut off', async () => {
+  const f = fixture([{ text: 'The three causes are: first', finish: 'length' }]);
+  const delivered: string[] = [];
+  f.ask('why did it fail?');
+  await runAgent({ ...f.deps, deliver: (_agent, _thread, text) => delivered.push(text) }, f.agent, f.conversationId);
+  assert.equal(f.messages().at(-1)?.content, `The three causes are: first${CUT_OFF}`);
+  assert.deepEqual(delivered, [`The three causes are: first${CUT_OFF}`]);
+  assert.equal(f.state(), 'waiting_for_user');
+
+  const empty = fixture([{ text: '', finish: 'length' }]);
+  empty.ask('think hard');
+  await runAgent(empty.deps, empty.agent, empty.conversationId);
+  assert.equal(empty.messages().at(-1)?.content, CUT_OFF, 'a reasoning model that spent it all thinking is cut off, not silent');
+});
+
+const halfCall = { id: 'c9', name: 'run_command', arguments: '{"command":"rm -rf /tmp/scratch' };
+
+test('a tool call cut off at the token limit is answered but never run, and the model is asked again', async () => {
+  const f = fixture([{ toolCalls: [halfCall], finish: 'length' }, { toolCalls: [commandCall] }, { text: 'done.' }]);
+  f.ask('clean up');
+  await runAgent(f.deps, f.agent, f.conversationId);
+
+  assert.ok(!f.ran.some((argv) => argv.join(' ').includes('rm -rf')), 'the cut-off call never ran');
+  assert.ok(tooling(f.ran).some((argv) => argv.join(' ').includes('uname -a')), 'the one asked next did');
+  const stored = f.messages();
+  const asked = stored.find((m) => m.toolCalls?.[0]?.id === halfCall.id);
+  assert.equal(asked?.toolCalls?.[0]?.arguments, '{}', 'no partial JSON is replayed');
+  assert.equal(stored.find((m) => m.toolCallId === halfCall.id)?.content, CALL_CUT_OFF);
+  const retry = f.seen[1] as ProviderMessage[];
+  assertEveryCallAnswered(retry);
+  assert.ok(retry.some((m) => m.role === 'tool' && m.text === CALL_CUT_OFF));
+  assert.ok(f.events().some((e) => e.type === 'tool_result' && e.data['callId'] === halfCall.id && e.data['ok'] === false));
+  assert.equal(stored.at(-1)?.content, 'done.');
+  assert.equal(f.state(), 'waiting_for_user');
+});
+
+test('a second cut-off tool call in one turn fails it, with every call still answered', async () => {
+  const f = fixture([
+    { toolCalls: [halfCall], finish: 'length' },
+    { toolCalls: [{ ...halfCall, id: 'c10' }], finish: 'length' },
+  ]);
+  f.ask('clean up');
+  await runAgent(f.deps, f.agent, f.conversationId);
+
+  assert.equal(f.seen.length, 2, 'asked again once, not a third time');
+  assert.ok(!f.ran.some((argv) => argv.join(' ').includes('rm -rf')));
+  assert.equal(f.state(), 'failed');
+  const stored = f.messages();
+  assert.equal(stored.at(-1)?.content, `${RUN_FAILED}: ${CUT_OFF_AGAIN}`);
+  assert.deepEqual(
+    stored.slice(-3, -1).map((m) => [m.role, m.toolCalls?.[0]?.id ?? m.toolCallId]),
+    [['assistant', 'c10'], ['tool', 'c10']],
+  );
+});
+
+test('summariser tokens count toward the turn and the idle budget, from both summaries a turn can write', async () => {
+  const f = fixture([]);
+  createModel(f.db, { name: 'small', model: 'small', contextWindow: 16_000 });
+  longThread(f.db, f.conversationId, 6, 1_000);
+  f.ask('go on');
+  let calls = 0;
+  let summaries = 0;
+  const provider: Provider = (messages) => {
+    if (messages[0]?.role === 'system' && messages[0].text === SUMMARY_PROMPT) {
+      summaries += 1;
+      return Promise.resolve({ text: SUMMARY, toolCalls: [], usage: { promptTokens: 1_000, completionTokens: 100 } });
+    }
+    calls += 1;
+    const usage = { promptTokens: 50, completionTokens: 5 };
+    if (calls === 1) return Promise.resolve({ text: '', toolCalls: [commandCall], usage });
+    if (calls === 2) return Promise.reject(new ProviderError('context_length_exceeded', false, 400, undefined, true));
+    return Promise.resolve({ text: 'done.', toolCalls: [], usage });
+  };
+  let ended: number | undefined;
+  const idle = { passId: 0, modelId: null, turnCap: 10, tokenLimit: 1_000_000, end: (tokens: number | undefined) => {
+    ended = tokens;
+    return Promise.resolve();
+  } };
+
+  await runAgent({ ...f.deps, provider, idle }, f.agent, f.conversationId);
+
+  assert.equal(summaries, 2, 'the turn-start compaction, then the forced one');
+  const turn = f.events().findLast((e) => e.type === 'turn');
+  assert.deepEqual(turn?.data, { steps: 2, summaries: 2, promptTokens: 2_100, completionTokens: 210 });
+  assert.equal(ended, 2_310);
+});
+
+test("the owner's compaction answers what its summary cost", async () => {
+  const f = fixture([]);
+  longThread(f.db, f.conversationId, 3, 100);
+  const provider: Provider = () =>
+    Promise.resolve({ text: SUMMARY, toolCalls: [], usage: { promptTokens: 700, completionTokens: 70 } });
+  const result = await compactNow({ db: f.db, provider }, f.agent, f.conversationId);
+  assert.deepEqual(result, { covered: f.messages().length, usage: { promptTokens: 700, completionTokens: 70 } });
+});
+
+test('a mid-turn switch to a backup with a smaller window compacts to the backup budget before the next step', async () => {
+  const run = async (backup: boolean) => {
+    const f = fixture([]);
+    createModel(f.db, { name: 'big', model: 'big', contextWindow: null });
+    const small = createModel(f.db, { name: 'small', model: 'small', contextWindow: 16_000 });
+    longThread(f.db, f.conversationId, 6, 1_000);
+    f.ask('go on');
+    const asked: ProviderMessage[][] = [];
+    let summaries = 0;
+    const tag = backup ? { modelId: small.id } : {};
+    const provider: Provider = (messages) => {
+      if (messages[0]?.role === 'system' && messages[0].text === SUMMARY_PROMPT) {
+        summaries += 1;
+        return Promise.resolve({ text: SUMMARY, toolCalls: [] });
+      }
+      asked.push([...messages]);
+      return Promise.resolve(
+        asked.length === 1 ? { text: '', toolCalls: [commandCall], ...tag } : { text: 'done.', toolCalls: [], ...tag },
+      );
+    };
+    await runAgent({ ...f.deps, provider }, f.agent, f.conversationId);
+    return { f, asked, summaries };
+  };
+
+  const switched = await run(true);
+  assert.equal(switched.summaries, 1, 'the big default needed none, the small backup did');
+  assert.doesNotMatch(String(switched.asked[0]?.[1]?.text), /summarised:/);
+  assert.match(String(switched.asked[1]?.[1]?.text), new RegExp(`summarised:\\n${SUMMARY}$`));
+  assertEveryCallAnswered(switched.asked[1] as ProviderMessage[]);
+  assert.equal(switched.f.messages().at(-1)?.content, 'done.');
+
+  const stayed = await run(false);
+  assert.equal(stayed.summaries, 0, 'without a switch the big budget holds');
+});
+
+test("an overflow on the backup's first call compacts to the backup's budget, not a quarter of the primary's", async () => {
+  const run = async (tagged: boolean) => {
+    const f = fixture([]);
+    createModel(f.db, { name: 'big', model: 'big', contextWindow: null });
+    const small = createModel(f.db, { name: 'small', model: 'small', contextWindow: 16_000 });
+    longThread(f.db, f.conversationId, 6, 1_000);
+    f.ask('go on');
+    const asked: ProviderMessage[][] = [];
+    const provider: Provider = (messages) => {
+      if (messages[0]?.role === 'system' && messages[0].text === SUMMARY_PROMPT) {
+        return Promise.resolve({ text: SUMMARY, toolCalls: [] });
+      }
+      asked.push([...messages]);
+      if (asked.length === 1) {
+        const refused = new ProviderError('context_length_exceeded', false, 400, undefined, true);
+        if (tagged) refused.modelId = small.id;
+        return Promise.reject(refused);
+      }
+      return Promise.resolve({ text: 'done.', toolCalls: [] });
+    };
+    await runAgent({ ...f.deps, provider }, f.agent, f.conversationId);
+    const verbatim = (asked[1] ?? []).filter((m) => m.role === 'assistant' && m.text.startsWith('(A')).length;
+    return { f, verbatim };
+  };
+
+  const backup = await run(true);
+  assert.equal(backup.f.messages().at(-1)?.content, 'done.');
+  assert.ok(backup.verbatim <= 1, `the small window keeps at most the last turn verbatim (${backup.verbatim})`);
+  const primary = await run(false);
+  assert.ok(primary.verbatim > backup.verbatim, `a quarter of the big budget keeps more (${primary.verbatim})`);
 });

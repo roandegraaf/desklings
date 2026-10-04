@@ -273,8 +273,8 @@ export function requestDeletionToolDef(): ToolDef {
       'Ask the owner to delete an agent (yours or another), or the thread you are in. Nothing ' +
       'is deleted by this call: the owner is shown the request and answers it, and the answer ' +
       'arrives here as a message later. Ask only when you were told to, or when you are sure ' +
-      'the thing is finished with — a deleted agent takes its threads, routines and history ' +
-      'with it, and this cannot be undone.',
+      'the thing is finished with — a deleted agent takes its threads, routines, history, home ' +
+      'and installed software with it, and this cannot be undone.',
     parameters: {
       type: 'object',
       properties: {

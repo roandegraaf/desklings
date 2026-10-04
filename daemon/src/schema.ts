@@ -1,16 +1,44 @@
-import { index, integer, primaryKey, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
 
 /** Single-row table: schermes has one owner, not a user list. */
 export const owner = sqliteTable('owner', {
   id: integer('id').primaryKey(),
   passwordHash: text('password_hash').notNull(),
   createdAt: integer('created_at').notNull(),
+  /** Encrypted with the master key, like every other secret. */
+  totpSecret: text('totp_secret'),
+  /** An enrolment not yet confirmed with a code; never used to log in. */
+  totpPending: text('totp_pending'),
+  /** The newest 30 s step a code was accepted for, so no step is accepted twice. */
+  totpLastStep: integer('totp_last_step'),
 });
+
+/** SHA-256 of each unspent recovery code. A spent one is deleted. */
+export const recoveryCodes = sqliteTable('recovery_codes', {
+  hash: text('hash').primaryKey(),
+  createdAt: integer('created_at').notNull(),
+});
+
+export const auditEvents = sqliteTable(
+  'audit_events',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    at: integer('at').notNull(),
+    action: text('action').notNull(),
+    ip: text('ip'),
+    userAgent: text('user_agent'),
+    /** Small JSON: names and handles, never a value the owner typed. */
+    detail: text('detail'),
+  },
+  (table) => [index('audit_events_at').on(table.at)],
+);
 
 export const sessions = sqliteTable('sessions', {
   id: text('id').primaryKey(),
   createdAt: integer('created_at').notNull(),
   expiresAt: integer('expires_at').notNull(),
+  lastSeenAt: integer('last_seen_at'),
+  userAgent: text('user_agent'),
 });
 
 export const settings = sqliteTable('settings', {
@@ -42,6 +70,9 @@ export const models = sqliteTable('models', {
   model: text('model').notNull(),
   // A JSON object merged under every request body, or empty.
   extraBody: text('extra_body').notNull().default(''),
+  // In tokens; null is unknown, and compaction then falls back to its fixed character budget.
+  contextWindow: integer('context_window'),
+  vision: integer('vision', { mode: 'boolean' }).notNull().default(true),
   createdAt: integer('created_at').notNull(),
 });
 
@@ -74,8 +105,28 @@ export const agents = sqliteTable('agents', {
   parentId: integer('parent_id'),
   parentConversationId: integer('parent_conversation_id'),
   answeredThrough: integer('answered_through').notNull().default(0),
+  // The newest message id a turn of this agent has started from. What lies past it, and past
+  // the agent's own last word, is input nobody has read yet.
+  readThrough: integer('read_through').notNull().default(0),
   createdAt: integer('created_at').notNull(),
 });
+
+/** Turns waiting for a free loop. Keyed by the agent's id, so a rename cannot strand one. */
+export const turnQueue = sqliteTable(
+  'turn_queue',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    agentId: integer('agent_id')
+      .notNull()
+      .references(() => agents.id),
+    conversationId: integer('conversation_id')
+      .notNull()
+      .references(() => conversations.id),
+    kind: text('kind').notNull(),
+    createdAt: integer('created_at').notNull(),
+  },
+  (table) => [uniqueIndex('turn_queue_agent_conversation_idx').on(table.agentId, table.conversationId)],
+);
 
 /** A thread: one agent and the owner. The agent lives in `conversation_participants`. */
 export const conversations = sqliteTable('conversations', {
@@ -110,12 +161,17 @@ export const messages = sqliteTable(
     // JSON, written only on assistant rows that asked for tools.
     toolCalls: text('tool_calls'),
     toolCallId: text('tool_call_id'),
-    // JSON: the base64 PNG a screenshot observation carries.
+    // Legacy JSON `{mediaType, base64}`, from before images moved to files. Nulled by the boot move.
     image: text('image'),
+    // JSON `{mediaType, sha256}` naming a file under the data volume's `images/`, or
+    // `{mediaType, expired: true}` once pruned. At most one of `image` and `image_ref` is set.
+    imageRef: text('image_ref'),
     kind: text('kind'),
+    // JSON: what the endpoint wants back verbatim on a replayed assistant row, never sent to clients.
+    echo: text('echo'),
     createdAt: integer('created_at').notNull(),
   },
-  (table) => [index('messages_conversation_id_idx').on(table.conversationId)],
+  (table) => [index('messages_conversation_id_idx').on(table.conversationId), index('messages_sender_idx').on(table.sender)],
 );
 
 /**
@@ -250,6 +306,17 @@ export const formVault = sqliteTable(
   },
   (table) => [primaryKey({ columns: [table.agentId, table.origin] })],
 );
+
+/** Secret values the owner typed into a form for an agent, newest last, kept so they stay hidden
+ * from its tool results across a restart. A JSON array encrypted with the master key; never read
+ * back by a route or used to fill anything. */
+export const hiddenValues = sqliteTable('hidden_values', {
+  agentId: integer('agent_id')
+    .primaryKey()
+    .references(() => agents.id),
+  values: text('values').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+});
 
 /** The owner's thumbs on an agent's reply: one row per message, replaced on change. `created_at`
  * is the last change, so a pass that looks for new feedback finds a changed mind too. */

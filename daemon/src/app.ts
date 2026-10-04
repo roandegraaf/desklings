@@ -5,6 +5,13 @@ import { MIN_PASSWORD_LENGTH } from '@schermes/shared';
 import type {
   Agent,
   Approval,
+  AuditAction,
+  AuditEvent,
+  LoginError,
+  SessionEntry,
+  TotpConfirmed,
+  TotpSetup,
+  TotpStatus,
   CompactResult,
   Conversation,
   FileChanges,
@@ -34,15 +41,39 @@ import {
   SESSION_COOKIE,
   checkPassword,
   claimOwner,
+  clientIp,
+  createLoginGuard,
+  newSetupToken,
+  tokenMatches,
   dropSession,
   issueSession,
   ownerExists,
   sessionValid,
 } from './auth.ts';
+import type { LoginGuard } from './auth.ts';
 import {
+  AUDIT_PAGE_MAX,
+  beginTotp,
+  changePassword,
+  checkSecondFactor,
+  confirmTotp,
+  disableTotp,
+  listAudit,
+  listSessions,
+  recordAudit,
+  revokeSession,
+  sessionByHandle,
+  totpEnabled,
+  totpStatus,
+} from './account.ts';
+import {
+  MAX_IMAGE_RETENTION_DAYS,
   mcpServers,
   pushConfig,
+  readImageSettings,
   readPushSettings,
+  readTimeSettings,
+  readTimezone,
   readWebSettings,
   searchConfig,
   writeMcpServers,
@@ -50,8 +81,12 @@ import {
   writePushIds,
   writePushKey,
   writePushSandbox,
+  writeImageRetentionDays,
   writeSearchUrl,
+  writeTimezone,
+  validImageRetentionDays,
 } from './settings.ts';
+import { validTimezone } from './timezone.ts';
 import {
   assignModel,
   backupConfig,
@@ -115,7 +150,7 @@ import { cdpConnect, fillForm, focusedField, stopBrowser } from './browser.ts';
 import { createRecorder, saveRecording, shownLine } from './recording.ts';
 import type { Recording } from './recording.ts';
 import type { Connect } from './browser.ts';
-import { filledLine, fillSteps, findForm, hideFromAgent, rememberSteps } from './forms.ts';
+import { filledLine, fillSteps, findForm, hideFromAgent, loadHidden, rememberSteps } from './forms.ts';
 import { listReadMarks, markRead } from './read.ts';
 import { formRequests, handOvers, hungBrowsers, listNeedsYou, pushedItem, threadsOf } from './needs.ts';
 import type { DesktopOps } from './agents.ts';
@@ -145,6 +180,7 @@ import {
   insertSchedule,
   listSchedules,
   parseSchedule,
+  rescheduleAll,
   setPaused,
 } from './schedules.ts';
 import type { ScheduleRequest } from './schedules.ts';
@@ -170,6 +206,21 @@ import type { Exec } from './exec.ts';
 import { log } from './log.ts';
 
 const PUBLIC_PATHS = new Set(['/api/health', '/api/auth/setup', '/api/auth/login']);
+
+/** The owner-side writes the audit log records, beside the auth events each route records. */
+const AUDITED_WRITES: readonly (readonly [string, RegExp, AuditAction])[] = [
+  ['PUT', /^\/api\/settings$/, 'settings_changed'],
+  ['POST', /^\/api\/providers$/, 'provider_changed'],
+  ['PUT', /^\/api\/providers\/[^/]+$/, 'provider_changed'],
+  ['DELETE', /^\/api\/providers\/[^/]+$/, 'provider_changed'],
+  ['POST', /^\/api\/models$/, 'model_changed'],
+  ['PUT', /^\/api\/models\/[^/]+$/, 'model_changed'],
+  ['DELETE', /^\/api\/models\/[^/]+$/, 'model_changed'],
+  ['PUT', /^\/api\/agents\/[^/]+\/model$/, 'model_changed'],
+  ['PUT', /^\/api\/mcp\/servers(\/[^/]+)?$/, 'mcp_changed'],
+  ['DELETE', /^\/api\/mcp\/servers\/[^/]+$/, 'mcp_changed'],
+  ['PUT', /^\/api\/agents\/[^/]+\/rules$/, 'rules_changed'],
+];
 
 async function jsonBody(c: Context): Promise<Record<string, unknown>> {
   try {
@@ -225,8 +276,9 @@ function messagePage(c: Context): MessagePage | undefined {
   return rawBefore === undefined ? { limit, after: id } : { limit, before: id };
 }
 
-/** `?images=0` keeps each image's media type and drops its bytes, for a reader that only shows
- * that a screenshot is there: a sidebar polling every agent's newest row would otherwise carry it. */
+/** `?images=0` keeps each image's media type (and `expired`) and drops its bytes, for a reader that
+ * only shows that a screenshot is there: a sidebar polling every agent's newest row would
+ * otherwise carry it. */
 function withImages(c: Context, rows: Message[]): Message[] {
   if (c.req.query('images') !== '0') return rows;
   return rows.map((row) => (row.image === undefined ? row : { ...row, image: { ...row.image, base64: '' } }));
@@ -243,6 +295,11 @@ export const MAX_IMAGE_BYTES = 5_000_000;
 const UPLOAD_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._()+-]{0,127}$/;
 // Base64 is four characters per three bytes.
 const MAX_UPLOAD_BASE64_CHARS = Math.ceil(MAX_FILE_BYTES / 3) * 4;
+/**
+ * Every /api body. The largest legitimate one is an upload at MAX_FILE_BYTES: 33.3 MB of base64,
+ * plus about 1.6% more because the app's JSONEncoder escapes each `/` as `\\/`. 40 MB clears it.
+ */
+export const MAX_API_BODY_BYTES = 40_000_000;
 const UPLOAD_SCRIPT = `set -eu
 mkdir -p "$HOME/uploads"
 base64 -d > "$HOME/uploads/$1"
@@ -423,6 +480,12 @@ export type AppDeps = {
   pushSend?: PushSend;
   /** When the owner counts as at a screen and how long a push waits for them; tests shrink it. */
   presence?: Presence;
+  /** What first-run setup must present; generated when no owner exists, fixed by tests. */
+  setupToken?: string;
+  /** Failed login and setup attempts per address; tests hand in one with a fake clock. */
+  loginGuard?: LoginGuard;
+  /** The clock TOTP steps and audit rows are read from; tests pin it. */
+  now?: () => number;
 };
 
 export function createApp({
@@ -437,13 +500,18 @@ export function createApp({
   connect = cdpConnect,
   pushSend,
   presence = PRESENCE,
+  setupToken: givenSetupToken,
+  loginGuard = createLoginGuard(),
+  now = Date.now,
 }: AppDeps) {
   const app = new Hono();
+  let setupToken = ownerExists(db) ? undefined : (givenSetupToken ?? newSetupToken());
   let attendedAt = -Infinity;
   const attended = () => Date.now() - attendedAt < presence.attendedMs;
   const buildProvider = makeProvider ?? openAiProvider;
   /** The model call each agent is waiting to ask again, with the owner's levers over it. */
   const waits = new Map<string, { state: RetryState; control: RetryControl }>();
+  loadHidden(db, masterKey);
 
   /**
    * An agent's turn provider: its model, retried, with the backup on offer while it waits. A
@@ -542,11 +610,21 @@ export function createApp({
     // Reads the row every turn like the provider and the search key do, and resolves the agent's
     // Linux user only when there is something to connect to: a daemon with no MCP server
     // configured starts no process and runs no `getent` for one.
-    mcp: async (agent) => {
+    mcp: async (agent, homeReady) => {
       const specs = mcpServers(db, masterKey);
-      return specs.length === 0 ? undefined : openMcp(specs, await agentTarget(exec, agent));
+      if (specs.length === 0) return undefined;
+      await homeReady();
+      return openMcp(specs, await agentTarget(exec, agent));
     },
   });
+
+  app.use(
+    '/api/*',
+    bodyLimit({
+      maxSize: MAX_API_BODY_BYTES,
+      onError: (c) => c.json({ error: `the body is over ${MAX_API_BODY_BYTES / 1_000_000} MB` }, 413),
+    }),
+  );
 
   // Registered before any route so unlisted paths are denied by default.
   app.use('/api/*', async (c, next) => {
@@ -556,36 +634,193 @@ export function createApp({
     return next();
   });
 
+  const audit = (c: Context, action: AuditAction, detail?: Record<string, unknown>) =>
+    recordAudit(db, { ip: clientIp(c), userAgent: c.req.header('user-agent') }, action, detail, now());
+
+  app.use('/api/*', async (c, next) => {
+    await next();
+    const action = AUDITED_WRITES.find(([method, path]) => method === c.req.method && path.test(c.req.path))?.[2];
+    if (action === undefined || c.res.status >= 300) return;
+    // Field names only: the values include api keys.
+    const fields = action === 'settings_changed' ? Object.keys(await jsonBody(c)) : undefined;
+    audit(c, action, { method: c.req.method, path: c.req.path, ...(fields === undefined ? {} : { fields }) });
+  });
+
   app.get('/api/health', (c) =>
     c.json<HealthResponse>({ status: 'ok', setupRequired: !ownerExists(db) }),
   );
 
+  const backedOff = (c: Context, ip: string) => {
+    const wait = loginGuard.retryAfter(ip);
+    if (wait === 0) return undefined;
+    c.header('Retry-After', String(wait));
+    return c.json({ error: `too many failed attempts, try again in ${wait} s` }, 429);
+  };
+
   app.post('/api/auth/setup', async (c) => {
-    const password = stringField(await jsonBody(c), 'password') ?? '';
+    const ip = clientIp(c);
+    const refused = backedOff(c, ip);
+    if (refused !== undefined) return refused;
+    const body = await jsonBody(c);
+    if (setupToken === undefined || ownerExists(db)) return c.json({ error: 'owner password is already set' }, 409);
+    if (!tokenMatches(stringField(body, 'setupToken') ?? '', setupToken)) {
+      loginGuard.fail(ip);
+      return c.json({ error: 'setup token required: it is printed in the daemon log' }, 403);
+    }
+    const password = stringField(body, 'password') ?? '';
     if (password.length < MIN_PASSWORD_LENGTH) {
       return c.json({ error: `password must be at least ${MIN_PASSWORD_LENGTH} characters` }, 400);
     }
-    if (!claimOwner(db, password)) return c.json({ error: 'owner password is already set' }, 409);
+    if (!(await claimOwner(db, password))) return c.json({ error: 'owner password is already set' }, 409);
+    setupToken = undefined;
+    loginGuard.succeed(ip);
     issueSession(c, db);
+    audit(c, 'setup');
     return c.json({ ok: true }, 201);
   });
 
   app.post('/api/auth/login', async (c) => {
-    const password = stringField(await jsonBody(c), 'password') ?? '';
-    if (!checkPassword(db, password)) return c.json({ error: 'invalid password' }, 401);
+    const ip = clientIp(c);
+    const refused = backedOff(c, ip);
+    if (refused !== undefined) return refused;
+    const body = await jsonBody(c);
+    if (!(await checkPassword(db, stringField(body, 'password') ?? ''))) {
+      loginGuard.fail(ip);
+      audit(c, 'login_failed', { reason: 'password' });
+      return c.json<LoginError>({ error: 'invalid password' }, 401);
+    }
+    let method: 'password' | 'totp' | 'recovery' = 'password';
+    if (totpEnabled(db)) {
+      const totp = stringField(body, 'totp');
+      const recoveryCode = stringField(body, 'recoveryCode');
+      // The right password with no code yet is the first half of a normal login, not a failure.
+      if (!totp && !recoveryCode) {
+        return c.json<LoginError>({ error: 'enter the code from your authenticator app', totpRequired: true }, 401);
+      }
+      const factor = checkSecondFactor(db, masterKey, { totp, recoveryCode }, now());
+      if (factor === undefined) {
+        loginGuard.fail(ip);
+        audit(c, 'login_failed', { reason: recoveryCode ? 'recovery code' : 'totp' });
+        return c.json<LoginError>({ error: 'invalid code', totpRequired: true }, 401);
+      }
+      method = factor;
+      if (factor === 'recovery') audit(c, 'recovery_code_used', { left: totpStatus(db).recoveryCodesLeft });
+    }
+    loginGuard.succeed(ip);
     issueSession(c, db);
+    audit(c, 'login', { method });
     return c.json({ ok: true });
   });
 
   app.post('/api/auth/logout', (c) => {
-    const id = getCookie(c, SESSION_COOKIE);
-    if (id !== undefined) dropSession(db, id);
+    dropSession(c, db, getCookie(c, SESSION_COOKIE));
+    audit(c, 'logout');
     return c.json({ ok: true });
+  });
+
+  /** For the routes behind the session guard, where the cookie is known to name a live session. */
+  const currentSession = (c: Context) => getCookie(c, SESSION_COOKIE) as string;
+
+  /**
+   * A password check behind the session guard, so a stolen cookie cannot use these routes to
+   * guess the password, or turn on a second factor the owner does not hold. It shares the
+   * login backoff.
+   */
+  const reauthenticate = async (c: Context, password: string, failed: AuditAction | undefined) => {
+    const ip = clientIp(c);
+    const refused = backedOff(c, ip);
+    if (refused !== undefined) return refused;
+    if (await checkPassword(db, password)) return undefined;
+    loginGuard.fail(ip);
+    if (failed !== undefined) audit(c, failed);
+    return c.json({ error: 'the current password is wrong' }, 403);
+  };
+
+  app.post('/api/auth/password', async (c) => {
+    const body = await jsonBody(c);
+    const next = stringField(body, 'next') ?? '';
+    const refused = await reauthenticate(c, stringField(body, 'current') ?? '', 'password_change_failed');
+    if (refused !== undefined) return refused;
+    if (next.length < MIN_PASSWORD_LENGTH) {
+      return c.json({ error: `the new password must be at least ${MIN_PASSWORD_LENGTH} characters` }, 400);
+    }
+    loginGuard.succeed(clientIp(c));
+    const signedOut = await changePassword(db, next, currentSession(c));
+    audit(c, 'password_changed', { signedOut });
+    return c.json({ ok: true, signedOut });
+  });
+
+  app.get('/api/auth/sessions', (c) =>
+    c.json<SessionEntry[]>(listSessions(db, currentSession(c), now())),
+  );
+
+  app.delete('/api/auth/sessions/:handle', (c) => {
+    const handle = c.req.param('handle');
+    const id = sessionByHandle(db, handle);
+    if (id === undefined) return c.json({ error: 'no such session' }, 404);
+    const own = id === currentSession(c);
+    audit(c, 'session_revoked', { handle, own });
+    if (own) dropSession(c, db, id);
+    else revokeSession(db, id);
+    return c.json({ ok: true });
+  });
+
+  app.get('/api/auth/totp', (c) => c.json<TotpStatus>(totpStatus(db)));
+
+  app.post('/api/auth/totp/setup', async (c) => {
+    if (totpEnabled(db)) return c.json({ error: 'two-factor login is already on: turn it off first' }, 409);
+    const refused = await reauthenticate(c, stringField(await jsonBody(c), 'password') ?? '', undefined);
+    if (refused !== undefined) return refused;
+    loginGuard.succeed(clientIp(c));
+    return c.json<TotpSetup>(beginTotp(db, masterKey));
+  });
+
+  app.post('/api/auth/totp/confirm', async (c) => {
+    if (totpEnabled(db)) return c.json({ error: 'two-factor login is already on' }, 409);
+    if (!totpStatus(db).pending) return c.json({ error: 'start with POST /api/auth/totp/setup' }, 409);
+    const recoveryCodes = confirmTotp(db, masterKey, stringField(await jsonBody(c), 'code') ?? '', now());
+    if (recoveryCodes === undefined) return c.json({ error: 'that code does not match: check the phone clock and try the next one' }, 400);
+    audit(c, 'totp_enabled');
+    return c.json<TotpConfirmed>({ recoveryCodes });
+  });
+
+  app.delete('/api/auth/totp', async (c) => {
+    if (!totpEnabled(db)) return c.json({ error: 'two-factor login is not on' }, 409);
+    const body = await jsonBody(c);
+    const refused = await reauthenticate(c, stringField(body, 'password') ?? '', undefined);
+    if (refused !== undefined) return refused;
+    const recoveryCode = stringField(body, 'recoveryCode');
+    const factor = checkSecondFactor(db, masterKey, { totp: stringField(body, 'code'), recoveryCode }, now());
+    if (factor === undefined) {
+      loginGuard.fail(clientIp(c));
+      return c.json({ error: 'a current code, or an unused recovery code, is required' }, 403);
+    }
+    loginGuard.succeed(clientIp(c));
+    if (factor === 'recovery') audit(c, 'recovery_code_used', { left: totpStatus(db).recoveryCodesLeft });
+    disableTotp(db);
+    audit(c, 'totp_disabled');
+    return c.json({ ok: true });
+  });
+
+  app.get('/api/audit', (c) => {
+    const before = c.req.query('before');
+    const limit = c.req.query('limit');
+    const beforeId = before === undefined ? undefined : Number(before);
+    const limitCount = limit === undefined ? 50 : Number(limit);
+    if (beforeId !== undefined && !(Number.isSafeInteger(beforeId) && beforeId > 0)) {
+      return c.json({ error: 'before must be an event id' }, 400);
+    }
+    if (!(Number.isSafeInteger(limitCount) && limitCount > 0 && limitCount <= AUDIT_PAGE_MAX)) {
+      return c.json({ error: `limit must be 1 to ${AUDIT_PAGE_MAX}` }, 400);
+    }
+    return c.json<AuditEvent[]>(listAudit(db, beforeId, limitCount));
   });
 
   const allSettings = () => ({
     ...readProviderSettings(db),
     ...readWebSettings(db),
+    ...readTimeSettings(db),
+    ...readImageSettings(db),
     push: readPushSettings(db),
   });
 
@@ -619,6 +854,14 @@ export function createApp({
     if (pushSandbox !== undefined && typeof pushSandbox !== 'boolean') {
       return c.json({ error: 'pushSandbox must be a boolean' }, 400);
     }
+    const timezone = body['timezone'];
+    if (timezone !== undefined && (typeof timezone !== 'string' || !validTimezone(timezone))) {
+      return c.json({ error: 'timezone must be an IANA zone name, like Europe/Amsterdam' }, 400);
+    }
+    const imageRetentionDays = body['imageRetentionDays'];
+    if (imageRetentionDays !== undefined && !validImageRetentionDays(imageRetentionDays)) {
+      return c.json({ error: `imageRetentionDays must be a whole number of days from 0 (keep forever) to ${MAX_IMAGE_RETENTION_DAYS}` }, 400);
+    }
 
     writeProviderSettings(db, masterKey, {
       baseUrl,
@@ -636,6 +879,12 @@ export function createApp({
     });
     if (pushKey !== undefined) writePushKey(db, masterKey, pushKey.trim());
     if (pushSandbox !== undefined) writePushSandbox(db, pushSandbox);
+    if (timezone !== undefined) {
+      const moved = timezone !== readTimezone(db);
+      writeTimezone(db, timezone);
+      if (moved) rescheduleAll(db, now());
+    }
+    if (imageRetentionDays !== undefined) writeImageRetentionDays(db, imageRetentionDays);
 
     return c.json(allSettings());
   });
@@ -731,6 +980,18 @@ export function createApp({
     }
     if (fields.extraBody !== undefined && fields.extraBody.trim() !== '' && parseExtraBody(fields.extraBody) === undefined) {
       return { error: 'extraBody must be a JSON object' };
+    }
+    const window = body['contextWindow'];
+    if (window !== undefined) {
+      if (window !== null && modelId(window) === undefined) {
+        return { error: 'contextWindow must be a positive whole number of tokens, or null' };
+      }
+      fields.contextWindow = window as number | null;
+    }
+    const vision = body['vision'];
+    if (vision !== undefined) {
+      if (typeof vision !== 'boolean') return { error: 'vision must be true or false' };
+      fields.vision = vision;
     }
     return fields;
   }
@@ -906,8 +1167,6 @@ export function createApp({
   });
 
 
-  /** The desktop first: the row is what frees the display number, and an Xvnc still holding it
-   * would be adopted by whichever agent is given that number next. */
   /**
    * The desktop first, because usermod refuses a user with processes; the row last, because a
    * user that would not move is a rename that did not happen. The turn cap is the caller's:
@@ -927,12 +1186,13 @@ export function createApp({
     return moved;
   }
 
+  /**
+   * The user, home and sandbox first: the row is what frees the display number and the name, and
+   * a new agent given either must not inherit an Xvnc or a home. One that would not go keeps
+   * its row, so deleting it again finishes the job.
+   */
   async function removeAgent(agent: Agent): Promise<void> {
-    try {
-      await desktop.stop(agent.name);
-    } catch (error) {
-      log.error('desktop would not stop', { agent: agent.name, error });
-    }
+    await desktop.remove(agent.name);
     deleteAgent(db, agent);
     log.info('agent deleted', { agent: agent.name, display: agent.display });
   }
@@ -943,7 +1203,7 @@ export function createApp({
     const asker = findAgent(db, approval.agent);
     if (asker === undefined || findConversation(db, approval.conversationId) === undefined) return;
     appendMessage(db, approval.conversationId, { role: 'user', content: text, sender: SYSTEM_SENDER });
-    runner.start(asker, approval.conversationId);
+    runner.start(asker, approval.conversationId, undefined, 'approval');
   }
 
   app.get('/api/agents', (c) => {
@@ -994,12 +1254,12 @@ export function createApp({
       const { description, tagline, levels, routine } = described;
       if (levels !== undefined) updateRules(db, agent, { levels });
       if (routine !== undefined) insertSchedule(db, agent, routine, Date.now());
-      // The interview needs no screen, so it starts now and the desktop catches up; one that
-      // will not start is logged, and a restart of it or of the daemon brings it up later.
-      if (providerConfig(db, masterKey, agent) !== undefined && runner.atCapacity(agent.name) === undefined) {
+      // The interview needs no screen, so it starts now, or waits for a loop, and the desktop
+      // catches up.
+      if (providerConfig(db, masterKey, agent) !== undefined) {
         const conversationId = conversationFor(db, agent.id);
         appendMessage(db, conversationId, { role: 'user', content: describedKickoff(description, tagline) });
-        runner.start(agent, conversationId);
+        runner.start(agent, conversationId, undefined, 'kickoff');
       }
       void desktop.ensure(agent.name, agent.display).catch((error: unknown) => {
         log.error('agent desktop did not start', { agent: name, display: agent.display, error });
@@ -1019,10 +1279,10 @@ export function createApp({
     // provider yet it cannot run, and the prompt tells a profile-less agent to ask anyway, so
     // the owner's first message gets the same interview later.
     if (profile === undefined || profile === null) {
-      if (providerConfig(db, masterKey, agent) !== undefined && runner.atCapacity(agent.name) === undefined) {
+      if (providerConfig(db, masterKey, agent) !== undefined) {
         const conversationId = conversationFor(db, agent.id);
         appendMessage(db, conversationId, { role: 'user', content: KICKOFF });
-        runner.start(agent, conversationId);
+        runner.start(agent, conversationId, undefined, 'kickoff');
       }
     } else {
       setAgentCosmetics(db, agent.name, { profile });
@@ -1233,7 +1493,7 @@ export function createApp({
     const agent = findAgent(db, c.req.param('name'));
     if (agent === undefined) return c.json({ error: 'no such agent' }, 404);
     const retry = waits.get(agent.name)?.state;
-    return c.json({ ...(liveReply(agent.name) ?? { text: '', reasoning: '' }), ...(retry === undefined ? {} : { retry }) });
+    return c.json({ ...(liveReply(agent.id) ?? { text: '', reasoning: '' }), ...(retry === undefined ? {} : { retry }) });
   });
 
   /** "Retry now" (`now`) or "Use backup model" (`backup`) on a model call that is waiting. */
@@ -1272,11 +1532,8 @@ export function createApp({
       return c.json({ error: 'set a provider base url, model and api key first' }, 400);
     }
 
-    // Synchronous from here to the start, so nothing can take the last free loop in between.
-    const refusal = runner.atCapacity(agent.name);
-    if (refusal !== undefined) return c.json({ error: refusal }, 429);
-
-    // Never a 409: a busy agent's running turn picks this row up before it releases the agent.
+    // Never refused: a busy agent's running turn picks this row up before it releases the agent,
+    // and a full loop cap queues the turn.
     const conversationId = conversationFor(db, agent.id);
     const message = appendMessage(db, conversationId, { role: 'user', content: sent.text, ...(sent.image === undefined ? {} : { image: sent.image }) });
     runner.start(agent, conversationId);
@@ -1303,9 +1560,6 @@ export function createApp({
     if (providerConfig(db, masterKey, agent) === undefined) {
       return c.json({ error: 'set a provider base url, model and api key first' }, 400);
     }
-    const busy = runner.atCapacity(agent.name);
-    if (busy !== undefined) return c.json({ error: busy }, 429);
-
     let copied: UploadResult | undefined;
     if (wanted.file !== undefined && holder !== undefined) {
       try {
@@ -1325,9 +1579,6 @@ export function createApp({
       }
     }
 
-    // Checked again: the copy awaited, and something else may have taken the last free loop.
-    const refusal = runner.atCapacity(agent.name);
-    if (refusal !== undefined) return c.json({ error: refusal }, 429);
     const from = source?.sender === undefined ? 'something I wrote earlier' : (findAgent(db, source.sender)?.label ?? source.sender);
     const content = forwardedText(wanted.note, source === undefined ? undefined : { from, text: source.content }, copied?.path);
     const conversationId = conversationFor(db, agent.id);
@@ -1397,7 +1648,7 @@ export function createApp({
     const asked = screenAsked(agent);
     if (asked !== undefined) {
       appendMessage(db, asked.conversationId, { role: 'user', content: HANDS_BACK });
-      runner.start(agent, asked.conversationId);
+      runner.start(agent, asked.conversationId, undefined, 'answer');
     }
     const recording = await recorder.stop(agent.display);
     if (recording !== undefined && recording.steps.length > 0) await handOver(agent, recording);
@@ -1428,12 +1679,12 @@ export function createApp({
     }
     const parsed = fillSteps(db, masterKey, form, await jsonBody(c));
     if ('error' in parsed) return c.json({ error: parsed.error }, 400);
-    hideFromAgent(agent.id, parsed.steps.filter((s) => s.secret).map((s) => s.value));
+    hideFromAgent(db, masterKey, agent.id, parsed.steps.filter((s) => s.secret).map((s) => s.value));
     const filled = await fillForm(connect, agent.display, form.origin, parsed.steps);
     if ('error' in filled) return c.json({ error: filled.error }, 409);
     if (parsed.remember) rememberSteps(db, masterKey, form, parsed.steps);
     appendMessage(db, item.conversationId, { role: 'user', content: filledLine(form.origin, parsed.steps) });
-    runner.start(agent, item.conversationId);
+    runner.start(agent, item.conversationId, undefined, 'answer');
     return c.json({ ok: true });
   });
 
@@ -1451,7 +1702,7 @@ export function createApp({
       content: shownLine(recording, saved.dir, saved.picture),
       ...(saved.image === undefined ? {} : { image: saved.image }),
     });
-    runner.start(agent, thread);
+    runner.start(agent, thread, undefined, 'answer');
   }
 
   /** The newest request of the agent's that the owner answers on its screen. */
@@ -1489,7 +1740,7 @@ export function createApp({
     if (hang !== undefined) {
       const done = what === 'desktop' ? 'I restarted your desktop, browser included.' : 'I restarted your browser.';
       appendMessage(db, hang.conversationId, { role: 'user', content: `${done} Try again.` });
-      runner.start(agent, hang.conversationId);
+      runner.start(agent, hang.conversationId, undefined, 'answer');
     }
     return c.json({ ok: true });
   });
@@ -1650,13 +1901,10 @@ export function createApp({
     const sent = messageBody(await jsonBody(c));
     if ('error' in sent) return c.json({ error: sent.error }, 400);
 
-    // Every agent in the thread answers, so the whole fan-out has to fit under the cap.
     const agents = participantAgents(db, conversation.id);
     if (agents.some((agent) => providerConfig(db, masterKey, agent) === undefined)) {
       return c.json({ error: 'set a provider base url, model and api key first' }, 400);
     }
-    const refusal = agents.map((agent) => runner.atCapacity(agent.name)).find(Boolean);
-    if (refusal !== undefined) return c.json({ error: refusal }, 429);
 
     const message = appendMessage(db, conversation.id, { role: 'user', content: sent.text, ...(sent.image === undefined ? {} : { image: sent.image }) });
     // One message from the owner, a turn for every agent in the thread.
@@ -1667,9 +1915,9 @@ export function createApp({
 
   /**
    * Everything an agent is and everything of its own: its workers, its threads, its routines,
-   * its history. Its Linux user and its home stay — that is the agent's work, and nothing here
-   * is worth destroying it for. Refused while a turn is running, because pulling the rows out
-   * from under a live loop turns its next write into a foreign-key failure.
+   * its history, its Linux user, its home and its sandbox. Refused while a turn is running,
+   * because pulling the rows out from under a live loop turns its next write into a
+   * foreign-key failure.
    */
   app.delete('/api/agents/:name', async (c) => {
     const agent = findAgent(db, c.req.param('name'));
@@ -1677,7 +1925,12 @@ export function createApp({
     if (runner.running(agent.name)) {
       return c.json({ error: `${agent.name} is in the middle of a turn; try again in a moment` }, 409);
     }
-    await removeAgent(agent);
+    try {
+      await removeAgent(agent);
+    } catch (error) {
+      log.error('agent removal failed', { agent: agent.name, error });
+      return c.json({ error: 'could not remove the agent\'s user and home; try again' }, 500);
+    }
     return c.json({ ok: true });
   });
 
@@ -1732,8 +1985,6 @@ export function createApp({
       if (askers.some((agent) => providerConfig(db, masterKey, agent) === undefined)) {
         return c.json({ error: 'set a provider base url, model and api key first' }, 400);
       }
-      const refusal = askers.map((agent) => runner.atCapacity(agent.name)).find(Boolean);
-      if (refusal !== undefined) return c.json({ error: refusal }, 429);
     }
     const restored: FileChanges[] = [];
     if (files) {
@@ -1775,7 +2026,7 @@ export function createApp({
     }
     rewindConversation(db, conversationId, from);
     for (const changes of restored) appendMessage(db, conversationId, { role: 'user', content: restoredLine(changes), sender: SYSTEM_SENDER });
-    if (retry) for (const agent of askers) runner.start(agent, conversationId);
+    if (retry) for (const agent of askers) runner.start(agent, conversationId, undefined, 'retry');
     return c.json({ ok: true, ...(files ? { files: restored } : {}) });
   }
 
@@ -1830,6 +2081,7 @@ export function createApp({
       });
       const result = await compactNow({ db, provider }, agent, conversationId);
       if ('error' in result) return c.json({ error: result.error }, 500);
+      if (result.usage !== undefined) log.info('owner compaction tokens', { agent: agent.name, ...result.usage });
       compacted[agent.name] = result.covered;
     }
     return c.json<CompactResult>({ compacted });
@@ -1984,7 +2236,12 @@ export function createApp({
     }
     // Told before it is done: deleting the asker takes the thread the answer would go in.
     tellTheAsker(approval, `The owner approved: ${approval.target} has been deleted.`);
-    await removeAgent(target);
+    try {
+      await removeAgent(target);
+    } catch (error) {
+      log.error('agent removal failed', { agent: target.name, error });
+      tellTheAsker(approval, `Correction: ${approval.target} could not be deleted after all and is still there.`);
+    }
     return answered;
   }
 
@@ -2019,5 +2276,5 @@ export function createApp({
 
   // The runner comes back out because the scheduler tick starts turns through it too, and it
   // cannot be built twice: the one-turn-per-agent set is process state inside this one.
-  return { app, runner, recorder };
+  return { app, runner, recorder, setupToken };
 }

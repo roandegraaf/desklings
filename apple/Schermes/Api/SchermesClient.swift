@@ -11,10 +11,21 @@ enum SchermesError: LocalizedError {
     /// Valid JSON that is not a server list. The daemon would say so too; saying it here names
     /// the entry rather than the request.
     case notServers(String)
+    /// The password was right and the daemon wants the authenticator code (or a recovery code)
+    /// beside it. Carries the daemon's text, which is "invalid code" once a code was sent.
+    case totpRequired(String)
+    /// The daemon's per-address login backoff. `retryAfter` is its `Retry-After`, in seconds.
+    case tooManyAttempts(retryAfter: Int, message: String)
+    /// A caller with no window could not sign in again on its own, which is what a stored
+    /// password meets once TOTP is on and the shared session has expired.
+    case signInInApp
 
     var errorDescription: String? {
         switch self {
         case .unauthorized: "the session expired"
+        case .totpRequired(let message): message
+        case .tooManyAttempts(_, let message): message
+        case .signInInApp: "Open Schermes and sign in again."
         case .daemon(_, let message): message
         case .badURL: "that is not a daemon address"
         case .notJSON(let detail): "that is not JSON: \(detail)"
@@ -31,11 +42,20 @@ extension Error {
     nonisolated var isCancellation: Bool {
         self is CancellationError || (self as? URLError)?.code == .cancelled
     }
+
+    /// The daemon was not reached: the network failed, or a proxy in front of it answered that
+    /// it is down. A daemon's own refusal is an answer, so it is not this.
+    nonisolated var isUnreachable: Bool {
+        if let url = self as? URLError { return url.code != .cancelled }
+        if case .daemon(let status, _) = self as? SchermesError { return [502, 503, 504].contains(status) }
+        return false
+    }
 }
 
 /// Which thread is being read. An agent's own thread — a task worker's included — is reached
 /// through the agent, because a brand new agent has no conversation row until something is
-/// written to it; every other thread is reached by its conversation id.
+/// written to it. A conversation id reaches the same thread where a row names only that id, as
+/// a Needs you item does.
 enum ThreadSource: Hashable, Sendable {
     case agent(String)
     case conversation(Int)
@@ -49,31 +69,38 @@ enum ThreadSource: Hashable, Sendable {
     }
 }
 
-/// `GET` and `PUT /api/settings` carry the web and push halves in one object. The provider fields
-/// it still carries are the default model's, which the app edits through `/api/models` instead.
+/// `GET` and `PUT /api/settings` carry the web, push and general parts in one object. The provider
+/// fields it still carries are the default model's, which the app edits through `/api/models` instead.
 struct DaemonSettings: Decodable, Sendable {
     var web: WebSettings
     var push: PushSettings
+    var general: GeneralSettings
 
-    private enum Keys: String, CodingKey { case push }
+    private enum Keys: String, CodingKey { case push, timezone, imageRetentionDays }
 
     init(from decoder: any Decoder) throws {
         web = try WebSettings(from: decoder)
+        let container = try decoder.container(keyedBy: Keys.self)
         // Absent on a daemon from before push existed, which is not a reason to refuse the
         // settings screen.
-        push = try decoder.container(keyedBy: Keys.self)
-            .decodeIfPresent(PushSettings.self, forKey: .push)
+        push = try container.decodeIfPresent(PushSettings.self, forKey: .push)
             ?? PushSettings(keyId: "", teamId: "", bundleId: "", keySet: false, sandbox: false)
+        general = GeneralSettings(
+            timezone: try container.decodeIfPresent(String.self, forKey: .timezone),
+            imageRetentionDays: try container.decodeIfPresent(Int.self, forKey: .imageRetentionDays)
+        )
     }
 }
 
 struct DaemonSettingsUpdate: Encodable, Sendable {
-    var web: WebSettingsUpdate
-    var push: PushSettingsUpdate
+    var web = WebSettingsUpdate()
+    var push = PushSettingsUpdate()
+    var general = GeneralSettingsUpdate()
 
     func encode(to encoder: any Encoder) throws {
         try web.encode(to: encoder)
         try push.encode(to: encoder)
+        try general.encode(to: encoder)
     }
 }
 
@@ -89,10 +116,16 @@ struct SettingsForm: Equatable {
     var pushKeyId: String
     var searchKey = ""
     var pushKey = ""
+    /// The daemon always reports a zone, its own until the owner picks one, so the form starts from
+    /// that and never from this device's: opening the page must not make it dirty.
+    var timezone: String
+    var imageRetentionDays: Int
 
     init(_ settings: DaemonSettings) {
         searchUrl = settings.web.searchUrl
         pushKeyId = settings.push.keyId
+        timezone = settings.general.timezone ?? ""
+        imageRetentionDays = settings.general.imageRetentionDays ?? defaultImageRetentionDays
     }
 
     /// One page at a time: `PUT /api/settings` keeps every field a body leaves out, so a page
@@ -101,19 +134,37 @@ struct SettingsForm: Equatable {
     /// The daemon writes whatever string it is given, so a blank key is left out rather than sent
     /// as `""`, which would erase it. Every other field always goes: empty is how one is cleared.
     var webUpdate: DaemonSettingsUpdate {
-        DaemonSettingsUpdate(
-            web: WebSettingsUpdate(searchUrl: searchUrl, searchKey: searchKey.isEmpty ? nil : searchKey),
-            push: PushSettingsUpdate()
-        )
+        DaemonSettingsUpdate(web: WebSettingsUpdate(searchUrl: searchUrl, searchKey: searchKey.isEmpty ? nil : searchKey))
     }
 
     var pushUpdate: DaemonSettingsUpdate {
-        DaemonSettingsUpdate(
-            web: WebSettingsUpdate(),
-            push: PushSettingsUpdate(pushKeyId: pushKeyId, pushKey: pushKey.isEmpty ? nil : pushKey)
-        )
+        DaemonSettingsUpdate(push: PushSettingsUpdate(pushKeyId: pushKeyId, pushKey: pushKey.isEmpty ? nil : pushKey))
+    }
+
+    /// The zone goes out trimmed, and not at all when blank: an older daemon reports none, and an
+    /// empty one would be refused.
+    var generalUpdate: DaemonSettingsUpdate {
+        let zone = timezone.trimmingCharacters(in: .whitespaces)
+        return DaemonSettingsUpdate(general: GeneralSettingsUpdate(
+            timezone: zone.isEmpty ? nil : zone,
+            imageRetentionDays: imageRetentionDays
+        ))
     }
 }
+
+/// A number field's text, read on every keystroke. `TextField(value:format:)` only commits on
+/// Return or losing focus, and a number pad has no Return, so a typed value never reached Save.
+/// Grouping separators and spaces are ignored; anything else, or nothing, is not a number.
+func typedWholeNumber(_ text: String) -> Int? {
+    let digits = text.filter { !$0.isWhitespace && $0 != "," && $0 != "." && $0 != "\u{2019}" && $0 != "'" }
+    guard !digits.isEmpty, digits.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
+    return Int(digits)
+}
+
+/// What the daemon keeps when the owner has never set a retention.
+let defaultImageRetentionDays = 30
+/// The daemon's ceiling: ten years.
+let maxImageRetentionDays = 3650
 
 /// The iOS keyboard's Smart Punctuation, on by default, turns a typed `"` into a curly quote, and
 /// SwiftUI has no switch for it on a text field. Hand-typed JSON is straightened only when that is
@@ -160,6 +211,11 @@ struct McpServerDraft: Sendable, Hashable, Encodable {
         case .http:
             try container.encode(url, forKey: .url)
             try container.encode(values, forKey: .headers)
+        case .unknown:
+            throw EncodingError.invalidValue(transport, .init(
+                codingPath: encoder.codingPath,
+                debugDescription: "this server uses a transport this app does not know, so it cannot be saved from here"
+            ))
         }
     }
 }
@@ -174,7 +230,7 @@ private extension JSONValue {
 /// The MCP box, or a snippet pasted out of a README, as drafts a form can be filled from. Both
 /// shapes are accepted: the bare `[{…}]` array the daemon speaks, and the
 /// `{"mcpServers": {"name": {…}}}` object every MCP README prints, whose keys are the names.
-/// Parsed here, as the web UI did, so a typo is named with its line and column instead of
+/// Parsed here, so a typo is named with its line and column instead of
 /// arriving as something that is not an array. Empty is no servers.
 ///
 /// Only what a draft cannot represent is refused. The name's charset, the url's scheme and how
@@ -269,19 +325,37 @@ struct MessageWindow: Sendable {
 
 struct SchermesClient: Sendable {
     var baseURL: URL
+    var urlSession: URLSession = SchermesClient.session
 
-    /// The shared cookie storage, so the daemon's session cookie — which carries an expiry, so it
-    /// is written to disk rather than dropped at exit — survives a relaunch and the owner is not
-    /// asked for a password every cold start.
-    private static let session: URLSession = {
+    /// The daemon's session cookie carries an expiry, so it is written to disk rather than dropped
+    /// at exit, and survives a relaunch: the owner is not asked for a password every cold start.
+    static let session: URLSession = {
         let config = URLSessionConfiguration.default
-        config.httpCookieStorage = .shared
+        config.httpCookieStorage = cookieStore
         config.httpCookieAcceptPolicy = .always
         config.httpShouldSetCookies = true
         // Every route is live data: a disk cache only wrote each poll, screenshots included, to disk.
         config.urlCache = nil
         return URLSession(configuration: config)
     }()
+
+    /// On an iPhone the cookie lives in the app group, so the share extension spends the app's
+    /// session instead of signing in with the stored password, which cannot pass TOTP. Only when
+    /// the build carries the group: a simulator build has no entitlement and keeps its own store.
+    /// The Mac's Services entry and menu bar panel run in the app, so its own store is shared.
+    private static var cookieStore: HTTPCookieStorage {
+        #if os(iOS)
+        guard FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) != nil
+        else { return .shared }
+        let group = HTTPCookieStorage.sharedCookieStorage(forGroupContainerIdentifier: appGroup)
+        if group.cookies?.isEmpty ?? true {
+            for cookie in HTTPCookieStorage.shared.cookies ?? [] { group.setCookie(cookie) }
+        }
+        return group
+        #else
+        return .shared
+        #endif
+    }
 
     /// An agent name is `^[a-z0-9][a-z0-9-]{0,30}$` on the daemon, but it arrives here from a
     /// text field, so it is escaped rather than trusted.
@@ -314,8 +388,14 @@ struct SchermesClient: Sendable {
         name.addingPercentEncoding(withAllowedCharacters: segment) ?? name
     }
 
+    /// A session handle is base64url, upper case included, and the daemon compares it byte for
+    /// byte, so the name escape (lower case only) would turn `A` into `%41` and miss.
+    private static let handleSegment = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+    /// `auth` marks the sign-in routes, whose 401 means a wrong password or code, not an expired
+    /// session, and must never send the caller round the re-login.
     private func send<T: Decodable>(
-        _ method: String, _ url: URL, body: (any Encodable)? = nil, headers: [String: String] = [:]
+        _ method: String, _ url: URL, body: (any Encodable)? = nil, headers: [String: String] = [:], auth: Bool = false
     ) async throws -> T {
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -325,17 +405,27 @@ struct SchermesClient: Sendable {
             request.setValue("application/json", forHTTPHeaderField: "content-type")
         }
 
-        let (data, response) = try await Self.session.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let (data, response) = try await urlSession.data(for: request)
+        return try decoded(data, response, auth: auth)
+    }
+
+    private func decoded<T: Decodable>(_ data: Data, _ response: URLResponse, auth: Bool) throws -> T {
+        let http = response as? HTTPURLResponse
+        let status = http?.statusCode ?? 0
 
         // Setup answers 201, create 201 and send 202: the whole 2xx range is success.
         guard (200..<300).contains(status) else {
-            if status == 401 { throw SchermesError.unauthorized }
             let reported = try? JSONDecoder().decode(ApiError.self, from: data)
-            throw SchermesError.daemon(
-                status: status,
-                message: reported?.error ?? "the daemon answered \(status)"
-            )
+            let message = reported?.error ?? "the daemon answered \(status)"
+            if status == 401 {
+                guard auth else { throw SchermesError.unauthorized }
+                if reported?.totpRequired == true { throw SchermesError.totpRequired(message) }
+            }
+            if status == 429 {
+                let wait = http?.value(forHTTPHeaderField: "Retry-After").flatMap { Int($0) } ?? 1
+                throw SchermesError.tooManyAttempts(retryAfter: max(wait, 1), message: message)
+            }
+            throw SchermesError.daemon(status: status, message: message)
         }
 
         return try JSONDecoder().decode(T.self, from: data)
@@ -348,16 +438,64 @@ struct SchermesClient: Sendable {
         try await send("GET", url("/api/health"))
     }
 
-    func setup(password: String) async throws {
-        let _: Empty = try await send("POST", url("/api/auth/setup"), body: ["password": password])
+    /// `setupToken` is the code a daemon with no owner prints in its log.
+    func setup(password: String, setupToken: String) async throws {
+        let body = ["password": password, "setupToken": setupToken]
+        let _: Empty = try await send("POST", url("/api/auth/setup"), body: body, auth: true)
     }
 
-    func login(password: String) async throws {
-        let _: Empty = try await send("POST", url("/api/auth/login"), body: ["password": password])
+    /// With TOTP on, the password alone answers `totpRequired`; the same request with `totp` or
+    /// `recoveryCode` signs in.
+    func login(password: String, totp: String? = nil, recoveryCode: String? = nil) async throws {
+        var body = ["password": password]
+        if let totp { body["totp"] = totp }
+        if let recoveryCode { body["recoveryCode"] = recoveryCode }
+        let _: Empty = try await send("POST", url("/api/auth/login"), body: body, auth: true)
     }
 
     func logout() async throws {
         let _: Empty = try await send("POST", url("/api/auth/logout"), body: Empty())
+    }
+
+    /// A wrong `current` is a 403, not a 401: it must not send the app round the re-login.
+    func changePassword(current: String, next: String) async throws -> PasswordChanged {
+        try await send("POST", url("/api/auth/password"), body: ["current": current, "next": next])
+    }
+
+    /// Newest seen first; `current` marks the one this app holds.
+    func sessions() async throws -> [SessionEntry] {
+        try await send("GET", url("/api/auth/sessions"))
+    }
+
+    func revokeSession(handle: String) async throws {
+        let escaped = handle.addingPercentEncoding(withAllowedCharacters: Self.handleSegment) ?? handle
+        let _: Empty = try await send("DELETE", url("/api/auth/sessions/\(escaped)"))
+    }
+
+    func totpStatus() async throws -> TotpStatus {
+        try await send("GET", url("/api/auth/totp"))
+    }
+
+    /// Starts enrolment. Nothing changes for sign-in until a code from the new secret is confirmed.
+    func setupTotp(password: String) async throws -> TotpSetup {
+        try await send("POST", url("/api/auth/totp/setup"), body: ["password": password])
+    }
+
+    func confirmTotp(code: String) async throws -> TotpConfirmed {
+        try await send("POST", url("/api/auth/totp/confirm"), body: ["code": code])
+    }
+
+    /// Turning it off takes the password plus a current code or an unused recovery code.
+    func disableTotp(password: String, code: String? = nil, recoveryCode: String? = nil) async throws {
+        var body = ["password": password]
+        if let code { body["code"] = code }
+        if let recoveryCode { body["recoveryCode"] = recoveryCode }
+        let _: Empty = try await send("DELETE", url("/api/auth/totp"), body: body)
+    }
+
+    /// Newest first; `before` is the oldest id already shown.
+    func audit(before: Int? = nil, limit: Int) async throws -> [AuditEvent] {
+        try await send("GET", url("/api/audit", MessageWindow(before: before, limit: limit)))
     }
 
     /// `attending` tells the daemon the owner is at this screen, so their phone stays quiet.
@@ -395,12 +533,17 @@ struct SchermesClient: Sendable {
     }
 
     /// A file for the agent's `~/uploads`. Base64 in JSON, the way a screenshot travels.
+    /// The body goes out from a file, base64 written a slice at a time: as one string, a 25 MB
+    /// share became a 33 MB string plus its JSON copy, more than a share extension may hold.
     func upload(agent: String, name: String, data: Data) async throws -> UploadResult {
-        try await send(
-            "POST",
-            url("/api/agents/\(Self.escape(agent))/uploads"),
-            body: ["name": name, "base64": data.base64EncodedString()]
-        )
+        var request = URLRequest(url: try url("/api/agents/\(Self.escape(agent))/uploads"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        let body = FileManager.default.temporaryDirectory.appending(path: "upload-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: body) }
+        try writeUploadBody(name: name, data: data, to: body)
+        let (reply, response) = try await urlSession.upload(for: request, fromFile: body)
+        return try decoded(reply, response, auth: false)
     }
 
     /// Passes a message or a file on to `agent`, which answers it in its own thread.
@@ -788,6 +931,6 @@ struct SchermesClient: Sendable {
         }
         parts.scheme = route.scheme == "https" ? "wss" : "ws"
         guard let socket = parts.url else { throw SchermesError.badURL }
-        return Self.session.webSocketTask(with: socket)
+        return urlSession.webSocketTask(with: socket)
     }
 }

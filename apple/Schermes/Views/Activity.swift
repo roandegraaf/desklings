@@ -7,6 +7,8 @@ struct ActivityView: View {
     let agent: String
 
     @State private var events: [ExecutionEvent]?
+    @State private var trouble: String?
+    @Environment(\.pollPhase) private var pollPhase
 
     /// The daemon answers with the newest this many, oldest first; the list reads newest first.
     private let tail = 200
@@ -39,18 +41,18 @@ struct ActivityView: View {
         #endif
         .background(Theme.ground)
         .overlay {
-            if events == nil {
+            if events == nil, let trouble {
+                ContentUnavailableView("Could not load the activity", systemImage: "exclamationmark.triangle", description: Text(trouble))
+            } else if events == nil {
                 ProgressView()
             } else if newest.isEmpty {
                 ContentUnavailableView("Nothing recorded yet", systemImage: "list.bullet.rectangle")
             }
         }
-        .task(id: agent) {
-            while !Task.isCancelled {
-                if let rows = try? await session.run({ try await $0.events(agent: agent, limit: tail) }) {
-                    events = rows
-                }
-                try? await Task.sleep(for: .seconds(4))
+        .task(id: PollKey(value: agent, phase: pollPhase)) {
+            await session.poll(every: .seconds(4), pollPhase, failed: { session.note($0, in: &trouble) }) {
+                events = try await session.run { try await $0.events(agent: agent, limit: tail) }
+                trouble = nil
             }
         }
     }
@@ -67,6 +69,7 @@ struct ActivityView: View {
         case .approval: "checkmark.seal"
         case .stop: "stop.circle"
         case .turn: "flag.checkered"
+        case .unknown: "questionmark.circle"
         }
     }
 }
@@ -326,7 +329,13 @@ struct AgentModelRow: View {
                 Text(trouble).font(.caption).foregroundStyle(Theme.failed)
             }
         }
-        .task { models = (try? await session.run { try await $0.models() }) ?? [] }
+        .task {
+            do {
+                models = try await session.run { try await $0.models() }
+            } catch {
+                session.note(error, in: &trouble)
+            }
+        }
         .onChange(of: agent.modelId) { _, now in assigned = now }
     }
 

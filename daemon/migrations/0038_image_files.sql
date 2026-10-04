@@ -1,0 +1,1 @@
+ALTER TABLE `messages` ADD `image_ref` text;

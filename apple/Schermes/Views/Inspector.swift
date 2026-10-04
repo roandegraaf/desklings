@@ -21,6 +21,7 @@ struct AgentInspector: View {
     #else
     @State private var expanded = false
     #endif
+    @State private var trouble: String?
 
     private var link: DesktopLink { desktops.link(agent.name) }
 
@@ -64,7 +65,7 @@ struct AgentInspector: View {
                 Spacer(minLength: 0)
                 if waiting {
                     Text("PAUSED")
-                        .font(.system(size: 11, weight: .bold))
+                        .font(.canvas(11, .caption2, weight: .bold))
                         .foregroundStyle(Theme.needsYou)
                         .padding(.horizontal, 9)
                         .padding(.vertical, 3)
@@ -81,6 +82,11 @@ struct AgentInspector: View {
                     .labelStyle(.iconOnly)
                     .buttonStyle(.pill(.secondary, round: true))
                     .help("Open the screen")
+            }
+            if let trouble {
+                Text(trouble)
+                    .font(.caption)
+                    .foregroundStyle(Theme.failed)
             }
         }
     }
@@ -121,9 +127,14 @@ struct AgentInspector: View {
     }
 
     private func takeControl() {
+        trouble = nil
         Task {
-            _ = try? await session.run { try await $0.setControl(agent: agent.name, held: true) }
-            expand()
+            do {
+                _ = try await session.run { try await $0.setControl(agent: agent.name, held: true) }
+                expand()
+            } catch {
+                if !error.isCancellation { trouble = error.localizedDescription }
+            }
         }
     }
 

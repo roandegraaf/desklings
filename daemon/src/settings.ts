@@ -1,13 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { eq } from 'drizzle-orm';
-import type { PushSettings, WebSettings } from '@schermes/shared';
+import type { ImageSettings, PushSettings, TimeSettings, WebSettings } from '@schermes/shared';
 import type { Db } from './db.ts';
 import { log } from './log.ts';
 import { parseMcpServers } from './mcp.ts';
 import type { McpServerSpec } from './mcp.ts';
 import { settings } from './schema.ts';
 import { decrypt, encrypt } from './secrets.ts';
+import { daemonTimezone, validTimezone } from './timezone.ts';
 import { BRAVE_SEARCH_URL } from './web.ts';
 import type { SearchConfig } from './web.ts';
 
@@ -19,6 +20,11 @@ const PUSH_TEAM_ID = 'push.teamId';
 const PUSH_BUNDLE_ID = 'push.bundleId';
 const PUSH_KEY = 'push.key';
 const PUSH_SANDBOX = 'push.sandbox';
+const TIMEZONE = 'owner.timezone';
+const IMAGE_RETENTION_DAYS = 'images.retentionDays';
+
+export const DEFAULT_IMAGE_RETENTION_DAYS = 30;
+export const MAX_IMAGE_RETENTION_DAYS = 3650;
 
 function read(db: Db, key: string): string | undefined {
   return db.select().from(settings).where(eq(settings.key, key)).get()?.value;
@@ -145,4 +151,43 @@ export function mcpServers(db: Db, masterKey: Buffer): McpServerSpec[] {
 
 export function writeMcpServers(db: Db, masterKey: Buffer, servers: readonly McpServerSpec[]): void {
   write(db, MCP_SERVERS, encrypt(masterKey, JSON.stringify(servers)), true);
+}
+
+/**
+ * The owner's IANA zone, which schedules and the idle window are read in. Unset is the daemon's
+ * own zone, so an install from before the setting keeps its clock. A stored zone this runtime no
+ * longer knows falls back the same way rather than leaving every schedule without a next run.
+ */
+export function readTimezone(db: Db): string {
+  const stored = read(db, TIMEZONE);
+  if (stored === undefined) return daemonTimezone();
+  if (validTimezone(stored)) return stored;
+  log.warn('the stored timezone is unknown here; using the daemon\'s', { timezone: stored });
+  return daemonTimezone();
+}
+
+export function readTimeSettings(db: Db): TimeSettings {
+  return { timezone: readTimezone(db) };
+}
+
+export function writeTimezone(db: Db, timezone: string): void {
+  write(db, TIMEZONE, timezone, false);
+}
+
+/** How long an agent's screenshots are kept. Zero keeps them forever. */
+export function readImageRetentionDays(db: Db): number {
+  const stored = Number(read(db, IMAGE_RETENTION_DAYS));
+  return validImageRetentionDays(stored) ? stored : DEFAULT_IMAGE_RETENTION_DAYS;
+}
+
+export function validImageRetentionDays(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= MAX_IMAGE_RETENTION_DAYS;
+}
+
+export function readImageSettings(db: Db): ImageSettings {
+  return { imageRetentionDays: readImageRetentionDays(db) };
+}
+
+export function writeImageRetentionDays(db: Db, days: number): void {
+  write(db, IMAGE_RETENTION_DAYS, String(days), false);
 }

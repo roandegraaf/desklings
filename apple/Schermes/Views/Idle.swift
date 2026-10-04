@@ -54,6 +54,7 @@ struct LastNight: View {
 
     @State private var passes: [IdlePass]?
     @State private var trouble: String?
+    @Environment(\.pollPhase) private var pollPhase
 
     private var groups: [(agent: String, passes: [IdlePass])] {
         let byAgent = Dictionary(grouping: passes ?? [], by: \.agent)
@@ -90,21 +91,12 @@ struct LastNight: View {
                 }
             }
         }
-        .task {
-            while !Task.isCancelled {
-                await load()
-                try? await Task.sleep(for: .seconds(30))
+        .task(id: pollPhase) {
+            await session.poll(every: .seconds(30), pollPhase, failed: { session.note($0, in: &trouble) }) {
+                let since = Int(Date().timeIntervalSince1970 * 1000) - 86_400_000
+                passes = try await session.run { try await $0.idlePasses(since: since) }
+                trouble = nil
             }
-        }
-    }
-
-    private func load() async {
-        let since = Int(Date().timeIntervalSince1970 * 1000) - 86_400_000
-        do {
-            passes = try await session.run { try await $0.idlePasses(since: since) }
-            trouble = nil
-        } catch {
-            if !error.isCancellation { trouble = error.localizedDescription }
         }
     }
 }
@@ -740,7 +732,11 @@ struct IdleSettingsView: View {
         } catch {
             if !error.isCancellation { trouble[.load] = error.localizedDescription }
         }
-        models = (try? await session.run { try await $0.models() }) ?? models
+        do {
+            models = try await session.run { try await $0.models() }
+        } catch {
+            session.note(error, in: &trouble[.load])
+        }
     }
 
     private func save(_ update: IdleSettingsUpdate, _ field: Field) {

@@ -10,11 +10,12 @@ harness. Everything else is here.
 | [deployment.md](deployment.md)          | Running it on Unraid or any Docker host, bare Debian, TLS, backups |
 | [configuration.md](configuration.md)    | Every environment variable, and the limits that are not one  |
 | [troubleshooting.md](troubleshooting.md) | Symptoms that have happened, and what they turned out to be |
+| [acceptance.md](acceptance.md)          | End-to-end checks to run in the app that automation cannot   |
 
 ## The rest of the map
 
 The project overview names **eleven** documents. Six of them are the files above, counting the
-project README; a seventh, the qcow2 build guide, went away with the VM deploy path. The other
+project README and leaving out the later acceptance list; a seventh, the qcow2 build guide, went away with the VM deploy path. The other
 four are sections of `architecture.md` rather than files of their own.
 
 | Subject                             | Where it lives                                                                                   |

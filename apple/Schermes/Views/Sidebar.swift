@@ -196,8 +196,12 @@ final class MacSplitController: NSSplitViewController {
         NSAnimationContext.runAnimationGroup { _ in
             inspectorItem.animator().isCollapsed = !shown
         } completionHandler: { [weak self] in
-            self?.animating = false
+            Task { @MainActor in self?.settled() }
         }
+    }
+
+    private func settled() {
+        animating = false
     }
 
     /// A drag that closes or opens the inspector goes back to the binding the header button reads.

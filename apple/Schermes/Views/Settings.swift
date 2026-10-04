@@ -11,6 +11,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
     case web
     case notifications
     case plugins
+    case account
     case daemon
     case about
 
@@ -22,6 +23,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         case .web: "Web search"
         case .notifications: "Notifications"
         case .plugins: "Plugins"
+        case .account: "Account"
         case .daemon: "Daemon"
         case .about: "About"
         }
@@ -33,6 +35,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         case .web: "magnifyingglass"
         case .notifications: "bell.badge"
         case .plugins: "puzzlepiece.extension"
+        case .account: "lock.shield"
         case .daemon: "server.rack"
         case .about: "info.circle"
         }
@@ -45,6 +48,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         case .web: BloubColorId.blue
         case .notifications: BloubColorId.red
         case .plugins: BloubColorId.orange
+        case .account: BloubColorId.green
         case .daemon: BloubColorId.grey
         case .about: BloubColorId.teal
         }
@@ -59,6 +63,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
     case .web: WebSearchPage(session: session)
     case .notifications: NotificationsPage(session: session)
     case .plugins: PluginsPage(session: session)
+    case .account: AccountPage(session: session)
     case .daemon: DaemonPage(session: session)
     case .about: AboutPage()
     }
@@ -199,7 +204,7 @@ struct SettingsSheet: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Theme.ground)
-        .frame(minWidth: 700, minHeight: 480, idealHeight: 580)
+        .frame(minWidth: 760, minHeight: 480, idealHeight: 580)
         .onAppear { if let start { tab = start } }
     }
 
@@ -327,6 +332,9 @@ struct ModelDraft: Equatable {
     var providerId: Int?
     var model = ""
     var extraBody = ""
+    /// Nil is unknown, which the daemon reads as its fixed default budget.
+    var contextWindow: Int?
+    var vision = true
 
     init(providerId: Int? = nil) {
         self.providerId = providerId
@@ -337,18 +345,24 @@ struct ModelDraft: Equatable {
         providerId = entry.providerId
         model = entry.model
         extraBody = entry.extraBody
+        contextWindow = entry.contextWindow
+        vision = entry.seesImages
     }
 
-    /// Everything for a new entry, only what changed for an existing one.
+    /// Everything for a new entry, only what changed for an existing one. A window cleared on an
+    /// existing entry goes out as `null`; a new entry without one leaves it out.
     func update(from existing: ModelEntry?) -> ModelUpdate {
         let name = name.trimmingCharacters(in: .whitespaces)
         let model = model.trimmingCharacters(in: .whitespaces)
         let extraBody = typedJSON(extraBody)
+        let windowUnchanged = existing.map { $0.contextWindow == contextWindow } ?? (contextWindow == nil)
         return ModelUpdate(
             name: name == existing?.name ? nil : name,
             providerId: providerId == existing?.providerId ? nil : providerId,
             model: model == existing?.model ? nil : model,
-            extraBody: extraBody == (existing?.extraBody ?? "") ? nil : extraBody
+            extraBody: extraBody == (existing?.extraBody ?? "") ? nil : extraBody,
+            contextWindow: windowUnchanged ? nil : .some(contextWindow),
+            vision: vision == existing?.seesImages ? nil : vision
         )
     }
 }
@@ -790,6 +804,7 @@ private struct ModelSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var draft: ModelDraft
+    @State private var windowText: String
     @State private var trouble: String?
     @State private var saving = false
 
@@ -799,6 +814,11 @@ private struct ModelSheet: View {
         self.providers = providers
         self.onSaved = onSaved
         _draft = State(initialValue: existing.map(ModelDraft.init) ?? ModelDraft(providerId: providers.first?.id))
+        _windowText = State(initialValue: existing?.contextWindow.map(String.init) ?? "")
+    }
+
+    private var windowTyped: Bool {
+        windowText.trimmingCharacters(in: .whitespaces).isEmpty || typedWholeNumber(windowText) != nil
     }
 
     var body: some View {
@@ -823,6 +843,31 @@ private struct ModelSheet: View {
                 }
             } footer: {
                 Text("The provider holds the endpoint and the key.")
+            }
+
+            Section {
+                LabeledContent("Context window") {
+                    TextField("Context window", text: Binding(get: { windowText }, set: { text in
+                        windowText = text
+                        draft.contextWindow = typedWholeNumber(text)
+                    }), prompt: Text("Unknown"))
+                        .font(.body.monospaced())
+                        #if os(iOS)
+                        .keyboardType(.numberPad)
+                        #endif
+                        .multilineTextAlignment(.trailing)
+                        .rowField()
+                }
+                if !windowTyped {
+                    Text("The context window is a whole number of tokens.")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.failed)
+                }
+                Toggle("Sees images", isOn: $draft.vision)
+            } header: {
+                Text("Capabilities").formHeader()
+            } footer: {
+                Text("The context window in tokens, from the model's card: the transcript is compacted to fit it. Blank uses the daemon's fixed budget. A model that does not see images gets a line of text in place of every screenshot.")
             }
 
             Section {
@@ -857,20 +902,20 @@ private struct ModelSheet: View {
         .sheetChrome(
             existing?.name ?? "Add model",
             confirm: saving ? "Saving…" : "Save",
-            confirmDisabled: saving,
+            confirmDisabled: saving || !windowTyped,
             cancel: { dismiss() },
             onConfirm: save
         )
         .presentationBackground(Theme.ground)
         #if os(macOS)
-        .frame(minWidth: 480, minHeight: 440)
+        .frame(minWidth: 480, minHeight: 560)
         #endif
     }
 
     /// Checking the fields is the daemon's: its refusal is shown as it came and the sheet keeps
     /// what was typed.
     private func save() {
-        guard !saving else { return }
+        guard !saving, windowTyped else { return }
         let update = draft.update(from: existing)
         guard existing == nil || update != ModelUpdate() else {
             dismiss()
@@ -932,6 +977,7 @@ private struct NotificationsPage: View {
     let session: Session
 
     @State private var devices: [Device] = []
+    @State private var devicesFailure: String?
     @State private var pushing = false
     @State private var pushed: PushTestResult?
     @Environment(PushRegistration.self) private var registration
@@ -986,11 +1032,17 @@ private struct NotificationsPage: View {
             }
         }
         .task(id: session.registeredDevice) {
-            devices = (try? await session.run { try await $0.devices() }) ?? []
+            do {
+                devices = try await session.run { try await $0.devices() }
+                devicesFailure = nil
+            } catch {
+                if !error.isCancellation { devicesFailure = error.localizedDescription }
+            }
         }
     }
 
     private var deviceLine: String {
+        if let devicesFailure { return "Could not list them: \(devicesFailure)" }
         let count = devices.isEmpty ? "None registered" : "\(devices.count) registered"
         let mine = registration.token.map { token in devices.contains { $0.token == token } } ?? false
         if mine { return count + ", this one included" }
@@ -1013,40 +1065,181 @@ private struct NotificationsPage: View {
     }
 }
 
-/// Which daemon this is talking to, and the two ways to stop.
+/// Which daemon this is talking to, its clock and screenshot retention, and the two ways to stop.
+/// The address and the exits sit outside the settings load: they are what an owner reaches for
+/// when the daemon cannot be read.
 private struct DaemonPage: View {
     let session: Session
 
     @Environment(\.dismiss) private var dismiss
 
+    @State private var stored: DaemonSettings?
+    @State private var form: SettingsForm?
+    @State private var daysText = ""
+    @State private var trouble: String?
+    @State private var saving = false
+    @State private var saved = false
+
+    private let deviceZone = TimeZone.current.identifier
+
     var body: some View {
         ThemedForm {
+            if let stored, let form = Binding($form) {
+                if stored.general.timezone == nil && stored.general.imageRetentionDays == nil {
+                    Section {
+                        Text("This daemon is too old to set its time zone or screenshot retention from here.")
+                            .foregroundStyle(Theme.muted)
+                    }
+                } else {
+                    general(form, stored: stored)
+                }
+            } else if let trouble {
+                Section {
+                    Text("Settings could not be read: \(trouble)")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.failed)
+                        .textSelection(.enabled)
+                }
+            } else {
+                Section { ProgressView().frame(maxWidth: .infinity) }
+            }
+
             Section {
                 LabeledContent("Address", value: session.client?.baseURL.absoluteString ?? "none")
                     .textSelection(.enabled)
-                // The address only: the password stays in the Keychain under it, so coming back
-                // to this daemon does not ask for one again.
+                if let url = session.client?.baseURL, Session.isCleartext(url) { CleartextWarning(url: url) }
                 Button("Use a different daemon") {
                     dismiss()
                     session.forgetServer()
                 }
                 .buttonStyle(.pill(.secondary))
+            } header: {
+                Text("Connection").formHeader()
             }
 
             Section {
                 Button("Log out", role: .destructive) {
                     dismiss()
-                    Task { await session.logOut() }
+                    session.logOut()
                 }
                 .buttonStyle(.pill(.destructive))
             } footer: {
-                Text("Logging out keeps the address and the stored password; using a different daemon keeps neither.")
+                Text("Both sign this device out and take it off the push list. Logging out keeps the address; using a different daemon forgets it too.")
             }
         }
+        .autocorrectionDisabled()
+        #if os(iOS)
+        .textInputAutocapitalization(.never)
+        #endif
         .navigationTitle(SettingsCategory.daemon.title)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
+        .task { await load() }
+    }
+
+    @ViewBuilder private func general(_ form: Binding<SettingsForm>, stored: DaemonSettings) -> some View {
+        let unchanged = form.wrappedValue == SettingsForm(stored)
+        let daysTyped = typedWholeNumber(daysText) != nil
+        let zone = form.wrappedValue.timezone.trimmingCharacters(in: .whitespaces)
+        Section {
+            LabeledContent("Time zone") {
+                TextField("Time zone", text: form.timezone, prompt: Text(verbatim: deviceZone))
+                    .multilineTextAlignment(.trailing)
+                    .rowField()
+            }
+            if zone != deviceZone {
+                Button("Use this device's (\(deviceZone))") { form.wrappedValue.timezone = deviceZone }
+                    .buttonStyle(.pill(.secondary))
+            }
+        } header: {
+            Text("Clock").formHeader()
+        } footer: {
+            Text(zoneFooter(zone))
+        }
+
+        Section {
+            LabeledContent("Keep screenshots for") {
+                HStack(spacing: 6) {
+                    TextField("Days", text: Binding(get: { daysText }, set: { text in
+                        daysText = text
+                        if let days = typedWholeNumber(text) { form.wrappedValue.imageRetentionDays = days }
+                    }), prompt: Text(verbatim: "\(defaultImageRetentionDays)"))
+                        .font(.body.monospaced())
+                        #if os(iOS)
+                        .keyboardType(.numberPad)
+                        #endif
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 80)
+                        .rowField()
+                    Text("days").foregroundStyle(Theme.muted)
+                }
+            }
+            if !daysTyped {
+                Text("Days is a whole number.")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.failed)
+            }
+        } header: {
+            Text("Screenshots").formHeader()
+        } footer: {
+            Text("Agent screenshots older than this are deleted and show as \"screenshot expired\". 0 keeps them forever, at most \(maxImageRetentionDays). Pictures you sent are always kept.")
+        }
+
+        Section {
+            Button(saving ? "Saving…" : "Save", action: save)
+                .buttonStyle(.pill(.primary))
+                .disabled(saving || unchanged || !daysTyped)
+            if let trouble {
+                Text(trouble)
+                    .font(.footnote)
+                    .foregroundStyle(Theme.failed)
+                    .textSelection(.enabled)
+            } else if saved && unchanged {
+                Text("Saved.")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.muted)
+            }
+        }
+    }
+
+    private func adopt(_ answer: DaemonSettings) {
+        stored = answer
+        form = SettingsForm(answer)
+        daysText = String(SettingsForm(answer).imageRetentionDays)
+    }
+
+    private func zoneFooter(_ zone: String) -> String {
+        let base = "Schedules, the idle window and the idle budget's day follow this zone, an IANA name such as Europe/Amsterdam."
+        guard let known = TimeZone(identifier: zone) else {
+            return zone.isEmpty ? base : base + " This device does not know \(zone); the daemon will say if it does not either."
+        }
+        let now = Date.now.formatted(Date.FormatStyle(date: .omitted, time: .shortened, timeZone: known))
+        return base + " It is \(now) there now."
+    }
+
+    private func load() async {
+        do {
+            adopt(try await session.run { try await $0.settings() })
+        } catch {
+            if !error.isCancellation { trouble = error.localizedDescription }
+        }
+    }
+
+    private func save() {
+        guard let form, !saving, typedWholeNumber(daysText) != nil else { return }
+        saving = true
+        saved = false
+        trouble = nil
+        Task {
+            do {
+                adopt(try await session.run { try await $0.saveSettings(form.generalUpdate) })
+                saved = true
+            } catch {
+                if !error.isCancellation { trouble = error.localizedDescription }
+            }
+            saving = false
+        }
     }
 }
 
@@ -1171,7 +1364,7 @@ struct PluginsPage: View {
     private func load() async {
         do {
             servers = try await session.run { try await $0.mcpServers() }
-            agents = (try? await session.run { try await $0.agents() })?.filter { $0.parentId == nil } ?? []
+            agents = try await session.run { try await $0.agents() }.filter { $0.parentId == nil }
         } catch {
             if !error.isCancellation { trouble = error.localizedDescription }
         }

@@ -12,9 +12,11 @@ import {
   events,
   forms,
   formVault,
+  hiddenValues,
   messages,
   schedules,
   summaries,
+  turnQueue,
 } from './schema.ts';
 import type { Db } from './db.ts';
 import type { Exec } from './exec.ts';
@@ -48,25 +50,37 @@ export type DesktopOps = {
   ensure(name: string, display: number, tag?: string): Promise<DesktopOutcome>;
   /** One display of this agent's user, and nothing else it runs. */
   stopDisplay(name: string, display: number): Promise<void>;
-  /** Everything this agent is running, stopped. Called when the agent is deleted: its display
-   * number goes back in the pool, and an Xvnc still holding it would take the next agent's. */
+  /** Everything this agent is running, stopped: its display number can go back in the pool,
+   * and an Xvnc still holding it would take the next agent's. */
   stop(name: string): Promise<void>;
+  /** Stopped for good, then its Linux user, home and sandbox removed, so a new agent with the
+   * same name starts empty. Rejects when any of it is left behind; running it again finishes it. */
+  remove(name: string): Promise<void>;
   /** Moves the Linux user and its home to a new name. Only with the desktop stopped: usermod
    * refuses a user that still has processes. */
   rename(from: string, to: string): Promise<void>;
 };
 
+/** Run as the agent user: `enter` runs a command inside the agent's sandbox. See infra/desktop. */
+export const SANDBOX = `${config.desktopScripts}/sandbox.sh`;
+
 export const systemDesktop: DesktopOps = {
   async stop(name) {
-    const user = `agent-${name}`;
-    // Xvnc, the window manager, the dock and whatever the agent left running, in one signal.
-    // `pkill` exits 1 when nothing matched, which is a desktop that was already down.
-    await run('sudo', ['-n', '-u', user, 'pkill', '-u', user]).catch(() => undefined);
+    // Xvnc, the window manager, the dock, whatever the agent left running and the sandbox
+    // itself. An agent whose user is already gone has nothing left to stop.
+    await run('sudo', ['-n', '-u', `agent-${name}`, SANDBOX, 'stop']).catch((error: unknown) =>
+      log.warn('sandbox would not stop', { agent: name, error }),
+    );
   },
 
   async stopDisplay(name, display) {
     const user = `agent-${name}`;
     await run('sudo', ['-n', '-u', user, 'pkill', '-u', user, '-f', `Xvnc :${display}( |$)`]).catch(() => undefined);
+    await run('sudo', ['-n', '-u', user, SANDBOX, 'unforward', String(display)]).catch(() => undefined);
+  },
+
+  async remove(name) {
+    await run('sudo', ['-n', `${config.desktopScripts}/delete-agent-user.sh`, name]);
   },
 
   async rename(from, to) {
@@ -108,7 +122,7 @@ export async function agentTarget(exec: Exec, agent: Agent): Promise<AgentTarget
 }
 
 /**
- * The argv that turns a command into that command run as the agent. `sudo` strips the
+ * The argv for `sudo` that runs a command as the agent, inside its sandbox. `sudo` strips the
  * environment, so all five variables an X client needs are passed explicitly, and `--chdir`
  * comes before them because `env` treats the first non-assignment operand as the command.
  */
@@ -117,6 +131,8 @@ export function asAgent(target: AgentTarget, argv: readonly string[]): string[] 
     '-n',
     '-u',
     target.user,
+    SANDBOX,
+    'enter',
     'env',
     `--chdir=${target.cwd ?? target.home}`,
     `HOME=${target.home}`,
@@ -287,6 +303,8 @@ export function insertWorker(
 
 /** Drops the row only. The Linux user and its home stay, and a retry reuses them. */
 export function forgetAgent(db: Db, name: string): void {
+  const row = db.select({ id: agents.id }).from(agents).where(eq(agents.name, name)).get();
+  if (row !== undefined) db.delete(turnQueue).where(eq(turnQueue.agentId, row.id)).run();
   db.delete(agents).where(eq(agents.name, name)).run();
 }
 
@@ -295,9 +313,8 @@ export function forgetAgent(db: Db, name: string): void {
  * events, the approvals it asked for, and every thread it was the only agent in. A thread it
  * shared with somebody else outlives it, minus its own messages and its seat in it.
  *
- * The Linux user and its home stay, as `forgetAgent` leaves them: a home is the agent's work,
- * and nothing here is worth destroying it for. Stopping the desktop is `DesktopOps.stop`, which
- * the route calls before this — the row is what frees the display number.
+ * Rows only. The Linux user, its home and its sandbox are `DesktopOps.remove`, which callers
+ * run first — the row is what frees the display number and the name.
  */
 export function deleteAgent(db: Db, agent: Agent): void {
   for (const worker of db.select().from(agents).where(eq(agents.parentId, agent.id)).all()) {
@@ -313,7 +330,9 @@ export function deleteAgent(db: Db, agent: Agent): void {
   db.delete(approvals).where(eq(approvals.agentId, agent.id)).run();
   db.delete(forms).where(eq(forms.agentId, agent.id)).run();
   db.delete(formVault).where(eq(formVault.agentId, agent.id)).run();
+  db.delete(hiddenValues).where(eq(hiddenValues.agentId, agent.id)).run();
   db.delete(schedules).where(eq(schedules.agentId, agent.id)).run();
+  db.delete(turnQueue).where(eq(turnQueue.agentId, agent.id)).run();
   db.delete(events).where(eq(events.agentId, agent.id)).run();
   db.delete(conversationParticipants).where(eq(conversationParticipants.agentId, agent.id)).run();
   // An answer it sent back sits in the asker's own thread, which stays.

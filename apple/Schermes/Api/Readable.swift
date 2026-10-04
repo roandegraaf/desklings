@@ -228,6 +228,9 @@ func sentence(for event: ExecutionEvent) -> String {
             : data.text("target").map { "the agent \($0)" } ?? "something"
         guard let approved = data.flag("approved") else { return "Asked you to delete \(what)" }
         return approved ? "You approved deleting \(what)" : "You refused to delete \(what)"
+
+    case .unknown:
+        return "Something this app does not know yet happened"
     }
 }
 

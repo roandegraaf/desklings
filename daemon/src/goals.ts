@@ -246,7 +246,7 @@ async function removeHelpers(ops: HelperOps, goalId: number): Promise<void> {
     const agent = findAgentById(ops.db, helper.agentId);
     if (agent === undefined) continue;
     if (helper.kind === 'agent') {
-      await ops.desktop.stop(agent.name).catch((error: unknown) => log.error('desktop would not stop', { agent: agent.name, error }));
+      await ops.desktop.remove(agent.name).catch((error: unknown) => log.error('helper user would not go', { agent: agent.name, error }));
       deleteAgent(ops.db, agent);
     } else {
       const parent = agent.parentId === undefined ? undefined : findAgentById(ops.db, agent.parentId);

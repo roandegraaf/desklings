@@ -2,6 +2,7 @@ import { SEARCH_KINDS } from '@schermes/shared';
 import type { SearchAnswer, SearchFilters, SearchKind, SearchResult } from '@schermes/shared';
 import { agentTarget, asAgent, isWorker, listAgents } from './agents.ts';
 import { participantAgents } from './conversations.ts';
+import { resolveImage } from './images.ts';
 import type { Db } from './db.ts';
 import type { Exec } from './exec.ts';
 import { log } from './log.ts';
@@ -67,18 +68,20 @@ async function readScreenshots(db: Db, exec: Exec): Promise<void> {
   if ((await exec('sh', ['-c', 'command -v tesseract'])).code !== 0) return;
   const sqlite = db.$client;
   const next = sqlite.prepare(
-    'SELECT id, conversation_id AS conversationId, image FROM messages WHERE image IS NOT NULL ' +
+    'SELECT id, conversation_id AS conversationId, image, image_ref AS imageRef FROM messages ' +
+      'WHERE (image IS NOT NULL OR image_ref IS NOT NULL) ' +
       'AND id NOT IN (SELECT rowid FROM screenshots_fts) ORDER BY id DESC LIMIT 1',
   );
   const mark = sqlite.prepare('INSERT INTO screenshots_fts (rowid, text) VALUES (?, ?)');
   for (let done = 0; done < OCR_PER_PASS; done += 1) {
-    const row = next.get() as { id: number; conversationId: number; image: string } | undefined;
+    const row = next.get() as { id: number; conversationId: number; image: string | null; imageRef: string | null } | undefined;
     if (row === undefined) return;
     let text = '';
     const agent = participantAgents(db, row.conversationId).find((candidate) => !isWorker(candidate));
     try {
-      const image = JSON.parse(row.image) as { base64?: unknown };
-      if (agent !== undefined && typeof image.base64 === 'string') {
+      // An expired picture is still marked, with no text, or this pass would pick it again forever.
+      const image = resolveImage(db, row.image, row.imageRef);
+      if (agent !== undefined && image !== undefined && image.base64 !== '') {
         const result = await exec('sudo', asAgent(await agentTarget(exec, agent), ['bash', '-c', OCR_SCRIPT]), {
           input: image.base64,
           timeoutMs: OCR_TIMEOUT_MS,

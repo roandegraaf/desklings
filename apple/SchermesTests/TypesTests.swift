@@ -159,7 +159,7 @@ private func encode(_ value: some Encodable) throws -> String {
     var fresh = ModelDraft(providerId: 2)
     fresh.name = "Local"
     fresh.model = "qwen"
-    #expect(fresh.update(from: nil) == ModelUpdate(name: "Local", providerId: 2, model: "qwen"))
+    #expect(fresh.update(from: nil) == ModelUpdate(name: "Local", providerId: 2, model: "qwen", vision: true))
 }
 
 @Test func aProviderEditSendsOnlyWhatChangedAndNeverABlankKey() throws {
@@ -258,7 +258,7 @@ private func encode(_ value: some Encodable) throws -> String {
     // A name is typed, so it is escaped rather than trusted to be `^[a-z0-9][a-z0-9-]{0,30}$`.
     #expect(try client.messagesURL(.agent("a/b"), .newest).absoluteString
             == "http://127.0.0.1:7777/api/agents/a%2Fb/messages")
-    // A shared thread is the same window on a different route.
+    // A thread by its conversation id is the same window on a different route.
     #expect(try client.messagesURL(.conversation(9), .newest).absoluteString
             == "http://127.0.0.1:7777/api/conversations/9/messages")
     #expect(try client.messagesURL(.conversation(9), MessageWindow(limit: 1)).absoluteString

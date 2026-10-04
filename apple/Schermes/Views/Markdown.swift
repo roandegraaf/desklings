@@ -483,7 +483,7 @@ nonisolated func exportMarkdown(_ messages: [Message], title: String, titles: [S
             for call in message.toolCalls ?? [] {
                 out.append("- `\(call.name)` \(call.arguments)")
             }
-        case .tool:
+        case .tool, .unknown:
             if message.image != nil { out.append("- screenshot") }
             if !message.content.isEmpty {
                 out.append("```")

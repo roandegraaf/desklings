@@ -218,6 +218,62 @@
       "when": 1790967992444,
       "tag": "0030_dry_maginty",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1790977571045,
+      "tag": "0031_turn_queue",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1790979673537,
+      "tag": "0032_model_capabilities",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1790980856400,
+      "tag": "0033_hidden_values",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1790982115967,
+      "tag": "0034_provider_echo",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "6",
+      "when": 1790983086270,
+      "tag": "0035_session_details",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "6",
+      "when": 1790984035681,
+      "tag": "0036_account_security",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "6",
+      "when": 1791014978124,
+      "tag": "0037_messages_sender_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "6",
+      "when": 1791015937001,
+      "tag": "0038_image_files",
+      "breakpoints": true
     }
   ]
 }

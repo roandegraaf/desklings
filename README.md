@@ -1,8 +1,8 @@
 # schermes
 
 A single self-hosted Linux machine that runs persistent AI agents. Each agent gets its own
-Linux user, X display, browser and terminal, and you drive and watch all of them from one web
-UI. Point it at any OpenAI-compatible model endpoint and the agents work.
+Linux user sandbox, X display, browser and terminal, and you drive and watch all of them from
+the native SwiftUI app for iOS and macOS. Point it at any OpenAI-compatible model endpoint and the agents work.
 
 MIT licensed. One repository. No Kubernetes, no container per agent, no cloud account.
 
@@ -14,7 +14,7 @@ model endpoint. Every piece below runs in the Docker harness on every smoke run.
 The desktop foundation: `install.sh` provisions a Debian 13 host, and
 several agents run concurrent Xvnc desktops with their own Chromium profiles, controllable
 through xdotool and observable through scrot. The daemon: a Node service under systemd that
-owns the single web port, persists to SQLite, makes you set an owner password on first visit,
+owns the single web port, persists to SQLite, has you claim it with an owner password and a first-run setup token,
 and stores the model provider settings with the API key encrypted at rest. Agent lifecycle:
 creating an agent through the API creates its Linux user, home layout and X display, and a
 restarted daemon adopts the desktops that are still running instead of respawning them. The
@@ -58,7 +58,9 @@ docker compose up -d
 docker compose exec schermes /opt/schermes/infra/desktop/check.sh # the desktops
 ```
 
-Then point the app at http://127.0.0.1:7777 and set the owner password.
+Then point the app at http://127.0.0.1:7777 and sign in. On a fresh daemon `smoke.sh` claims
+the owner with `SCHERMES_SMOKE_PASSWORD`, reading the first-run setup token from the daemon log.
+To claim it with your own password instead, see [deployment](docs/deployment.md#docker).
 
 `smoke.sh` walks the API: health, the first-run password, the second setup attempt being
 refused, an unauthenticated request being rejected, login, and the settings round-trip with the
@@ -106,8 +108,10 @@ pnpm check   # TypeScript, strict
 | `SCHERMES_GEOMETRY`    | `1920x1200`         | Desktop size                           |
 | `SCHERMES_MAX_LOOPS`   | `8`                 | Concurrent agent turns                 |
 | `SCHERMES_MAX_WORKERS` | `4`                 | Concurrent task workers                |
+| `SCHERMES_APNS_KEY_FILE` | unset             | An APNs `.p8` to load at boot          |
+| `SCHERMES_APNS_KEY_ID` | from the file name  | Its key id                             |
 
-That is all of them. The model provider is not configured here: base URL, model and API key are
+That is all the daemon reads. The model provider is not configured here: base URL, model and API key are
 set in the app and stored encrypted, and so are the web search key and the APNs key. Full reference, including the limits that are constants
 rather than variables, in [docs/configuration.md](docs/configuration.md).
 
@@ -125,6 +129,9 @@ infra/install.sh                     idempotent Debian 13 provisioning
 infra/schermes.service               systemd unit for the daemon
 infra/smoke.sh                       runnable check for the daemon API
 infra/desktop/create-agent-user.sh   create agent-<name>, home, workspace, uploads, profile
+infra/desktop/rename-agent-user.sh   rename an agent's user, home and sandbox layer
+infra/desktop/delete-agent-user.sh   remove an agent's user, home and sandbox layer
+infra/desktop/sandbox.sh             each agent's user-namespace sandbox: start, enter, stop
 infra/desktop/start-desktop.sh       spawn or adopt an agent's Xvnc display and window manager
 infra/desktop/check.sh               runnable check for the whole desktop foundation
 infra/provider-stub.py               scripted OpenAI-compatible endpoint, used by smoke.sh
@@ -147,9 +154,9 @@ echo SCHERMES_BIND=0.0.0.0 > .env
 docker compose up -d --build
 ```
 
-Point the app at `http://<host>:7777` and set the owner password. Whoever reaches the port
-first becomes the owner, so claim it promptly on a network you trust — setup succeeds exactly
-once. Upgrading is `git pull` and the same `up -d --build`: the database, the master key, the
+Claim it with the first-run setup token from `docker compose logs schermes`, then sign in from
+the app at `http://<host>:7777`; [deployment](docs/deployment.md#docker) has the exact
+calls. Setup needs that token and succeeds exactly once. Upgrading is `git pull` and the same `up -d --build`: the database, the master key, the
 agent homes and the shared directory live in named volumes and survive it.
 
 For a domain, put `SCHERMES_DOMAIN=schermes.example.com` and `COMPOSE_PROFILES=domain` in
@@ -167,4 +174,5 @@ including TLS and what to back up, in [docs/deployment.md](docs/deployment.md).
 [architecture](docs/architecture.md) for why it is shaped this way,
 [development](docs/development.md) to work on it, [deployment](docs/deployment.md) to run it,
 [configuration](docs/configuration.md) for every knob, and
-[troubleshooting](docs/troubleshooting.md) when something is already wrong.
+[troubleshooting](docs/troubleshooting.md) when something is already wrong, and
+[acceptance](docs/acceptance.md) for the end-to-end checks to run in the app.

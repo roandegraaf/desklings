@@ -1,5 +1,31 @@
 import SwiftUI
 
+/// The system pasteboard behind a seam: the macOS test host is the owner's real app, and a test
+/// must never read or replace what they copied.
+protocol Clipboard {
+    var text: String? { get }
+    func put(_ text: String)
+}
+
+struct SystemClipboard: Clipboard {
+    var text: String? {
+        #if os(macOS)
+        NSPasteboard.general.string(forType: .string)
+        #else
+        UIPasteboard.general.string
+        #endif
+    }
+
+    func put(_ text: String) {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #else
+        UIPasteboard.general.string = text
+        #endif
+    }
+}
+
 /// One agent's desktop connection: the picture, and the one ordered pipe input goes down. Kept
 /// apart from `DesktopView` so the inspector's thumbnail and the full view it opens can share it:
 /// Xvnc counts a viewer per socket, and two of them on one desktop is what this prevents.
@@ -10,6 +36,11 @@ import SwiftUI
     @ObservationIgnored private var input: AsyncStream<@Sendable (RfbClient) async -> Void>.Continuation?
     /// Put back on every connect, so a socket that is replaced keeps the hold the viewer asked for.
     @ObservationIgnored private var holding = false
+    @ObservationIgnored private let clipboard: any Clipboard
+
+    init(clipboard: any Clipboard = SystemClipboard()) {
+        self.clipboard = clipboard
+    }
 
     func hold(_ wanted: Bool) {
         holding = wanted
@@ -20,12 +51,39 @@ import SwiftUI
         input?.yield(call)
     }
 
+    /// The paste chord with `text` put on the agent's clipboard first. No text (an image, or an
+    /// empty clipboard) is the bare chord, which pastes whatever the agent has. A text too long to
+    /// carry is not pasted at all, and the answer is what to tell the owner.
+    func paste(_ text: String?, keysym: UInt32 = Keysym.v) -> String? {
+        guard let text, !text.isEmpty else {
+            send { await $0.shortcut(keysym) }
+            return nil
+        }
+        guard RfbClient.canCarry(text) else {
+            return "That is too much text to paste onto the desktop (\(maxCutText / 1024) KB at most)."
+        }
+        send { await $0.paste(text, keysym: keysym) }
+        return nil
+    }
+
+    func pasteClipboard(keysym: UInt32 = Keysym.v) -> String? {
+        paste(clipboard.text, keysym: keysym)
+    }
+
+    private func copied(_ text: String) {
+        clipboard.put(text)
+    }
+
     /// The client runs as a child of this task rather than beside it, so cancelling the caller
     /// cancels it whatever the frame stream happens to be doing: cancellation reaches `run()`,
     /// which closes the socket and finishes the stream, which is what ends the loop below.
     func run(session: Session, agent: String) async {
-        guard let socket = try? session.client?.vnc(agent: agent) else {
-            failure = SchermesError.badURL.errorDescription
+        let socket: URLSessionWebSocketTask
+        do {
+            guard let made = try session.client?.vnc(agent: agent) else { throw SchermesError.badURL }
+            socket = made
+        } catch {
+            failure = error.localizedDescription
             return
         }
         let client = RfbClient(transport: WebSocketTransport(socket))
@@ -43,6 +101,8 @@ import SwiftUI
             // the button up that ends it are not interchangeable, and separate tasks onto an actor
             // have no order at all.
             group.addTask { for await call in calls { await call(client) } }
+            // The client only surfaces the desktop's clipboard while this viewer holds it.
+            group.addTask { for await text in client.cuts { await self.copied(text) } }
 
             for await event in client.events {
                 switch event {
@@ -107,8 +167,11 @@ struct DesktopWindow: View {
     let session: Session
     let name: String
 
-    @State private var agent: Agent?
-    @State private var gone = false
+    @Environment(AgentFeed.self) private var feed
+
+    private var agent: Agent? { feed.agents.first { $0.name == name } }
+    private var gone: Bool { feed.loaded && agent == nil }
+    @State private var loadFailure: String?
 
     var body: some View {
         Group {
@@ -116,19 +179,22 @@ struct DesktopWindow: View {
                 DesktopView(session: session, agent: agent)
             } else if gone {
                 ContentUnavailableView("No screen", systemImage: "display", description: Text("This agent no longer exists."))
+            } else if let loadFailure {
+                ContentUnavailableView("No screen", systemImage: "display", description: Text(loadFailure))
             } else {
                 ProgressView()
             }
         }
         .frame(minWidth: 560, minHeight: 360)
         .windowToolbarFullScreenVisibility(.onHover)
+        // The list is the app's one poll; this only makes sure a window opened first has one.
         .task {
-            while !Task.isCancelled {
-                if let rows = try? await session.run({ try await $0.agents() }) {
-                    agent = rows.first { $0.name == name }
-                    gone = agent == nil
+            if !feed.loaded {
+                do {
+                    try await feed.refresh()
+                } catch {
+                    loadFailure = session.complaint(about: error)
                 }
-                try? await Task.sleep(for: .seconds(2))
             }
         }
     }
@@ -281,7 +347,7 @@ struct DesktopView: View {
             .lineLimit(1)
             .accessibilityLabel(recording != nil ? "Stop and hand over" : holding ? (handOver ? "Give it back" : "Return control") : "Take control")
             // Unknown ownership is not a no: until the daemon has answered there is nothing
-            // to take or return, exactly as the web UI has it.
+            // to take or return.
             .disabled(held == nil)
     }
 
@@ -314,6 +380,15 @@ struct DesktopView: View {
             // The software keyboard is raised deliberately: it covers half the desktop, and most
             // of what is done on one is done with the pointer.
             if holding {
+                // A system paste control, which reads the clipboard without asking each time.
+                PasteButton(payloadType: String.self) { strings in
+                    Task { @MainActor in
+                        if let why = link.paste(strings.first) { trouble = why }
+                    }
+                }
+                .labelStyle(.iconOnly)
+                .buttonBorderShape(.circle)
+
                 Button(
                     typing ? "Hide keyboard" : "Keyboard",
                     systemImage: typing ? "keyboard.chevron.compact.down" : "keyboard"
@@ -358,11 +433,14 @@ struct DesktopView: View {
     private func follow() async {
         while !Task.isCancelled {
             // A poll that failed says nothing about who holds the desktop, so the last answer
-            // stands rather than being replaced by a guess. The web UI makes the same call.
-            if let state = try? await session.run({ try await $0.control(agent: agent.name) }) {
+            // stands rather than being replaced by a guess.
+            do {
+                let state = try await session.run { try await $0.control(agent: agent.name) }
                 held = state.held
                 handOver = state.handOver ?? false
                 recording = state.recording
+            } catch {
+                if trouble == nil, let complaint = session.complaint(about: error) { trouble = complaint }
             }
             try? await Task.sleep(for: .seconds(4))
         }
@@ -417,6 +495,13 @@ struct DesktopView: View {
         switch event {
         case .key(let keysym, let down):
             link.send { await $0.key(keysym, down: down) }
+
+        case .shortcut(let keysym):
+            if Keysym.isPaste(keysym) {
+                if let why = link.pasteClipboard(keysym: keysym) { trouble = why }
+            } else {
+                link.send { await $0.shortcut(keysym) }
+            }
 
         case .move(let point):
             guard let (x, y) = landing(point) else { return }

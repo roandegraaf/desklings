@@ -47,6 +47,12 @@ needing a display, a Linux user or a real `sudo` belongs in the harness instead.
 | `agents.test.ts`     | Agent names, display allocation, desktop adoption on restart                    |
 | `db.test.ts`         | Migrations over a populated database, and foreign keys staying enforced         |
 | `vnc.test.ts`        | The VNC WebSocket proxy's auth and byte relay                                   |
+| `account.test.ts`    | Password change, sessions, TOTP and recovery codes, the audit log               |
+| `images.test.ts`     | Message images as content-addressed files, the resumable move, retention        |
+| `provider-stub.test.ts` | The scripted endpoint's real-provider wire modes (`STUB_*`)                  |
+| `imap.test.ts`, `triggers.test.ts` | Mailbox parsing and the seen-UID cursor; trigger proposals, webhooks, checks |
+| `goals.test.ts`, `workers.test.ts`, `interview.test.ts` | Goals and helpers, task worker setup, the interview and profile |
+| `snapshots.test.ts`, `models.test.ts` | Workspace snapshots and their pruning; the model and provider registry |
 | `mcp.test.ts`, `web.test.ts`, `secrets.test.ts`, `log.test.ts` | MCP server config, web search/fetch, encryption, log redaction |
 
 The seams are dependency parameters, not mocks:

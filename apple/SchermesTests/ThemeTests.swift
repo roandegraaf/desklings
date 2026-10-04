@@ -62,7 +62,7 @@ func everyStateHasASymbolAndAWord(state: AgentState) {
     case .thinking, .using_computer, .using_terminal: #expect(presentation.role == .busy)
     case .failed: #expect(presentation.role == .failed)
     case .completed: #expect(presentation.role == .done)
-    case .idle, .waiting_for_user, .waiting_for_agent, .waiting_for_task_worker: #expect(presentation.role == .quiet)
+    case .idle, .waiting_for_user, .waiting_for_agent, .waiting_for_task_worker, .unknown: #expect(presentation.role == .quiet)
     }
 }
 

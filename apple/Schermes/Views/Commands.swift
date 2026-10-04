@@ -29,18 +29,9 @@ enum SlashCommand: String, CaseIterable, Identifiable {
     /// What follows the command, for the one that takes something.
     var argument: String? { self == .remember ? "note" : nil }
 
-    /// A shared thread has no single agent whose screen, memory or role it is.
-    var sharedToo: Bool {
-        switch self {
-        case .new, .compact, .stop, .retry, .undo: true
-        default: false
-        }
-    }
-
     /// A task worker has no composer, so it has no commands either.
     static func offered(in thread: ChatThread) -> [SlashCommand] {
-        if thread.isWorker { return [] }
-        return thread.only == nil ? allCases.filter(\.sharedToo) : allCases
+        thread.isWorker ? [] : allCases
     }
 }
 
@@ -64,15 +55,11 @@ func parseCommand(_ text: String, in thread: ChatThread) -> (command: SlashComma
     return (command, argument)
 }
 
-/// What `/compact` did, in words. Per agent in a shared thread, because each folds its own view.
-func compactionNotice(_ result: CompactResult, titles: [String: String]) -> String {
-    let folded = result.compacted.filter { $0.value > 0 }
-    if folded.isEmpty { return "Nothing new to fold in since the last summary." }
-    if result.compacted.count == 1, let count = folded.first?.value {
-        return "Folded \(count) message\(count == 1 ? "" : "s") into a summary."
-    }
-    let parts = folded.keys.sorted().map { "\(titles[$0] ?? $0) (\(folded[$0]!))" }
-    return "Folded into a summary for " + parts.joined(separator: ", ") + "."
+/// What `/compact` did, in words.
+func compactionNotice(_ result: CompactResult) -> String {
+    let count = result.compacted.values.reduce(0, +)
+    if count == 0 { return "Nothing new to fold in since the last summary." }
+    return "Folded \(count) message\(count == 1 ? "" : "s") into a summary."
 }
 
 /// `MEMORY.md` with the note as its last line, written the way the agent's own `remember` writes

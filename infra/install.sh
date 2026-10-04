@@ -25,6 +25,7 @@ apt-get install -y --no-install-recommends \
   tint2 pcmanfm lxterminal hsetroot \
   x11-utils x11-xserver-utils xdotool scrot xclip xauth \
   chromium \
+  uidmap fuse-overlayfs fuse3 passt libcap2-bin \
   fonts-dejavu fonts-liberation fonts-noto-color-emoji
 rm -rf /var/lib/apt/lists/*
 
@@ -39,6 +40,14 @@ case "$DISPLAY" in
   :[0-9]*) d="${DISPLAY#:}"; export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --remote-debugging-port=$((9222 + ${d%%.*}))" ;;
 esac
 EOF
+
+log "sandbox id mapping"
+# Setuid-root newuidmap cannot write uid_map in a container without CAP_SYS_ADMIN: opening it
+# as euid 0 needs that capability over the target namespace. File capabilities keep the euid
+# at the namespace owner, which the kernel accepts. See docs/architecture.md, "Per-agent sandbox".
+chmod u-s /usr/bin/newuidmap /usr/bin/newgidmap
+setcap cap_setuid+ep /usr/bin/newuidmap
+setcap cap_setgid+ep /usr/bin/newgidmap
 
 log "node ${NODE_MAJOR} + pnpm"
 if ! /opt/node/bin/node --version 2>/dev/null | grep -q "^v${NODE_MAJOR}\."; then
@@ -75,25 +84,26 @@ id -u schermes >/dev/null 2>&1 || \
 install -d -o schermes -g schermes -m 0755 \
   "$SCHERMES_HOME/desktops" "$SCHERMES_HOME/logs"
 install -d -o root -g agents -m 2775 /srv/schermes "$SHARED_DIR" "$SHARED_DIR/skills"
+install -d -o root -g root -m 0711 /var/lib/schermes-sandboxes
 # X clients need this before the first Xvnc starts; an unprivileged Xvnc cannot create it.
 install -d -m 1777 /tmp/.X11-unix
 
 log "sudoers"
-# The daemon (schermes) may create agent users, install packages, and act as any agent user.
-# create-agent-user.sh is root-owned under /opt/schermes, so this is not a path to arbitrary root.
-cat > /etc/sudoers.d/schermes.tmp <<'EOF'
-schermes ALL=(root) NOPASSWD: /opt/schermes/infra/desktop/create-agent-user.sh, /opt/schermes/infra/desktop/rename-agent-user.sh, /usr/bin/apt-get
-schermes ALL=(%agents) NOPASSWD: ALL
+# The daemon (schermes) may create, rename and delete agent users as root; those scripts are
+# root-owned under /opt/schermes and validate their arguments, so this is not a path to arbitrary
+# root. As an agent it runs only the sandbox script, so every command lands inside the agent's
+# sandbox, and pkill, which stops one display. Agents have no host sudo at all: the root they
+# get is their sandbox's own. See docs/architecture.md, "Privilege model".
+d=/opt/schermes/infra/desktop
+cat > /etc/sudoers.d/schermes.tmp <<EOF
+schermes ALL=(root) NOPASSWD: $d/create-agent-user.sh, $d/rename-agent-user.sh, $d/delete-agent-user.sh
+schermes ALL=(%agents) NOPASSWD: $d/sandbox.sh start, $d/sandbox.sh stop, $d/sandbox.sh forward *, $d/sandbox.sh unforward *, $d/sandbox.sh enter *, /usr/bin/pkill
 EOF
-# Agent users are the operators of their own machine; the spec allows passwordless sudo.
-cat > /etc/sudoers.d/agents.tmp <<'EOF'
-%agents ALL=(ALL) NOPASSWD: ALL
-EOF
-for f in schermes agents; do
-  visudo -c -q -f "/etc/sudoers.d/$f.tmp"
-  install -o root -g root -m 0440 "/etc/sudoers.d/$f.tmp" "/etc/sudoers.d/$f"
-  rm -f "/etc/sudoers.d/$f.tmp"
-done
+visudo -c -q -f /etc/sudoers.d/schermes.tmp
+install -o root -g root -m 0440 /etc/sudoers.d/schermes.tmp /etc/sudoers.d/schermes
+rm -f /etc/sudoers.d/schermes.tmp
+# Earlier images granted %agents host root here; a host provisioned by one still has the file.
+rm -f /etc/sudoers.d/agents /etc/sudoers.d/agents.tmp
 
 log "daemon"
 install -o root -g root -m 0644 "$here/schermes.service" /etc/systemd/system/schermes.service

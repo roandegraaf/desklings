@@ -219,7 +219,7 @@ export function actOnTrigger(
     // Not an owner row (sender null), which would clear every pending question and form in the thread.
     const thread = conversationFor(db, agent.id);
     appendMessage(db, thread, { role: 'user', content: turnedOnLine(updated), sender: TRIGGER_SENDER });
-    runner.start(agent, thread);
+    runner.start(agent, thread, undefined, 'trigger');
   }
   return toTrigger(updated, agent.name, masterKey);
 }
@@ -393,7 +393,7 @@ function fire(db: Db, runner: Runner, id: number, detail: string, now: number): 
     `you proposed it for: "${row.reason}". If the owner is testing it with you, tell them it fired.\n\n${detail}`;
   const thread = conversationFor(db, agent.id);
   appendMessage(db, thread, { role: 'user', content: text, sender: TRIGGER_SENDER });
-  runner.start(agent, thread);
+  runner.start(agent, thread, undefined, 'trigger');
   log.info('trigger fired', { trigger: id, agent: agent.name, kind: row.kind });
   return 'fired';
 }
@@ -441,12 +441,12 @@ cd "$d" && find . -mindepth 1 -maxdepth 3 -type f -newerct "@$2" -not -path '*/.
 type Check = { cursor: string; detail?: string } | { error: string };
 export type ImapDeps = { masterKey: Buffer; open?: OpenSocket };
 
-async function checkImap(db: Db, imap: ImapDeps, row: Row, config: TriggerConfig, now: number): Promise<Check> {
+async function checkImap(db: Db, imap: ImapDeps, row: Row, config: TriggerConfig, now: number, timeoutMs: number): Promise<Check> {
   const login = JSON.parse(decrypt(imap.masterKey, row.login ?? '')) as Login;
   const since = row.cursor === null ? undefined : (JSON.parse(row.cursor) as MailCursor);
   const box = { host: config.host ?? '', port: config.port ?? IMAP_PORT, mailbox: config.mailbox ?? 'INBOX' };
   try {
-    const seen = await checkMailbox(imap.open ?? openTls, box, login, since, { timeoutMs: CHECK_TIMEOUT_MS, maxListed: MAX_MAIL_LISTED });
+    const seen = await checkMailbox(imap.open ?? openTls, box, login, since, { timeoutMs, maxListed: MAX_MAIL_LISTED });
     const cursor = JSON.stringify(seen.cursor);
     if (seen.count === 0) return { cursor };
     const listed = seen.mail.map((mail) => `- From: ${mail.from}\n  Subject: ${mail.subject}\n  Date: ${mail.date}`).join('\n');
@@ -499,9 +499,66 @@ async function checkCommand(exec: Exec, agent: Agent, config: TriggerConfig, cur
 }
 
 /**
- * One pass of the poll: every folder and command trigger that is on and due is checked as its
- * agent, and fires on news. The row is read again after the awaits, so one the owner turned off
- * or deleted meanwhile neither fires nor moves its cursor.
+ * How long one trigger's check may take before it counts as failed. Above the command's own
+ * limit, so a command killed at its limit reports its own exit rather than this.
+ */
+export const TRIGGER_CHECK_LIMIT_MS = CHECK_TIMEOUT_MS + 15_000;
+
+function withinLimit(check: Promise<Check>, limitMs: number, expire: () => void): Promise<Check> {
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<Check>((done) => {
+    timer = setTimeout(() => {
+      expire();
+      done({ error: `the check did not answer within ${limitMs / 1000} s` });
+    }, limitMs);
+  });
+  return Promise.race([check, expired]).finally(() => clearTimeout(timer));
+}
+
+type DueCheck = { row: Row; agent: Agent; config: TriggerConfig };
+
+async function runCheck(db: Db, exec: Exec, imap: ImapDeps | undefined, due: DueCheck, now: number, limitMs: number): Promise<Check> {
+  const { row, agent, config } = due;
+  try {
+    if (row.kind === 'folder') return await checkFolder(exec, agent, config, row.cursor, now);
+    if (row.kind === 'imap' && imap !== undefined) return await checkImap(db, imap, row, config, now, Math.min(CHECK_TIMEOUT_MS, limitMs));
+    return await checkCommand(exec, agent, config, row.cursor);
+  } catch (error) {
+    log.error('trigger check failed', { trigger: row.id, agent: agent.name, error });
+    return { error: (error as Error).message };
+  }
+}
+
+/** What one check came to, once it answered or ran out of time. Synchronous from the re-read to
+ * the fire, like `fire` itself; a check that answers after its limit changes nothing. */
+async function settleCheck(
+  db: Db,
+  exec: Exec,
+  runner: Runner,
+  imap: ImapDeps | undefined,
+  due: DueCheck,
+  now: number,
+  limitMs: number,
+): Promise<boolean> {
+  const { row } = due;
+  const check = await withinLimit(runCheck(db, exec, imap, due, now, limitMs), limitMs, () =>
+    log.error('trigger check timed out', { trigger: row.id, agent: due.agent.name, limitMs }),
+  );
+  const current = findRow(db, row.id);
+  if (current?.state !== 'on' || current.cursor !== row.cursor) return false;
+  if ('error' in check) {
+    db.update(triggers).set({ lastError: check.error.slice(0, MAX_REASON_CHARS) }).where(eq(triggers.id, row.id)).run();
+    return false;
+  }
+  db.update(triggers).set({ cursor: check.cursor, lastError: null }).where(eq(triggers.id, row.id)).run();
+  return check.detail !== undefined && fire(db, runner, row.id, check.detail, now) === 'fired';
+}
+
+/**
+ * One pass of the poll: every folder, command and imap trigger that is on and due is checked as
+ * its agent, all at once and each under its own time limit, so one hung mail server delays no
+ * other trigger. The row is read again after the await, so one the owner turned off or deleted
+ * meanwhile neither fires nor moves its cursor.
  */
 export async function runTriggerChecks(
   db: Db,
@@ -509,8 +566,9 @@ export async function runTriggerChecks(
   runner: Runner,
   now: number = Date.now(),
   imap?: ImapDeps,
+  limitMs: number = TRIGGER_CHECK_LIMIT_MS,
 ): Promise<number> {
-  let fired = 0;
+  const due: DueCheck[] = [];
   const rows = db.select().from(triggers).where(eq(triggers.state, 'on')).orderBy(asc(triggers.id)).all();
   for (const row of rows) {
     if (row.kind === 'webhook' || (row.kind === 'imap' && (imap === undefined || row.login === null))) continue;
@@ -520,28 +578,13 @@ export async function runTriggerChecks(
     const agent = findAgentById(db, row.agentId);
     if (agent === undefined) continue;
     db.update(triggers).set({ checkedAt: now }).where(eq(triggers.id, row.id)).run();
-    let check: Check;
-    try {
-      check =
-        row.kind === 'folder'
-          ? await checkFolder(exec, agent, config, row.cursor, now)
-          : row.kind === 'imap' && imap !== undefined
-            ? await checkImap(db, imap, row, config, now)
-            : await checkCommand(exec, agent, config, row.cursor);
-    } catch (error) {
-      log.error('trigger check failed', { trigger: row.id, agent: agent.name, error });
-      check = { error: (error as Error).message };
-    }
-    const current = findRow(db, row.id);
-    if (current?.state !== 'on' || current.cursor !== row.cursor) continue;
-    if ('error' in check) {
-      db.update(triggers).set({ lastError: check.error.slice(0, MAX_REASON_CHARS) }).where(eq(triggers.id, row.id)).run();
-      continue;
-    }
-    db.update(triggers).set({ cursor: check.cursor, lastError: null }).where(eq(triggers.id, row.id)).run();
-    if (check.detail !== undefined && fire(db, runner, row.id, check.detail, now) === 'fired') fired += 1;
+    due.push({ row, agent, config });
   }
-  return fired;
+  const settled = await Promise.allSettled(due.map((check) => settleCheck(db, exec, runner, imap, check, now, limitMs)));
+  for (const [index, outcome] of settled.entries()) {
+    if (outcome.status === 'rejected') log.error('trigger check failed', { trigger: due[index]?.row.id, error: outcome.reason });
+  }
+  return settled.filter((outcome) => outcome.status === 'fulfilled' && outcome.value).length;
 }
 
 export function startTriggerScheduler(db: Db, exec: Exec, runner: Runner, imap: ImapDeps): () => void {

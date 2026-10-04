@@ -16,6 +16,8 @@ import { MAX_MEMORY_CHARS, MAX_MEMORY_FILE_CHARS, readMemory, writeMemory } from
 import { findModel } from './models.ts';
 import { classifyCommand, commandNames } from './rules.ts';
 import { SCHEDULE_TICK_MS, insertSchedule } from './schedules.ts';
+import { readTimezone } from './settings.ts';
+import { daemonTimezone, startOfDay, wallClock, zonedTime } from './timezone.ts';
 import { agents, conversationParticipants, feedback, idleOutputs, idlePasses, messages } from './schema.ts';
 import { log } from './log.ts';
 import { TRIGGER_SENDER } from './triggers.ts';
@@ -99,15 +101,15 @@ export function updateIdle(db: Db, agent: Agent, body: Record<string, unknown>):
   return next;
 }
 
-/** When the window that holds `now` opened, or undefined outside it. */
-export function windowOpenedAt(settings: IdleSettings, now: number): number | undefined {
-  const open = new Date(now);
-  open.setHours(settings.startHour, 0, 0, 0);
-  if (open.getTime() > now) open.setDate(open.getDate() - 1);
+/** When the window that holds `now` opened, or undefined outside it. Hours are wall-clock hours
+ * in `timezone`, so a window across a DST change is an hour longer or shorter. */
+export function windowOpenedAt(settings: IdleSettings, now: number, timezone: string = daemonTimezone()): number | undefined {
+  const { year, month, day } = wallClock(now, timezone);
+  const openingOn = (date: number) => zonedTime({ year, month, day: date, hour: settings.startHour, minute: 0 }, timezone);
+  const openDay = openingOn(day) > now ? day - 1 : day;
   const hours = (settings.endHour - settings.startHour + 24) % 24 || 24;
-  const close = new Date(open);
-  close.setHours(close.getHours() + hours);
-  return now < close.getTime() ? open.getTime() : undefined;
+  const close = zonedTime({ year, month, day: openDay, hour: settings.startHour + hours, minute: 0 }, timezone);
+  return now < close ? openingOn(openDay) : undefined;
 }
 
 /** Where the next pre-check looks from: the end of the last pass that ran or was skipped. A
@@ -122,13 +124,12 @@ function lastFinishedAt(db: Db, agent: Agent): number | undefined {
   return row === undefined ? undefined : (row.endedAt ?? row.startedAt);
 }
 
-function tokensToday(db: Db, agent: Agent, now: number): number {
-  const day = new Date(now);
-  day.setHours(0, 0, 0, 0);
+/** What idle passes spent since local midnight in `timezone`, the running total of one still going included. */
+export function tokensToday(db: Db, agent: Agent, now: number, timezone: string = daemonTimezone()): number {
   const row = db
     .select({ total: sql<number>`coalesce(sum(${idlePasses.tokens}), 0)` })
     .from(idlePasses)
-    .where(and(eq(idlePasses.agentId, agent.id), gte(idlePasses.startedAt, day.getTime())))
+    .where(and(eq(idlePasses.agentId, agent.id), gte(idlePasses.startedAt, startOfDay(now, timezone))))
     .get();
   return row?.total ?? 0;
 }
@@ -330,6 +331,33 @@ async function memorySnapshot(exec: Exec, agent: Agent): Promise<string | undefi
   }
 }
 
+function recordPassTokens(db: Db, passId: number, tokens: number): void {
+  try {
+    db.update(idlePasses).set({ tokens }).where(and(eq(idlePasses.id, passId), eq(idlePasses.outcome, 'due'))).run();
+  } catch (error) {
+    log.error('idle pass tokens not recorded', { pass: passId, error });
+  }
+}
+
+export const INTERRUPTED_REASON = 'the daemon restarted during this pass; what it spent until then is counted';
+
+/**
+ * Boot repair for idle work. A pass whose turn was running when the daemon died is still `due`
+ * with no reason and no end, and nothing will ever end it. Its tokens are already on the row,
+ * written as they were spent, so closing it only marks what happened. Runs before the runner
+ * exists, so no pass is live.
+ */
+export function closeInterruptedPasses(db: Db, now: number = Date.now()): number {
+  const closed = db
+    .update(idlePasses)
+    .set({ outcome: 'interrupted', reason: INTERRUPTED_REASON, endedAt: now })
+    .where(and(eq(idlePasses.outcome, 'due'), isNull(idlePasses.reason), isNull(idlePasses.endedAt)))
+    .returning({ id: idlePasses.id })
+    .all();
+  if (closed.length > 0) log.info('interrupted idle passes closed', { passes: closed.map((row) => row.id) });
+  return closed.length;
+}
+
 /** Closes a pass: its memory diff, its outcome and what it spent. Never throws; it runs in the
  * turn's `finally`. `tokens` undefined means no turn ran (no model). */
 async function endPass(
@@ -368,9 +396,10 @@ async function endPass(
  */
 export async function runIdleChecks(db: Db, exec: Exec, runner: Runner, now: number = Date.now()): Promise<IdlePass[]> {
   const recorded: IdlePass[] = [];
+  const timezone = readTimezone(db);
   for (const agent of listAgents(db).filter((candidate) => !isWorker(candidate))) {
     const settings = readIdle(db, agent);
-    const opened = windowOpenedAt(settings, now);
+    const opened = windowOpenedAt(settings, now, timezone);
     if (!settings.enabled || opened === undefined) continue;
     const last = lastPass(db, agent);
     if (last !== undefined && last.startedAt >= opened) continue;
@@ -390,7 +419,7 @@ export async function runIdleChecks(db: Db, exec: Exec, runner: Runner, now: num
       continue;
     }
 
-    const spent = tokensToday(db, agent, now);
+    const spent = tokensToday(db, agent, now, timezone);
     const before = spent < settings.dailyTokens && !runner.running(agent.name) ? await memorySnapshot(exec, agent) : undefined;
     // Synchronous from here to the start: a turn begun during an await above would swallow it.
     // Only from rest: an idle turn ends in waiting_for_user, which would hide a failure from
@@ -418,6 +447,7 @@ export async function runIdleChecks(db: Db, exec: Exec, runner: Runner, now: num
       modelId: settings.modelId,
       turnCap: settings.turnCap,
       tokenLimit: settings.dailyTokens - spent,
+      spent: (tokens) => recordPassTokens(db, row.id, tokens),
       end: (tokens) => endPass(db, exec, agent, row, before, tokens),
     });
   }

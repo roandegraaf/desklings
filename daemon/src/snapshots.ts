@@ -12,16 +12,21 @@ import { TRIGGER_SENDER } from './triggers.ts';
 
 export const SNAPSHOTS = 'schermes-snapshots';
 export const KEEP_SNAPSHOTS_MS = 7 * 24 * 60 * 60 * 1_000;
+export const KEEP_SNAPSHOTS_COUNT = 50;
+export const KEEP_SNAPSHOT_BYTES = 2 * 1024 * 1024 * 1024;
 const PRUNE_EVERY_MS = 60 * 60 * 1_000;
 const SNAPSHOT_TIMEOUT_MS = 5 * 60 * 1_000;
 const MAX_LISTED = 5_000;
 const MAX_MANIFEST_BYTES = 64 * 1024 * 1024;
 
 /**
- * One script, four modes, run as the agent in its home. A snapshot is `<mark>-<epoch ms>` in
+ * One script, run as the agent in its home. A snapshot is `<mark>-<epoch ms>` in
  * ~/.schermes-snapshots: a NUL-separated manifest (`size mtime path`) and a tar of exactly those
  * files. The mark is the newest message id when the turn started. An unchanged home hard-links the
- * previous tar, which is safe because an archive is never written again.
+ * previous tar, which is safe because an archive is never written again. `sizes` lists every
+ * snapshot file as `inode size name`, and `snapshot` ends with that listing so a prune after a
+ * turn costs no extra round trip unless something has to go. Which ones go is decided here, not
+ * in the script.
  */
 // ponytail: a full tar per changed turn; a home of many gigabytes wants rsync --link-dest instead.
 const SCRIPT = `set -u
@@ -29,6 +34,9 @@ d="$HOME/.schermes-snapshots"
 cd "$HOME" || exit 1
 manifest() {
   find . -mindepth 1 \\( -name '.*' -o -name node_modules \\) -prune -o ! -type d -printf '%s %T@ %P\\0'
+}
+sizes() {
+  find "$d" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+-[0-9]+\\.(list|tgz)' -printf '%i %s %f\\n'
 }
 case $1 in
 list)
@@ -46,15 +54,20 @@ snapshot)
       | tar -czf "$d/.new.tgz" --null --no-recursion --verbatim-files-from --ignore-failed-read --warning=no-file-changed -T -
     [ $? -le 1 ] || exit 1
   fi
-  mv -f "$d/.new.tgz" "$d/$2.tgz" && mv -f "$d/.new.list" "$d/$2.list"
+  mv -f "$d/.new.tgz" "$d/$2.tgz" && mv -f "$d/.new.list" "$d/$2.list" || exit 1
+  sizes || true
   ;;
-prune)
+sizes)
   [ -d "$d" ] || exit 0
-  for f in "$d"/*.list; do
-    [ -e "$f" ] || continue
-    t=\${f##*-}; t=\${t%.list}
-    case $t in ''|*[!0-9]*) continue;; esac
-    [ "$t" -lt "$2" ] && rm -f -- "$f" "\${f%.list}.tgz"
+  sizes
+  ;;
+remove)
+  [ -d "$d" ] || exit 0
+  shift
+  for n in "$@"; do
+    case $n in [0-9]*-[0-9]*) ;; *) continue;; esac
+    case $n in *[!0-9-]*) continue;; esac
+    rm -f -- "$d/$n.list" "$d/$n.tgz"
   done
   exit 0
   ;;
@@ -80,11 +93,62 @@ async function run(exec: Exec, agent: Agent, args: string[], options: { input?: 
   return exec('sudo', asAgent(await agentTarget(exec, agent), argv), { timeoutMs: SNAPSHOT_TIMEOUT_MS, maxBytes: MAX_MANIFEST_BYTES, ...options });
 }
 
-/** Before a turn. A failure is logged and the turn goes on without one. */
+export type SnapshotFile = { inode: string; size: number; name: string };
+
+export function parseSnapshotSizes(stdout: string): SnapshotFile[] {
+  return stdout.split('\n').flatMap((line) => {
+    const match = /^(\d+) (\d+) (\d+-\d+)\.(?:list|tgz)$/.exec(line.trim());
+    return match === null ? [] : [{ inode: match[1] as string, size: Number(match[2]), name: match[3] as string }];
+  });
+}
+
+function diskBytes(files: readonly SnapshotFile[]): number {
+  const inodes = new Map(files.map((file) => [file.inode, file.size]));
+  return [...inodes.values()].reduce((sum, size) => sum + size, 0);
+}
+
+/**
+ * The snapshots to delete: past the age limit, then the oldest until at most `count` are left and
+ * the files take at most `bytes` on disk. A hard-linked tar is counted once, so dropping a
+ * snapshot that shares its tar with a newer one frees nothing and the next oldest goes too. The
+ * caps never take the newest snapshot: it is the one a rewind of the latest turn restores from.
+ * Age can, since `pickSnapshot` would not choose it either.
+ */
+export function snapshotsToPrune(
+  files: readonly SnapshotFile[],
+  now: number,
+  limits: { count: number; bytes: number } = { count: KEEP_SNAPSHOTS_COUNT, bytes: KEEP_SNAPSHOT_BYTES },
+): string[] {
+  const snapshots = parseSnapshotNames([...new Set(files.map((file) => `${file.name}.list`))].join('\n'));
+  const newest = [...snapshots].sort((a, b) => b.mark - a.mark || b.takenAt - a.takenAt)[0];
+  const gone = new Set(snapshots.filter((s) => s.takenAt < now - KEEP_SNAPSHOTS_MS).map((s) => s.name));
+  const left = () => files.filter((file) => !gone.has(file.name));
+  const oldestFirst = snapshots.filter((s) => s !== newest).sort((a, b) => a.takenAt - b.takenAt || a.mark - b.mark);
+  for (const snapshot of oldestFirst) {
+    if (gone.has(snapshot.name)) continue;
+    if (snapshots.length - gone.size <= limits.count && diskBytes(left()) <= limits.bytes) break;
+    gone.add(snapshot.name);
+  }
+  return [...gone];
+}
+
+async function removeSnapshots(exec: Exec, agent: Agent, listing: string, now: number, signal?: AbortSignal): Promise<void> {
+  const names = snapshotsToPrune(parseSnapshotSizes(listing), now);
+  if (names.length === 0 || signal?.aborted) return;
+  const result = await run(exec, agent, ['remove', ...names], signal === undefined ? {} : { signal });
+  if (result.code !== 0) log.error('snapshot prune failed', { agent: agent.name, stderr: result.stderr });
+}
+
+/** Before a turn, then a prune from the listing the snapshot ends with. A failure is logged and
+ * the turn goes on without one. */
 export async function snapshotWorkspace(exec: Exec, agent: Agent, mark: number, now: number, signal?: AbortSignal): Promise<void> {
   try {
     const result = await run(exec, agent, ['snapshot', `${mark}-${now}`], signal === undefined ? {} : { signal });
-    if (result.code !== 0) log.error('workspace snapshot failed', { agent: agent.name, stderr: result.stderr });
+    if (result.code !== 0) {
+      log.error('workspace snapshot failed', { agent: agent.name, stderr: result.stderr });
+      return;
+    }
+    await removeSnapshots(exec, agent, result.stdout.toString(), now, signal);
   } catch (error) {
     log.error('workspace snapshot failed', { agent: agent.name, error });
   }
@@ -93,7 +157,9 @@ export async function snapshotWorkspace(exec: Exec, agent: Agent, mark: number, 
 export async function pruneSnapshots(db: Db, exec: Exec, now: number): Promise<void> {
   for (const agent of listAgents(db).filter((a) => !isWorker(a))) {
     try {
-      await run(exec, agent, ['prune', String(now - KEEP_SNAPSHOTS_MS)]);
+      const listed = await run(exec, agent, ['sizes']);
+      if (listed.code !== 0) throw new Error(listed.stderr);
+      await removeSnapshots(exec, agent, listed.stdout.toString(), now);
     } catch (error) {
       log.error('snapshot prune failed', { agent: agent.name, error });
     }

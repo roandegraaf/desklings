@@ -21,6 +21,8 @@ export type ModelFields = {
   providerId?: number | undefined;
   model?: string | undefined;
   extraBody?: string | undefined;
+  contextWindow?: number | null | undefined;
+  vision?: boolean | undefined;
 };
 
 export type ProviderFields = {
@@ -75,6 +77,8 @@ function toEntry(db: Db, entry: Row): ModelEntry {
     model: entry.model,
     apiKeySet: provider !== undefined && provider.apiKey !== null,
     extraBody: entry.extraBody,
+    contextWindow: entry.contextWindow,
+    vision: entry.vision,
     isDefault: defaultModelId(db) === entry.id,
     isBackup: backupModelId(db) === entry.id,
     createdAt: entry.createdAt,
@@ -96,6 +100,8 @@ function columns(fields: ModelFields) {
     ...(fields.providerId === undefined ? {} : { providerId: fields.providerId }),
     ...(fields.model === undefined ? {} : { model: fields.model }),
     ...(fields.extraBody === undefined ? {} : { extraBody: fields.extraBody }),
+    ...(fields.contextWindow === undefined ? {} : { contextWindow: fields.contextWindow }),
+    ...(fields.vision === undefined ? {} : { vision: fields.vision }),
   };
 }
 
@@ -221,7 +227,13 @@ function config(db: Db, masterKey: Buffer, entry: Row | undefined): ProviderConf
   const apiKey = decrypt(masterKey, provider.apiKey);
   if (apiKey === '') return undefined;
   const extraBody = parseExtraBody(entry.extraBody);
-  return { baseUrl: provider.baseUrl, model: entry.model, apiKey, ...(extraBody === undefined ? {} : { extraBody }) };
+  return {
+    baseUrl: provider.baseUrl,
+    model: entry.model,
+    apiKey,
+    ...(extraBody === undefined ? {} : { extraBody }),
+    ...(entry.vision ? {} : { vision: false }),
+  };
 }
 
 export function modelConfig(db: Db, masterKey: Buffer, id: number): ProviderConfig | undefined {
@@ -242,7 +254,15 @@ export function modelIdFor(db: Db, agent?: Agent): number | undefined {
   return owner?.modelId ?? defaultModelId(db);
 }
 
-/** The backup a turn on `activeId` may switch to: set, usable, and not the model already in use. */
+/** The context window, in tokens, of the model a call on `agent` resolves to (or of `modelId`,
+ * an idle pass's own pick); null when unknown or when there is no model at all. */
+export function contextWindowFor(db: Db, agent: Agent, modelId?: number | null): number | null {
+  const id = modelId ?? modelIdFor(db, agent);
+  return id === undefined ? null : (row(db, id)?.contextWindow ?? null);
+}
+
+/** The backup a turn on `activeId` may switch to: set, usable, not the model already in use, and
+ * not one whose key the endpoint has refused, since switching to it could only fail the turn. */
 export function backupConfig(
   db: Db,
   masterKey: Buffer,
@@ -250,6 +270,7 @@ export function backupConfig(
 ): { id: number; name: string; config: ProviderConfig } | undefined {
   const id = backupModelId(db);
   if (id === undefined || id === activeId) return undefined;
+  if (readSetting(db, `${AUTH_FAILED}${id}`) !== undefined) return undefined;
   const entry = row(db, id);
   const resolved = config(db, masterKey, entry);
   return entry === undefined || resolved === undefined ? undefined : { id, name: entry.name, config: resolved };

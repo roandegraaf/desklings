@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { asAgent, findAgent, insertAgent, insertWorker } from './agents.ts';
+import { asAgent, findAgent, insertAgent, insertWorker, SANDBOX } from './agents.ts';
 import { classifyCommand, grantOnce, guardCommand, readRules, updateRules } from './rules.ts';
 import type { AgentTarget } from './agents.ts';
 import { openDb } from './db.ts';
@@ -171,10 +171,11 @@ test('a display larger than the view is shrunk for the model and its clicks mapp
   assert.match(String(argv({ action: 'screenshot' }).at(-1)), / -resize 1280x800! /);
 });
 
-test('the sudo prefix carries every variable sudo strips', () => {
+test('the sudo prefix enters the sandbox and carries every variable sudo strips', () => {
   const args = asAgent(TARGET, ['xdotool', 'key', 'Return']);
   assert.deepEqual(args, [
     '-n', '-u', 'agent-alpha',
+    SANDBOX, 'enter',
     'env', '--chdir=/home/agent-alpha',
     'HOME=/home/agent-alpha',
     'USER=agent-alpha',
@@ -185,6 +186,17 @@ test('the sudo prefix carries every variable sudo strips', () => {
   ]);
   // --chdir must precede the assignments or env takes it as the command to run.
   assert.ok(args.indexOf('--chdir=/home/agent-alpha') < args.indexOf('HOME=/home/agent-alpha'));
+});
+
+test("a worker's command enters its parent's sandbox and starts in its own directory", () => {
+  const args = asAgent({ ...TARGET, display: 120, cwd: '/home/agent-alpha/workspace/workers/w1' }, ['make']);
+  assert.deepEqual(args.slice(0, 7), [
+    '-n', '-u', 'agent-alpha',
+    SANDBOX, 'enter',
+    'env', '--chdir=/home/agent-alpha/workspace/workers/w1',
+  ]);
+  assert.ok(SANDBOX.endsWith('/infra/desktop/sandbox.sh'));
+  assert.equal(args.at(-1), 'make');
 });
 
 test('a screenshot comes back as base64 and the raw bytes stay out of the result', async () => {

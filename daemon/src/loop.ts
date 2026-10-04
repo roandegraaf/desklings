@@ -54,7 +54,6 @@ import {
   appendSummary,
   conversationFor,
   existingConversation,
-  lastMessageBy,
   lastMessageId,
   latestSummary,
   listConversations,
@@ -66,8 +65,11 @@ import {
   pendingConversation,
   recordEvent,
   repairInterruptedCalls,
+  awaitedAgents,
   sendMessageToolDef,
+  threadFingerprint,
 } from './conversations.ts';
+import type { StoredMessage } from './conversations.ts';
 import {
   MAX_PENDING_APPROVALS,
   describeApproval,
@@ -113,6 +115,7 @@ import {
 import { MCP_PREFIX } from './mcp.ts';
 import type { McpSession } from './mcp.ts';
 import { commandToolDef, parseCommand, runCommand } from './terminal.ts';
+import { readTimezone } from './settings.ts';
 import { LEAVE_NOTE, addIdleOutput, idleCommandRefusal, leaveNoteToolDef, parseNote } from './idle.ts';
 import { PROPOSE_TRIGGER, parseTriggerProposal, proposeTrigger, proposeTriggerToolDef, triggerPrompt } from './triggers.ts';
 import { guardCommand, readRules, rulesPrompt } from './rules.ts';
@@ -131,8 +134,13 @@ import type { Db } from './db.ts';
 import type { AgentTarget } from './agents.ts';
 import { snapshotWorkspace } from './snapshots.ts';
 import type { Exec } from './exec.ts';
-import type { ChatReply, Image, Provider, ProviderMessage } from './provider.ts';
+import { ProviderError } from './provider.ts';
+import type { ChatReply, Image, Provider, ProviderMessage, Usage } from './provider.ts';
+import { contextWindowFor, modelIdFor } from './models.ts';
 import { log } from './log.ts';
+import { listNeedsYou } from './needs.ts';
+import { dequeueTurn, enqueueTurn, isQueued, markRead, queuedTurns, readThrough } from './queue.ts';
+import type { TurnKind } from './queue.ts';
 import {
   liveWorkers,
   parseSpawnWorker,
@@ -144,12 +152,13 @@ import {
 // A turn is bounded so a model that keeps calling tools cannot run forever.
 const MAX_STEPS = 200;
 
-/** Replies still being streamed, by agent name. Process state: an agent is in `thinking` for
- * exactly as long as it has an entry here, and the stored message replaces it. */
-const live = new Map<string, LiveReply>();
+/** Replies still being streamed, by agent id so a rename mid-turn keeps its entry. Process
+ * state: an agent is in `thinking` for exactly as long as it has an entry here, and the stored
+ * message replaces it. */
+const live = new Map<number, LiveReply>();
 
-export function liveReply(name: string): LiveReply | undefined {
-  return live.get(name);
+export function liveReply(agentId: number): LiveReply | undefined {
+  return live.get(agentId);
 }
 const MAX_OBSERVATION_CHARS = 16_000;
 /**
@@ -183,6 +192,57 @@ export const MAX_TRANSCRIPT_CHARS = 400_000;
  * would fire every turn and shrink nothing.
  */
 export const COMPACTION_TAIL_CHARS = 260_000;
+
+/**
+ * Turns a model's context window, in tokens, into the character budgets above. Deliberately low:
+ * English prose runs near 4 characters a token, but the JSON, paths, logs and code a desktop
+ * agent replays tokenise denser, and an estimate that runs over costs a failed request.
+ */
+export const CHARS_PER_TOKEN = 3;
+/** Kept free for the reply: a quarter of a small window, at most this. */
+export const REPLY_RESERVE_TOKENS = 8_192;
+/** Per replayed image. A 1280x800 PNG costs about 1,100 tokens at OpenAI's high detail and
+ * more on some other vendors; the char budget never counts image bytes. */
+export const IMAGE_RESERVE_TOKENS = 1_600;
+/** The built-in tool schemas run near 19,500 characters (22 tools, in the JSON sent); the rest
+ * is room for MCP tools. More than that falls to the overflow retry. */
+export const TOOL_SCHEMA_RESERVE_CHARS = 24_000;
+const MIN_TRANSCRIPT_CHARS = 8_000;
+
+/** What one turn's compaction works to, in characters: the replay's ceiling, the tail kept
+ * verbatim behind a summary, and the longest summary stored. */
+export type Budget = { transcript: number; tail: number; summary: number };
+
+/**
+ * The window is a ceiling, not a target: a model with a million tokens still compacts at the
+ * fixed budget, since replaying more makes every step slower and dearer without being asked
+ * for. An unknown window is that fixed budget too. The tail keeps the fixed budget's share, so
+ * a compacted thread has the same room to grow before the next pass.
+ */
+export function compactionBudget(contextWindow: number | null): Budget {
+  if (contextWindow === null) {
+    return { transcript: MAX_TRANSCRIPT_CHARS, tail: COMPACTION_TAIL_CHARS, summary: MAX_OBSERVATION_CHARS };
+  }
+  const reserve =
+    Math.min(REPLY_RESERVE_TOKENS, Math.floor(contextWindow / 4)) + MAX_REPLAYED_IMAGES * IMAGE_RESERVE_TOKENS;
+  const fits = (contextWindow - reserve) * CHARS_PER_TOKEN - TOOL_SCHEMA_RESERVE_CHARS;
+  const transcript = Math.max(MIN_TRANSCRIPT_CHARS, Math.min(MAX_TRANSCRIPT_CHARS, fits));
+  return {
+    transcript,
+    tail: Math.floor((transcript * COMPACTION_TAIL_CHARS) / MAX_TRANSCRIPT_CHARS),
+    summary: Math.min(MAX_OBSERVATION_CHARS, Math.floor(transcript / 8)),
+  };
+}
+
+/** What a context-overflow retry compacts to: the endpoint has just said the estimate was
+ * wrong, so every part is a quarter of what it was. */
+export function overflowBudget(budget: Budget): Budget {
+  return {
+    transcript: Math.floor(budget.transcript / 4),
+    tail: Math.floor(budget.tail / 4),
+    summary: Math.floor(budget.summary / 4),
+  };
+}
 
 /** What the summariser is asked for. Its own system text, so it is not the agent. */
 export const SUMMARY_PROMPT =
@@ -220,8 +280,11 @@ function turnBoundaries(name: string, messages: readonly Message[]): number[] {
 /** What a projected transcript costs, counting everything but the screenshots. */
 function projectedChars(messages: readonly ProviderMessage[]): number {
   return messages.reduce((total, message) => {
-    const calls = message.role === 'assistant' ? message.toolCalls : [];
-    return total + message.text.length + calls.reduce((sum, c) => sum + c.arguments.length, 0);
+    if (message.role !== 'assistant') return total + message.text.length;
+    const calls = message.toolCalls.reduce((sum, c) => sum + c.arguments.length, 0);
+    const { source: _, ...echoed } = message.echo ?? { source: '' };
+    const echo = Object.keys(echoed).length === 0 ? 0 : JSON.stringify(echoed).length;
+    return total + message.text.length + calls + echo;
   }, 0);
 }
 
@@ -239,8 +302,18 @@ function flatten(messages: readonly ProviderMessage[]): string {
     .join('\n\n');
 }
 
+const OMITTED = '[earlier omitted]\n';
+
+/** The end of `text` in at most `limit` characters, the marker included. */
 function keepEnd(text: string, limit: number): string {
-  return text.length <= limit ? text : `[earlier omitted]\n${text.slice(-limit)}`;
+  if (text.length <= limit) return text;
+  const room = limit - OMITTED.length;
+  return room <= 0 ? OMITTED : OMITTED + text.slice(-room);
+}
+
+function newestReplay(db: Db, conversationId: number, name: string): Replay | undefined {
+  const summary = latestSummary(db, conversationId, name);
+  return summary === undefined ? undefined : { text: summary.content, throughId: summary.throughMessageId };
 }
 
 /**
@@ -258,47 +331,87 @@ async function compact(
   conversationId: number,
   system: string,
   stored: readonly Message[],
+  budget: Budget,
+  meter?: Meter,
 ): Promise<Replay | undefined> {
-  const previous = latestSummary(deps.db, conversationId, agent.name);
-  const replay =
-    previous === undefined
-      ? undefined
-      : { text: previous.content, throughId: previous.throughMessageId };
-  if (projectedChars(transcript(agent.name, system, stored, replay)) <= MAX_TRANSCRIPT_CHARS) {
+  const replay = newestReplay(deps.db, conversationId, agent.name);
+  if (projectedChars(transcript(agent.name, system, stored, replay)) <= budget.transcript) {
     return replay;
   }
+  return (await summariseHead(deps, agent, conversationId, system, stored, budget, undefined, meter)) ?? replay;
+}
 
+/**
+ * Summarises the head of what no summary covers yet, cutting at the first turn boundary whose
+ * tail fits `budget.tail` (the last boundary when none does). The tail's target also leaves room
+ * for the system text and the summary itself, or a small window would be full again at once.
+ * Only rows up to `through` may be covered: mid-turn, a row another sender wrote after the turn
+ * began is not in `stored`, and a summary reaching past it would hide it from every later
+ * replay. Undefined when there is no cut or the model would not summarise.
+ */
+async function summariseHead(
+  deps: LoopDeps,
+  agent: Agent,
+  conversationId: number,
+  system: string,
+  stored: readonly Message[],
+  budget: Budget,
+  through = Number.POSITIVE_INFINITY,
+  meter?: Meter,
+): Promise<Replay | undefined> {
+  const previous = latestSummary(deps.db, conversationId, agent.name);
   // Only what no summary covers yet, so a second pass never re-summarises the same messages.
   const live = stored.filter((message) => message.id > (previous?.throughMessageId ?? 0));
   // Raw content overstates what a trimmed observation costs, so the tail lands under the target
-  // rather than over it. Where to cut is a judgement; whether to cut is the measurement above.
+  // rather than over it. Where to cut is a judgement; whether to cut is the caller's measurement.
   const cost = live.map((message) => message.content.length);
   const tail = (from: number): number => cost.slice(from).reduce((sum, n) => sum + n, 0);
-  const cuts = turnBoundaries(agent.name, live).filter((index) => index > 0);
-  const cut = cuts.find((index) => tail(index) <= COMPACTION_TAIL_CHARS) ?? cuts.at(-1);
+  const target = Math.min(budget.tail, budget.transcript - system.length - budget.summary);
+  const cuts = turnBoundaries(agent.name, live).filter(
+    (index) => index > 0 && (live[index - 1]?.id ?? 0) <= through,
+  );
+  const cut = cuts.find((index) => tail(index) <= target) ?? cuts.at(-1);
   if (cut === undefined) {
     log.info('nothing to compact: the thread is one turn', { agent: agent.name, conversationId });
-    return replay;
+    return undefined;
   }
-
-  return (await writeSummary(deps, agent, conversationId, live.slice(0, cut))) ?? replay;
+  return writeSummary(deps, agent, conversationId, live.slice(0, cut), budget, meter);
 }
+
+/** How often `contextFullness` had to project a thread rather than answer from its memo. */
+export const fullnessStats = { projections: 0 };
+
+const projectedFullness = new WeakMap<Db, Map<number, { fingerprint: string; chars: number }>>();
 
 /**
  * How close the agent's own thread is to compaction, 0–100: the measure `compact` takes, against
  * the budget it takes it against. The system text is left out; it is built from the home, which
  * is too slow to read on every poll of the agent list, and is small beside the budget.
+ *
+ * The agent list asks this for every agent on every poll, so the projected size is memoised per
+ * thread under `threadFingerprint` and only recomputed once the thread changes. The budget is
+ * not memoised: a model switch changes it without touching the thread.
  */
 export function contextFullness(db: Db, agent: Agent): number {
   const conversationId = existingConversation(db, agent.id);
   if (conversationId === undefined) return 0;
-  const summary = latestSummary(db, conversationId, agent.name);
-  const replay =
-    summary === undefined ? undefined : { text: summary.content, throughId: summary.throughMessageId };
-  const stored = listMessagesWithoutImages(db, conversationId, replay?.throughId ?? 0);
-  const chars = projectedChars(transcript(agent.name, '', stored, replay));
-  return Math.min(100, Math.round((chars / MAX_TRANSCRIPT_CHARS) * 100));
+  const fingerprint = threadFingerprint(db, conversationId, agent.name);
+  const memo = projectedFullness.get(db) ?? new Map<number, { fingerprint: string; chars: number }>();
+  projectedFullness.set(db, memo);
+  const cached = memo.get(conversationId);
+  let chars = cached?.fingerprint === fingerprint ? cached.chars : undefined;
+  if (chars === undefined) {
+    fullnessStats.projections += 1;
+    const replay = newestReplay(db, conversationId, agent.name);
+    const stored = listMessagesWithoutImages(db, conversationId, replay?.throughId ?? 0);
+    chars = projectedChars(transcript(agent.name, '', stored, replay));
+    memo.set(conversationId, { fingerprint, chars });
+  }
+  const budget = compactionBudget(contextWindowFor(db, agent));
+  return Math.min(100, Math.round((chars / budget.transcript) * 100));
 }
+
+type Meter = (usage: Usage | undefined) => void;
 
 /**
  * Writes one summary row standing for `covered`, which must be the rows straight after the newest
@@ -306,14 +419,22 @@ export function contextFullness(db: Db, agent: Agent): number {
  * than re-read. Undefined when the model would not write one.
  */
 async function writeSummary(
-  deps: Pick<LoopDeps, 'db' | 'provider'>,
+  deps: Pick<LoopDeps, 'db' | 'provider' | 'signal'>,
   agent: Agent,
   conversationId: number,
   covered: readonly Message[],
+  budget: Budget,
+  meter?: Meter,
 ): Promise<Replay | undefined> {
   const previous = latestSummary(deps.db, conversationId, agent.name);
-  const earlier = previous === undefined ? '' : `The story so far:\n${previous.content}\n\n`;
-  const body = earlier + keepEnd(flatten(transcript(agent.name, '', covered)), MAX_TRANSCRIPT_CHARS);
+  // A summary written under a larger budget (another model, or before an overflow) may not leave
+  // room for anything else, so the story so far gets half of it at most.
+  const story = previous?.content.slice(0, Math.floor(budget.transcript / 2));
+  const earlier = story === undefined ? '' : `The story so far:\n${story}\n\n`;
+  // The summariser's request has to fit the same window: no tools and no images ride on it, so
+  // the replay budget is room enough for the prompt, the story so far and the stretch it covers.
+  const room = Math.max(0, budget.transcript - SUMMARY_PROMPT.length - earlier.length);
+  const body = earlier + keepEnd(flatten(transcript(agent.name, '', covered)), room);
   let summary: string;
   try {
     // No onDelta: this is not the agent speaking, and the live route would show it as its reply.
@@ -323,10 +444,17 @@ async function writeSummary(
         { role: 'user', text: body },
       ],
       [],
+      undefined,
+      deps.signal,
     );
+    meter?.(reply.usage);
     summary = reply.text.trim();
   } catch (error) {
-    log.error('summary failed, replaying the thread in full', { agent: agent.name, error });
+    if (deps.signal?.aborted) {
+      log.info('summary abandoned: the turn was stopped', { agent: agent.name });
+    } else {
+      log.error('summary failed, replaying the thread in full', { agent: agent.name, error });
+    }
     return undefined;
   }
   if (summary === '') {
@@ -336,7 +464,8 @@ async function writeSummary(
 
   // Clipped like any other text the transcript carries: a model that answers with the whole
   // conversation back would otherwise ride in every later request and eat the budget itself.
-  const content = clip(summary);
+  const content =
+    summary.length <= budget.summary ? summary : `${summary.slice(0, budget.summary)}\n[summary truncated]`;
   const throughId = covered.at(-1)?.id ?? 0;
   appendSummary(deps.db, {
     conversationId,
@@ -359,22 +488,26 @@ async function writeSummary(
  * into the next one and nothing is kept verbatim, so the agent's next turn opens on the summary
  * and whatever the owner writes after it. Only between turns — the loop writes every result
  * before it asks for more, so with no turn running every call this agent made is answered and
- * the whole stretch is one legal cut. Answers how many rows the new summary stands for.
+ * the whole stretch is one legal cut. Answers how many rows the new summary stands for, and what
+ * the summary cost when the endpoint said.
  */
 export async function compactNow(
   deps: Pick<LoopDeps, 'db' | 'provider'>,
   agent: Agent,
   conversationId: number,
-): Promise<{ covered: number } | { error: string }> {
+): Promise<{ covered: number; usage?: Usage } | { error: string }> {
   const previous = latestSummary(deps.db, conversationId, agent.name);
   const live = listMessages(deps.db, conversationId).filter(
     (message) => message.id > (previous?.throughMessageId ?? 0),
   );
   if (live.length === 0) return { covered: 0 };
-  const replay = await writeSummary(deps, agent, conversationId, live);
-  return replay === undefined
-    ? { error: `the model would not summarise the thread for ${agent.name}` }
-    : { covered: live.length };
+  const budget = compactionBudget(contextWindowFor(deps.db, agent));
+  let usage: Usage | undefined;
+  const replay = await writeSummary(deps, agent, conversationId, live, budget, (spent) => {
+    usage = spent;
+  });
+  if (replay === undefined) return { error: `the model would not summarise the thread for ${agent.name}` };
+  return usage === undefined ? { covered: live.length } : { covered: live.length, usage };
 }
 
 /**
@@ -419,13 +552,17 @@ export type IdleTurn = {
   turnCap: number;
   /** Tokens this pass may still spend today. */
   tokenLimit: number;
+  /** The running total after every metered call, so a restart mid-pass cannot lose what it spent. */
+  spent?: (tokens: number) => void;
   /** Called once the turn is over with what it spent, or with undefined when it never ran. */
   end: (tokens: number | undefined) => Promise<void>;
 };
 
 /** Starts turns. The loop needs it so `send_message` can put the agent it wrote to to work. */
 export type Runner = {
-  start(agent: Agent, conversationId: number, idle?: IdleTurn): void;
+  /** Starts a turn now, or queues it when every loop is taken. A busy agent's running turn
+   * picks the new row up itself. `kind` only labels the queue entry. */
+  start(agent: Agent, conversationId: number, idle?: IdleTurn, kind?: TurnKind): void;
   /**
    * Why no loop can start right now, or undefined when there is room. Naming the agent that
    * would run matters: one already running is not another loop, because its message is picked
@@ -449,8 +586,9 @@ export type LoopDeps = {
   search: () => SearchConfig | undefined;
   /** This agent's MCP tools for one turn, or undefined when no server is configured. A function
    * taking the agent, so a turn with nothing configured resolves no Linux user and starts no
-   * process. */
-  mcp: (agent: Agent) => Promise<McpSession | undefined>;
+   * process. A server runs as the agent and may write into its home, so one that is configured
+   * waits on `homeReady`, the turn's workspace snapshot, before it starts. */
+  mcp: (agent: Agent, homeReady: () => Promise<void>) => Promise<McpSession | undefined>;
   screen: Screen;
   runner: Runner;
   control: Control;
@@ -539,7 +677,7 @@ function systemPrompt(
  * itself; the rules and the schedules come from the database and are always there.
  */
 async function homeTail(deps: LoopDeps, agent: Agent): Promise<string> {
-  const schedules = schedulePrompt(listSchedules(deps.db, agent));
+  const schedules = schedulePrompt(listSchedules(deps.db, agent), readTimezone(deps.db));
   const standing =
     agent.parentId === undefined
       ? `${schedules}\n\n${triggerPrompt(deps.db, agent)}\n\n${goalPrompt(deps.db, agent)}`
@@ -559,9 +697,9 @@ async function homeTail(deps: LoopDeps, agent: Agent): Promise<string> {
  * configuration that cannot be read at all costs it every one of them, and neither costs it the
  * turn — the rule the home load and the schedules already follow.
  */
-async function mcpSession(deps: LoopDeps, agent: Agent): Promise<McpSession | undefined> {
+async function mcpSession(deps: LoopDeps, agent: Agent, homeReady: () => Promise<void>): Promise<McpSession | undefined> {
   try {
-    return await deps.mcp(agent);
+    return await deps.mcp(agent, homeReady);
   } catch (error) {
     log.error('no MCP tools this turn', { agent: agent.name, error });
     return undefined;
@@ -588,7 +726,7 @@ async function mcpSession(deps: LoopDeps, agent: Agent): Promise<McpSession | un
 export function transcript(
   name: string,
   system: string,
-  stored: readonly Message[],
+  stored: readonly StoredMessage[],
   replay?: Replay,
 ): ProviderMessage[] {
   const out: ProviderMessage[] = [{ role: 'system', text: system }];
@@ -610,6 +748,7 @@ export function transcript(
       .filter(
         (message) =>
           message.image !== undefined &&
+          message.image.expired !== true &&
           (message.role === 'user' || (message.sender === name && message.role === 'tool')),
       )
       .slice(-MAX_REPLAYED_IMAGES)
@@ -632,6 +771,8 @@ export function transcript(
       const text = `Message from ${message.sender ?? 'the owner'}:\n${message.content}`;
       if (message.image === undefined) {
         pending.push({ role: 'user', text });
+      } else if (message.image.expired === true) {
+        pending.push({ role: 'user', text: `${text}\n[the picture that came with this has expired and was deleted]` });
       } else if (visible.has(message.id)) {
         pending.push({ role: 'user', text: `${text}\n[with a picture]`, image: message.image });
       } else {
@@ -648,7 +789,12 @@ export function transcript(
       if (message.image !== undefined) {
         const call = message.toolCallId ?? '';
         pending.push(
-          visible.has(message.id)
+          message.image.expired === true
+            ? {
+                role: 'user',
+                text: `The screenshot from tool call ${call} has expired and was deleted. Take a new one to see the screen.`,
+              }
+            : visible.has(message.id)
             ? { role: 'user', text: `Screenshot from tool call ${call}.`, image: message.image }
             : {
                 role: 'user',
@@ -662,7 +808,12 @@ export function transcript(
     }
 
     flush();
-    out.push({ role: 'assistant', text: message.content, toolCalls: message.toolCalls ?? [] });
+    out.push({
+      role: 'assistant',
+      text: message.content,
+      toolCalls: message.toolCalls ?? [],
+      ...(message.echo === undefined ? {} : { echo: message.echo }),
+    });
   }
 
   flush();
@@ -750,8 +901,8 @@ async function spawnWorker(
   }
 
   // Asked again, and synchronous from here to the start: two agents spawning in overlapping
-  // turns both passed the check above before either of them took a slot, and a worker that
-  // is created but refused a loop would wait for one forever.
+  // turns both passed the check above before either of them took a slot, and a spawn is
+  // refused at the cap rather than queued.
   const late = refused();
   if (late !== undefined) return refusal(late);
 
@@ -770,7 +921,7 @@ async function spawnWorker(
       log.error('helper screen did not start', { worker: worker.name, display, error });
       return undo(`the helper's screen did not start: ${(error as Error).message}`);
     }
-    // The await above let other turns take the last loop; a worker refused one would wait forever.
+    // The await above let other turns take the last loop, and a spawn is refused at the cap.
     const full = deps.runner.atCapacity();
     if (full !== undefined) return undo(full);
   }
@@ -828,7 +979,7 @@ async function addHelper(deps: LoopDeps, agent: Agent, conversationId: number, r
   inheritFromLead(deps.db, agent, helper);
   addHelperRow(deps.db, goal.id, helper, 'agent', request.reason);
   const undo = async (error: string): Promise<Observation> => {
-    await desktop.stop(helper.name).catch(() => undefined);
+    await desktop.remove(helper.name).catch((error: unknown) => log.error('helper user would not go', { agent: helper.name, error }));
     deleteAgent(deps.db, helper);
     return refusal(error);
   };
@@ -842,7 +993,7 @@ async function addHelper(deps: LoopDeps, agent: Agent, conversationId: number, r
   if (full !== undefined) return undo(full);
   const thread = conversationFor(deps.db, helper.id);
   appendMessage(deps.db, thread, { role: 'user', content: request.brief, sender: agent.name, kind: 'request' });
-  deps.runner.start(helper, thread);
+  deps.runner.start(helper, thread, undefined, 'request');
   return {
     text:
       `Temporary agent ${name} is on it, with its own Linux user and desktop. Its reply arrives later as a message ` +
@@ -948,7 +1099,7 @@ async function dispatch(
       sender: agent.name,
       kind: 'request',
     });
-    deps.runner.start(target, conversationId);
+    deps.runner.start(target, conversationId, undefined, 'request');
     return {
       text: `Delivered to ${target.name}, which is now working on it. Its reply arrives later.`,
       event: { ok: true, to: target.name, conversationId },
@@ -1332,7 +1483,7 @@ function schedule(
 ): Observation {
   if (name === 'list_schedules') {
     const held = listSchedules(deps.db, agent);
-    return { text: schedulePrompt(held), event: { ok: true, schedules: held.length } };
+    return { text: schedulePrompt(held, readTimezone(deps.db)), event: { ok: true, schedules: held.length } };
   }
 
   if (name === 'schedule_task') {
@@ -1404,6 +1555,11 @@ export const WORKER_FAILED = 'I could not finish the job';
 export const RUN_FAILED = 'I could not finish this turn';
 export const STOPPED = 'I was stopped here by the owner and did not finish.';
 const NOTHING_TO_REPORT = 'I finished, but the model answered with nothing.';
+export const CUT_OFF = "\n\n[cut off: this reply reached the model's output token limit]";
+export const CALL_CUT_OFF =
+  'error: your reply was cut off at the output token limit before this call was complete, so it ' +
+  'was not run. Ask again with shorter arguments, or split the work into smaller steps.';
+export const CUT_OFF_AGAIN = "the model's reply was cut off at its output token limit a second time this turn";
 
 /**
  * A worker's last word is a message to its parent, in the thread the parent was in when it
@@ -1414,7 +1570,7 @@ const NOTHING_TO_REPORT = 'I finished, but the model answered with nothing.';
 function report(deps: LoopDeps, worker: Agent, parent: Agent, text: string): void {
   const conversationId = worker.parentConversationId ?? conversationFor(deps.db, parent.id);
   appendMessage(deps.db, conversationId, { role: 'user', content: text, sender: worker.name });
-  deps.runner.start(parent, conversationId);
+  deps.runner.start(parent, conversationId, undefined, 'report');
 }
 
 /**
@@ -1428,9 +1584,34 @@ function answerRequests(deps: LoopDeps, agent: Agent, owed: readonly { id: numbe
     if (asker === undefined || isWorker(asker)) continue;
     const thread = conversationFor(deps.db, asker.id);
     appendMessage(deps.db, thread, { role: 'user', content: text, sender: agent.name, kind: 'reply' });
-    deps.runner.start(asker, thread);
+    deps.runner.start(asker, thread, undefined, 'reply');
   }
   markAnswered(deps.db, agent.id, owed.at(-1)!.id);
+}
+
+/** How long a stopped turn waits for its killed snapshot to exit before it lets go of the agent. */
+const STOPPED_SNAPSHOT_GRACE_MS = 2_000;
+
+/** Settles with `work`, or rejects with the stop as soon as `signal` fires. */
+function untilStopped(work: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
+  if (signal === undefined) return work;
+  if (signal.aborted) return Promise.reject(signal.reason as Error);
+  return new Promise((resolve, reject) => {
+    const stopped = () => reject(signal.reason as Error);
+    signal.addEventListener('abort', stopped, { once: true });
+    void work.then(() => {
+      signal.removeEventListener('abort', stopped);
+      resolve();
+    });
+  });
+}
+
+function within(work: Promise<void>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const elapsed = new Promise<void>((done) => {
+    timer = setTimeout(done, ms);
+  });
+  return Promise.race([work, elapsed]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -1478,8 +1659,18 @@ export async function runAgent(
       : hasOwnScreen(agent)
       ? [computerToolDef(deps.screen), commandToolDef(), webSearchToolDef(), webFetchToolDef()]
       : [commandToolDef(), webSearchToolDef(), webFetchToolDef()];
+  // Not awaited before the first model call, only before anything that can write into the home:
+  // every tool call and the MCP start. Restoring files relies on the snapshot showing the home
+  // as it was before this turn touched it.
+  let snapshotted = false;
   const snapshot =
-    parent === undefined ? snapshotWorkspace(deps.exec, agent, lastMessageId(db), Date.now(), deps.signal) : undefined;
+    parent === undefined
+      ? snapshotWorkspace(deps.exec, agent, lastMessageId(db), Date.now(), deps.signal).finally(() => {
+          snapshotted = true;
+        })
+      : undefined;
+  const homeReady = (): Promise<void> =>
+    snapshot === undefined || snapshotted ? Promise.resolve() : untilStopped(snapshot, deps.signal);
   // The row, not the argument: the profile is written mid-turn by set_profile, and the next
   // turn's prompt has to carry it.
   const system =
@@ -1508,20 +1699,41 @@ export async function runAgent(
     history.every((message) => message.id <= lastOwn || message.role !== 'user' || requestIds.has(message.id));
   // Decided here with the system text rather than between steps, for the same reason: every
   // step of this turn is handed the same request head, and the summariser runs at most once.
-  const replay = await compact(
-    deps,
-    agent,
-    conversationId,
-    system,
-    history,
-  );
-  // Before an MCP server starts: it runs as the agent and may write into the home.
-  await snapshot;
+  const usage = { promptTokens: 0, completionTokens: 0 };
+  let metered = false;
+  let summaries = 0;
+  const meter: Meter = (spent) => {
+    if (spent === undefined) return;
+    metered = true;
+    usage.promptTokens += spent.promptTokens;
+    usage.completionTokens += spent.completionTokens;
+    deps.idle?.spent?.(usage.promptTokens + usage.completionTokens);
+  };
+  const summarised: Meter = (spent) => {
+    summaries += 1;
+    meter(spent);
+  };
+  // The budget belongs to the model that answers, which "Use backup model" can change mid-turn.
+  let budgetModel = deps.idle?.modelId ?? modelIdFor(db, agent);
+  let budget = compactionBudget(contextWindowFor(db, agent, budgetModel));
+  const follow = (modelId: number | undefined): boolean => {
+    if (modelId === undefined || modelId === budgetModel) return false;
+    budgetModel = modelId;
+    budget = compactionBudget(contextWindowFor(db, agent, modelId));
+    return true;
+  };
+  let switched = false;
+  let replay = await compact(deps, agent, conversationId, system, history, budget, summarised);
+  let shrunk = false;
+  let cutOffs = 0;
   // Connected here, with the system text and the replay, for the reason they are: every step of
   // this turn is handed the same tool list, so the request head the prompt cache keys on does
   // not change between steps. A worker gets none of them — it has no Linux user of its own, so a
   // stdio server would run as its parent, and it is one job that is never started again.
-  const mcp = parent === undefined && deps.idle === undefined ? await mcpSession(deps, agent) : undefined;
+  const mcp =
+    parent === undefined && deps.idle === undefined && deps.signal?.aborted !== true
+      ? await mcpSession(deps, agent, homeReady)
+      : undefined;
   const tools = mcp === undefined ? builtin : [...builtin, ...mcp.tools];
   let wrote = false;
   let spawned = false;
@@ -1532,8 +1744,6 @@ export async function runAgent(
   let formOn: string | undefined;
   let rename: string | undefined;
   let steps = 0;
-  const usage = { promptTokens: 0, completionTokens: 0 };
-  let metered = false;
   /** Where a finished turn stands: waiting on whoever it handed work to, else on the owner. */
   const endState = (): AgentState =>
     spawned ? 'waiting_for_task_worker' : wrote ? 'waiting_for_agent' : 'waiting_for_user';
@@ -1562,59 +1772,105 @@ export async function runAgent(
       const fresh = listMessages(db, conversationId, seen);
       seen = fresh.at(-1)?.id ?? seen;
       history.push(...fresh.filter(started));
+      if (switched) {
+        switched = false;
+        if (projectedChars(transcript(agent.name, system, history, replay)) > budget.transcript) {
+          replay = (await summariseHead(deps, agent, conversationId, system, history, budget, since, summarised)) ?? replay;
+          if (deps.signal?.aborted) return halt();
+        }
+      }
       let reply: ChatReply;
       try {
         reply = await deps.provider(
           transcript(agent.name, system, history, replay),
           tools,
-          (partial) => live.set(agent.name, partial),
+          (partial) => live.set(agent.id, partial),
           deps.signal,
         );
       } catch (error) {
         // Nothing was stored for this step: the reply never arrived, so there is no call to
         // answer and the history ends at the last complete exchange.
         if (deps.signal?.aborted) return halt();
+        // The window estimate was wrong, or the turn grew past it. Once a turn: compact harder,
+        // between turns only, and ask the same step again. A second overflow fails the turn.
+        if (!shrunk && error instanceof ProviderError && error.overflow) {
+          shrunk = true;
+          follow(error.modelId);
+          log.info('context overflow, compacting and asking again', { agent: agent.name, conversationId });
+          const smaller = await summariseHead(
+            deps,
+            agent,
+            conversationId,
+            system,
+            history,
+            overflowBudget(budget),
+            since,
+            summarised,
+          );
+          if (deps.signal?.aborted) return halt();
+          if (smaller !== undefined) {
+            replay = smaller;
+            step -= 1;
+            continue;
+          }
+        }
         throw error;
       } finally {
-        live.delete(agent.name);
+        live.delete(agent.id);
       }
       steps += 1;
-      if (reply.usage !== undefined) {
-        metered = true;
-        usage.promptTokens += reply.usage.promptTokens;
-        usage.completionTokens += reply.usage.completionTokens;
-      }
+      meter(reply.usage);
+      switched = follow(reply.modelId);
+      // A reply cut off at the output token limit: its text is kept and marked, and a tool call
+      // in it is never run, since its arguments are whatever the model got out before the cut.
+      const cutOff = reply.finish === 'length';
+      const text = cutOff && reply.toolCalls.length === 0 ? `${reply.text}${CUT_OFF}` : reply.text;
       appendMessage(db, conversationId, {
         role: 'assistant',
-        content: reply.text,
+        content: text,
         sender: agent.name,
-        ...(reply.toolCalls.length === 0 ? {} : { toolCalls: reply.toolCalls }),
+        ...(reply.toolCalls.length === 0
+          ? {}
+          : { toolCalls: cutOff ? reply.toolCalls.map((call) => ({ ...call, arguments: '{}' })) : reply.toolCalls }),
+        ...(reply.echo === undefined ? {} : { echo: reply.echo }),
       });
 
       if (reply.toolCalls.length === 0) {
         if (parent !== undefined) {
           transition(db, agent, 'completed');
-          report(deps, agent, parent, reply.text.trim() === '' ? NOTHING_TO_REPORT : reply.text);
+          report(deps, agent, parent, text.trim() === '' ? NOTHING_TO_REPORT : text);
           return;
         }
         const ending = endState();
         transition(db, agent, ending);
         if (ending === 'waiting_for_user') {
-          answerRequests(deps, agent, owed, reply.text.trim() === '' ? NOTHING_TO_REPORT : reply.text);
+          answerRequests(deps, agent, owed, text.trim() === '' ? NOTHING_TO_REPORT : text);
         }
-        if (!onlyAgentsAsked) deps.deliver?.(agent, conversationId, reply.text, 'reply');
+        if (!onlyAgentsAsked) deps.deliver?.(agent, conversationId, text, 'reply');
         return;
       }
 
-      for (const call of reply.toolCalls) {
+      if (cutOff) {
+        for (const call of reply.toolCalls) {
+          recordEvent(db, agent.id, 'tool_call', summarise(call));
+          appendMessage(db, conversationId, { role: 'tool', content: CALL_CUT_OFF, sender: agent.name, toolCallId: call.id });
+          recordEvent(db, agent.id, 'tool_result', { callId: call.id, ok: false, error: 'cut off' });
+        }
+        cutOffs += 1;
+        if (cutOffs > 1) throw new Error(CUT_OFF_AGAIN);
+      }
+
+      for (const call of cutOff ? [] : reply.toolCalls) {
         recordEvent(db, agent.id, 'tool_call', summarise(call));
         const acting = Object.hasOwn(STATE_FOR_TOOL, call.name) ? STATE_FOR_TOOL[call.name] : undefined;
         if (acting !== undefined) transition(db, agent, acting);
-        const observation: Observation = await (
-          deps.idle === undefined
-            ? dispatch(deps, agent, call, conversationId, mcp)
-            : idleDispatch(deps, agent, call, conversationId, deps.idle)
-        ).catch(
+        const observation: Observation = await homeReady()
+          .then(() =>
+            deps.idle === undefined
+              ? dispatch(deps, agent, call, conversationId, mcp)
+              : idleDispatch(deps, agent, call, conversationId, deps.idle),
+          )
+          .catch(
           (error: Error) => ({ text: `error: ${error.message}`, event: { ok: false, error: error.message } }),
         );
         if (observation.event['ok'] === true && call.name === 'send_message') wrote = true;
@@ -1632,7 +1888,7 @@ export async function runAgent(
         appendMessage(db, conversationId, {
           role: 'tool',
           // Whatever a tool reads back, a value the owner typed into a secret field is not in it.
-          content: redactSecrets((parent ?? agent).id, observation.text),
+          content: redactSecrets(db, (parent ?? agent).id, observation.text),
           sender: agent.name,
           toolCallId: call.id,
           ...(observation.image === undefined ? {} : { image: observation.image }),
@@ -1703,11 +1959,16 @@ export async function runAgent(
   } finally {
     // What the turn cost, on every way out. The tokens are only what the endpoint reported;
     // one that reports nothing leaves the count of model calls, which is still a cost.
-    recordEvent(db, agent.id, 'turn', { steps, ...(metered ? usage : {}) });
+    recordEvent(db, agent.id, 'turn', { steps, ...(summaries === 0 ? {} : { summaries }), ...(metered ? usage : {}) });
     await deps.idle?.end(usage.promptTokens + usage.completionTokens);
     // Every way out of the turn, not only the last line of the happy one: a stdio session left
     // open is a child process that outlives the turn that started it.
     await mcp?.close();
+    // A reply with no tool call can end the turn while the snapshot still runs, and the next
+    // round's snapshot or a rename must not overlap it. A stop kills it; a stuck one gets a grace.
+    if (snapshot !== undefined) {
+      await untilStopped(snapshot, deps.signal).catch(() => within(snapshot, STOPPED_SNAPSHOT_GRACE_MS));
+    }
     // Last, with nothing of the turn still running as the old user. The failure is logged and
     // not thrown: the turn itself succeeded, and the next one runs under the name that stuck.
     if (rename !== undefined) {
@@ -1733,7 +1994,7 @@ export type RunnerDeps = {
   /** The web search endpoint and its key, or undefined while no key is stored. */
   search: () => SearchConfig | undefined;
   /** One turn's MCP tools, connected when the turn starts and dropped when it ends. */
-  mcp: (agent: Agent) => Promise<McpSession | undefined>;
+  mcp: LoopDeps['mcp'];
   /** Who holds each desktop's input. Process state, like the loop cap below it. */
   control: Control;
   /** How many turns may run at once in this process, and how many workers may be live at all. */
@@ -1750,65 +2011,138 @@ export type RunnerDeps = {
 // Two agents writing to each other are stopped earlier, by MAX_AGENT_CHAIN.
 const MAX_ROUNDS = 16;
 
+/** How often the runner looks for unread input and agents left waiting on nobody. */
+export const SWEEP_MS = 60_000;
+
+export type TurnRunner = Runner & {
+  /** Repairs agents waiting on nobody, queues every thread with unread input, then fills free
+   * loops from the queue. Run at boot and on a timer. */
+  sweep(): void;
+};
+
 /**
- * Owns the one-turn-per-agent rule, and is why a message to a busy agent is no longer a 409.
- * The message rows are the queue: a turn that is already running looks for arrivals before it
- * releases the agent, so nothing needs to retry and nothing is dropped.
+ * Owns the one-turn-per-agent rule and the loop cap. A message to a busy agent is a row its
+ * running turn picks up before it releases the agent. A turn that finds every loop taken waits
+ * in `turn_queue`, and each freed loop starts the oldest waiting entry, so nothing is dropped
+ * and one chatty agent cannot starve the others.
  */
-export function createRunner(deps: RunnerDeps): Runner {
-  const busy = new Set<string>();
+export function createRunner(deps: RunnerDeps): TurnRunner {
+  // By id, not name: set_name renames the agent at the end of a turn while its drain still holds
+  // the loop, and a start under the new name must find it busy.
+  const busy = new Set<number>();
   /** One per turn in flight, so a stop reaches exactly the turn that is running now. */
-  const stops = new Map<string, AbortController>();
-  const runner: Runner = { start, atCapacity, running: (name) => busy.has(name), stop };
+  const stops = new Map<number, AbortController>();
+  const idOf = (name: string): number | undefined => findAgent(deps.db, name)?.id;
+  const busyNamed = (name: string): boolean => {
+    const id = idOf(name);
+    return id !== undefined && busy.has(id);
+  };
+  const runner: TurnRunner = { start, atCapacity, running: busyNamed, stop, sweep };
 
   function stop(name: string): boolean {
-    const controller = stops.get(name);
+    const id = idOf(name);
+    const controller = id === undefined ? undefined : stops.get(id);
     if (controller === undefined) return false;
     controller.abort(new Error('stopped by the owner'));
     return true;
   }
 
   function atCapacity(name?: string): string | undefined {
-    if (name !== undefined && busy.has(name)) return undefined;
+    if (name !== undefined && busyNamed(name)) return undefined;
     return busy.size < deps.maxLoops
       ? undefined
       : `at most ${deps.maxLoops} agent loops can run at once; wait for one to finish`;
   }
 
-  function start(agent: Agent, conversationId: number, idle?: IdleTurn): void {
-    // A busy agent is not refused. The message is already a row, and the drain below finds it.
-    if (busy.has(agent.name)) return;
-    const refusal = atCapacity(agent.name);
-    if (refusal !== undefined) {
-      // Callers that can answer somebody ask first. Getting here means nobody could be told, so
-      // the row waits for the next turn this agent runs, or for the boot repair.
-      log.error('loop cap reached, turn not started', { agent: agent.name, refusal });
+  function start(agent: Agent, conversationId: number, idle?: IdleTurn, kind: TurnKind = 'message'): void {
+    // An idle pass carries callbacks a row cannot hold, so it never waits in line: the idle tick
+    // checks for room first and keeps the pass due when there is none.
+    if (idle !== undefined) {
+      if (busy.has(agent.id) || busy.size >= deps.maxLoops || isQueued(deps.db, agent.id)) {
+        void idle.end(undefined);
+        return;
+      }
+      launch(agent, conversationId, idle);
       return;
     }
-    busy.add(agent.name);
-    void drain(agent, conversationId, idle);
+    if (busy.has(agent.id)) return;
+    if (busy.size < deps.maxLoops && queuedTurns(deps.db).length === 0) {
+      launch(agent, conversationId);
+      return;
+    }
+    enqueueTurn(deps.db, agent.id, conversationId, kind);
+    log.info('turn queued at the loop cap', { agent: agent.name, kind });
+    pump();
   }
 
-  /** `idle` shapes the first round only; what arrives meanwhile gets an ordinary turn. */
-  async function drain(agent: Agent, conversationId: number, idle?: IdleTurn): Promise<void> {
+  function launch(agent: Agent, conversationId: number, idle?: IdleTurn): void {
+    busy.add(agent.id);
+    void drain(agent.id, conversationId, idle);
+  }
+
+  /** Synchronous, like every release that calls it: an await here would let two freed loops
+   * start the same entry. */
+  function pump(): void {
+    for (const entry of queuedTurns(deps.db)) {
+      if (busy.size >= deps.maxLoops) return;
+      if (busy.has(entry.agentId)) continue;
+      const agent = findAgentById(deps.db, entry.agentId);
+      dequeueTurn(deps.db, entry.id);
+      if (agent === undefined) continue;
+      // A rewind or a clear while it waited can leave nothing to read, and a turn on nothing
+      // would answer an old message twice. A retry asks again on purpose.
+      const unread =
+        entry.kind === 'retry'
+          ? entry.conversationId
+          : pendingConversation(deps.db, agent, readThrough(deps.db, agent.id, agent.name));
+      if (unread === undefined) continue;
+      log.info('queued turn started', { agent: agent.name, kind: entry.kind, waitedMs: Date.now() - entry.createdAt });
+      launch(agent, unread);
+    }
+  }
+
+  function release(agentId: number): void {
+    busy.delete(agentId);
+    pump();
+  }
+
+  function sweep(): void {
+    const live = (agent: Agent): boolean => busy.has(agent.id) || isQueued(deps.db, agent.id);
+    repairWaiting(deps.db, live);
+    for (const agent of listAgents(deps.db)) {
+      if (live(agent) || deps.provider(agent) === undefined) continue;
+      const unread = pendingConversation(deps.db, agent, readThrough(deps.db, agent.id, agent.name));
+      if (unread === undefined) continue;
+      log.info('unread input queued by the sweep', { agent: agent.name, conversation: unread });
+      enqueueTurn(deps.db, agent.id, unread, 'requeue');
+    }
+    pump();
+  }
+
+  /** `idle` shapes the first round only; what arrives meanwhile gets an ordinary turn. The row is
+   * read again around every round, because a round can end in a rename. */
+  async function drain(agentId: number, conversationId: number, idle?: IdleTurn): Promise<void> {
     // A round covers its own thread up to the moment it started, and nothing in any other:
     // measuring every round against the global maximum left a second thread written to during
     // the first round unanswered until the owner spoke again.
     const since = lastMessageId(deps.db);
     const covered = new Map<number, number>();
     for (let round = 0; round < MAX_ROUNDS; round += 1) {
-      covered.set(conversationId, lastMessageId(deps.db));
+      const through = lastMessageId(deps.db);
+      covered.set(conversationId, through);
       const turnIdle = round === 0 ? idle : undefined;
-      const provider = deps.provider(agent, turnIdle?.modelId ?? undefined);
-      if (provider === undefined) {
-        log.error('no provider configured, turn dropped', { agent: agent.name });
-        busy.delete(agent.name);
+      const agent = findAgentById(deps.db, agentId);
+      const provider = agent === undefined ? undefined : deps.provider(agent, turnIdle?.modelId ?? undefined);
+      if (agent === undefined || provider === undefined) {
+        if (agent !== undefined) log.error('no provider configured, turn not run', { agent: agent.name });
+        release(agentId);
         void turnIdle?.end(undefined);
         return;
       }
+      markRead(deps.db, agentId, through);
 
       const controller = new AbortController();
-      stops.set(agent.name, controller);
+      stops.set(agentId, controller);
       try {
         // An idle pass tells nobody anything: no push for its reply or its cleanup requests.
         await runAgent(
@@ -1825,42 +2159,95 @@ export function createRunner(deps: RunnerDeps): Runner {
       } catch (error) {
         log.error('agent run threw', { agent: agent.name, error });
       } finally {
-        stops.delete(agent.name);
+        stops.delete(agentId);
       }
 
       // Synchronous from here to the release. An await in between opens a window in which a
       // message arrives, finds the agent busy, and is then never picked up by anyone.
-      const next = pendingConversation(deps.db, agent, since, (id) => covered.get(id) ?? since);
+      const after = findAgentById(deps.db, agentId);
+      const next = after === undefined ? undefined : pendingConversation(deps.db, after, since, (id) => covered.get(id) ?? since);
       if (next === undefined) {
-        busy.delete(agent.name);
+        release(agentId);
         return;
       }
       conversationId = next;
     }
 
-    busy.delete(agent.name);
-    log.info('agent released with messages still waiting', { agent: agent.name });
+    // To the back of the line, so the others get a loop before this agent's next round.
+    busy.delete(agentId);
+    enqueueTurn(deps.db, agentId, conversationId, 'requeue');
+    log.info('agent released with messages still waiting; requeued', { agentId });
+    pump();
   }
 
   return runner;
 }
 
+/** One pass now, so the queue a restart left behind is drained at boot, then every `SWEEP_MS`. */
+export function startSweeper(runner: TurnRunner): () => void {
+  const pass = () => {
+    try {
+      runner.sweep();
+    } catch (error) {
+      log.error('turn sweep failed', { error });
+    }
+  };
+  pass();
+  const timer = setInterval(pass, SWEEP_MS);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
 /** The states that mean a process was doing something, which after a restart nothing is. */
 const INTERRUPTED_STATES: readonly AgentState[] = ['thinking', 'using_computer', 'using_terminal'];
 
-/** The states in which what wakes an agent is another loop, which after a restart there is not:
- * the wake only ever fires from inside a live turn. */
-const WAITING_ON_AN_AGENT: readonly AgentState[] = ['waiting_for_agent', 'waiting_for_task_worker'];
+/**
+ * An agent waiting on another agent or on a worker that is no longer on it would wait forever:
+ * its wake only ever fires from inside a live turn. Hands it back to its owner. Waiting on an
+ * agent counts only while one it asked has not answered and is still on it: running, queued,
+ * waiting itself, or waiting on the owner for a question, form, hand-over or approval. A stopped
+ * turn never answers. Waiting on workers counts while one is live. The reply
+ * or report still wakes it whatever state it is in.
+ */
+/** Unread input counts: the sweep queues it, and that turn is the one that answers. */
+function onIt(db: Db, agent: Agent, live: (agent: Agent) => boolean): boolean {
+  if (live(agent) || agent.state === 'waiting_for_agent' || agent.state === 'waiting_for_task_worker') return true;
+  if (pendingConversation(db, agent, readThrough(db, agent.id, agent.name)) !== undefined) return true;
+  return listNeedsYou(db).some((item) => item.agent === agent.name && item.kind !== 'failure');
+}
+
+export function repairWaiting(db: Db, live: (agent: Agent) => boolean): Agent[] {
+  const repaired: Agent[] = [];
+  for (const agent of listAgents(db)) {
+    if (agent.state !== 'waiting_for_agent' && agent.state !== 'waiting_for_task_worker') continue;
+    if (live(agent)) continue;
+    try {
+      const pending =
+        agent.state === 'waiting_for_task_worker'
+          ? liveWorkers(db).some((worker) => worker.parentId === agent.id)
+          : awaitedAgents(db, agent.name).some((id) => {
+              const target = findAgentById(db, id);
+              return target !== undefined && onIt(db, target, live);
+            });
+      if (pending) continue;
+      transition(db, agent, 'waiting_for_user');
+      repaired.push(agent);
+      log.info('agent was waiting on nobody', { agent: agent.name, from: agent.state });
+    } catch (error) {
+      log.error('waiting repair failed', { agent: agent.name, error });
+    }
+  }
+  return repaired;
+}
 
 /**
  * Boot repair, the counterpart to `reconcileDesktops`. A daemon that died mid-turn left a row
  * claiming work no process is doing, and a transcript ending in tool calls nothing answered.
  * Runs before the server listens, so no reader ever sees the broken shape.
  *
- * A repaired agent waits for its owner rather than resuming by itself: a turn that killed the
- * daemon would be re-run on every boot, and resuming needs a provider configured at boot for
- * every agent at once. The synthetic observation is already in the transcript, so the next
- * message the owner sends carries the restart into the model call.
+ * A repaired agent does not resume the turn it was in: a turn that killed the daemon would be
+ * re-run on every boot. That turn marked its input read when it started, so the boot sweep only
+ * runs what arrived after it.
  */
 export function reconcileAgents(db: Db): void {
   // Workers first: a parent is only stranded once the worker it waits on has been given up on,
@@ -1888,19 +2275,19 @@ export function reconcileAgents(db: Db): void {
       const interrupted = listConversations(db, agent.id).flatMap((conversation) =>
         repairInterruptedCalls(db, conversation.id, agent.name),
       );
-      // An agent waiting on another one is not mid-turn, but a reply that landed before the
-      // daemon died will never reach it: the wake only ever fires from inside a live turn, and
-      // no turn is running now. Hand it back to its owner rather than leave it waiting forever.
-      const stranded =
-        WAITING_ON_AN_AGENT.includes(agent.state) &&
-        pendingConversation(db, agent, lastMessageBy(db, agent.name)) !== undefined;
       const acting = INTERRUPTED_STATES.includes(agent.state);
-      if (!acting && !stranded && interrupted.length === 0) continue;
+      if (!acting && interrupted.length === 0) continue;
       recordEvent(db, agent.id, 'restart', { from: agent.state, interrupted });
-      if (acting || stranded) transition(db, agent, 'waiting_for_user');
+      if (acting) transition(db, agent, 'waiting_for_user');
       log.info('agent reconciled', { agent: agent.name, from: agent.state, interrupted });
     } catch (error) {
       log.error('agent reconcile failed', { agent: agent.name, error });
     }
+  }
+
+  // After every interrupted agent has come to rest: whether an asker is stranded depends on
+  // where the agent it asked was left. Nothing runs or waits in line before the runner exists.
+  for (const agent of repairWaiting(db, () => false)) {
+    recordEvent(db, agent.id, 'restart', { from: agent.state, interrupted: [] });
   }
 }

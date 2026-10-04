@@ -2,41 +2,17 @@ import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// What the chat is reading. An agent's own thread — a task worker's included — is reached through
-/// the agent, because a brand new agent has no conversation row until something is written to it;
-/// a thread it shares with somebody is reached by its conversation id.
-enum ChatThread: Hashable {
-    case agent(Agent)
-    case group(id: Int, members: [Agent])
+/// What the chat is reading: one agent's thread, a task worker's included. It is reached through
+/// the agent, because a brand new agent has no conversation row until something is written to it.
+struct ChatThread: Hashable {
+    let agent: Agent
 
-    var source: ThreadSource {
-        switch self {
-        case .agent(let agent): .agent(agent.name)
-        case .group(let id, _): .conversation(id)
-        }
-    }
-
-    var members: [Agent] {
-        switch self {
-        case .agent(let agent): [agent]
-        case .group(_, let members): members
-        }
-    }
-
-    var title: String {
-        members.map(\.title).joined(separator: " + ")
-    }
-
-    /// The one agent behind an agent thread. A group has several, so it has no single state to
-    /// show and no reply of its own to stream.
-    var only: Agent? {
-        if case .agent(let agent) = self { return agent }
-        return nil
-    }
+    var source: ThreadSource { .agent(agent.name) }
+    var title: String { agent.title }
 
     /// A task worker reports to the agent that spawned it. Taking a message over HTTP would start
     /// it working again, so the owner is shown the reason instead of a composer.
-    var isWorker: Bool { only?.parentId != nil }
+    var isWorker: Bool { agent.parentId != nil }
 }
 
 /// One thread. The newest page on open, older pages when the reader reaches the top, new rows by
@@ -66,7 +42,7 @@ struct ChatView: View {
     }
     /// Everything drawn that follows from `loaded` and `mark` alone, rebuilt when either changes.
     @State private var rows = ChatRows()
-    @State private var more = false
+    @State private var paging = OlderPages()
     @State private var live: LiveReply?
     @State private var arrivals = Arrivals()
     /// The bubbles the live row has shown, so the stored reply does not show them arriving twice.
@@ -77,7 +53,6 @@ struct ChatView: View {
     @State private var draft = ""
     @State private var trouble: String?
     @State private var sending = false
-    @State private var loadingOlder = false
     @State private var dressing = false
     @State private var watching = false
     @State private var filling: NeedsYouItem?
@@ -138,19 +113,21 @@ struct ChatView: View {
     @Environment(Unread.self) private var unread
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.pollPhase) private var pollPhase
+    /// The first page has been asked for, so the catch-up poll has a newest row to walk on from.
+    @State private var opened = false
 
-    /// The thread's colours: the agent's own, so every thread is recognisably its agent's. A
-    /// shared thread has several and keeps the ground and the app's accent.
-    private var palette: AgentPalette? {
-        thread.only.map { looks[$0.name].palette(dark: scheme == .dark) }
-    }
+    private var agent: Agent { thread.agent }
 
-    private var agentColor: BloubColorId? { thread.only.map { looks[$0.name].color } }
-    private var accent: Color { palette?.accentText.color ?? Theme.ink.rgb(dark: scheme == .dark).color }
-    private var bubble: Color { palette?.bubble.color ?? Theme.ink.rgb(dark: scheme == .dark).color }
-    private var bubbleText: Color { palette?.bubbleText.color ?? Theme.onInk.rgb(dark: scheme == .dark).color }
-    private var replyBubble: Color { palette?.soft.color ?? Theme.card.rgb(dark: scheme == .dark).color }
-    private var replyLink: Color { palette?.softText.color ?? accent }
+    /// The thread's colours: the agent's own, so every thread is recognisably its agent's.
+    private var palette: AgentPalette { looks[agent.name].palette(dark: scheme == .dark) }
+
+    private var agentColor: BloubColorId { looks[agent.name].color }
+    private var accent: Color { palette.accentText.color }
+    private var bubble: Color { palette.bubble.color }
+    private var bubbleText: Color { palette.bubbleText.color }
+    private var replyBubble: Color { palette.soft.color }
+    private var replyLink: Color { palette.softText.color }
 
     /// By id rather than `scrollTo(edge:)`: in a lazy stack the edge is an estimate, and landing on
     /// it left the view scrolled past rows that were never laid out.
@@ -211,7 +188,7 @@ struct ChatView: View {
                 session: session,
                 message: message,
                 shown: shown,
-                speaker: speakerLabel(of: message, own: thread.only?.name, among: thread.members),
+                speaker: speakerLabel(of: message, own: agent.name),
                 bubble: bubble,
                 bubbleText: bubbleText,
                 replyBubble: replyBubble,
@@ -223,7 +200,7 @@ struct ChatView: View {
             )
             .equatable()
         case .tools(let run):
-            ToolRun(run: run, by: thread.only == nil ? speaker(of: run[0].message, among: thread.members) : nil)
+            ToolRun(run: run)
                 .equatable()
         case .request(let step):
             request(step)
@@ -235,12 +212,12 @@ struct ChatView: View {
     @ViewBuilder private func request(_ step: ToolStep) -> some View {
         if let approval = approvals.first(where: { $0.callId == step.message.toolCallId }) {
             if let item = requests.first(where: { $0.approval?.id == approval.id }) {
-                NeedsYouCard(item: item, agent: nil, titles: titles(thread.members), onAct: onAct)
+                NeedsYouCard(item: item, agent: nil, titles: titles([agent]), onAct: onAct)
             } else {
-                ApprovalLine(approval: approval, titles: titles(thread.members))
+                ApprovalLine(approval: approval, titles: titles([agent]))
             }
         } else {
-            ToolRun(run: [step], by: thread.only == nil ? speaker(of: step.message, among: thread.members) : nil)
+            ToolRun(run: [step])
                 .equatable()
         }
     }
@@ -249,7 +226,24 @@ struct ChatView: View {
 
     private func loadApprovals() async {
         guard !rows.requestCalls.isEmpty else { return }
-        if let fresh = try? await session.run({ try await $0.approvals(thread.source) }) { approvals = fresh }
+        do {
+            approvals = try await session.run { try await $0.approvals(thread.source) }
+        } catch {
+            pollFailed(error)
+        }
+    }
+
+    /// A poll's failure takes the strip only when it is free: a send that failed stays readable
+    /// under a poll that fails every two seconds.
+    private func pollFailed(_ error: any Error) {
+        guard trouble == nil, let complaint = session.complaint(about: error) else { return }
+        trouble = complaint
+    }
+
+    /// A fetch that follows an action. The action went through, so this one's failure is a
+    /// poll's, not the action's.
+    private func reporting(_ work: () async throws -> Void) async {
+        do { try await work() } catch { pollFailed(error) }
     }
 
     var body: some View {
@@ -258,7 +252,10 @@ struct ChatView: View {
                 // Keyed by the oldest row rather than fired when the top comes near: a page that folds
                 // into the tool line already there adds no height, the top stays near, and a
                 // trigger on nearness changing would never fire again.
-                if more {
+                // Retry swaps the spinner back in, and its load runs again as it appears.
+                if let failure = paging.failure {
+                    OlderFailedRow(reason: failure) { paging.retry() }
+                } else if paging.more {
                     ProgressView()
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
@@ -276,7 +273,7 @@ struct ChatView: View {
                     row(item)
                 }
 
-                if let live, let agent = thread.only {
+                if let live {
                     LiveRow(reply: live, agent: agent.title, bubble: replyBubble, link: replyLink, thinkingOpen: $thinkingOpen) { useBackup in
                         await retryModel(agent.name, useBackup: useBackup)
                     }
@@ -332,17 +329,17 @@ struct ChatView: View {
             jumpToBottom.animation(.easeOut(duration: 0.15), value: atBottom)
         }
         .overlay {
-            if loaded.isEmpty && !more { empty }
+            if loaded.isEmpty && !paging.more { empty }
         }
         // The content and the composer, not the toolbar. Text-strength: a filled control in the
         // agent's colour sets the bubble colour on itself.
         .tint(accent)
-        .background(palette.map { AnyShapeStyle($0.tint.color) } ?? AnyShapeStyle(Theme.ground))
+        .background(palette.tint.color)
         .safeAreaInset(edge: .bottom) { composer }
         .sheet(item: $confirming) { request in
             RewindSheet(
                 retry: request.retry,
-                title: { name in thread.members.first { $0.name == name }?.title ?? name },
+                title: { name in name == agent.name ? agent.title : name },
                 load: { try await session.run { try await $0.rewindPreview(thread.source, from: request.from) } },
                 confirm: { files in try await rewind(request, files: files) }
             )
@@ -359,9 +356,9 @@ struct ChatView: View {
             #if os(iOS)
             ToolbarItem(placement: .principal) { pill.padding(.horizontal, 8) }
             // Only a permanent agent: `desktopAgent` refuses a task worker a display, and a worker
-            // holds no schedules of its own — the web UI gives it neither tab. One menu, where three
+            // holds no schedules of its own, so it gets neither tab. One menu, where three
             // buttons beside the pill would not fit; with an inspector too, which no longer lists the pages.
-            if let agent = thread.only, agent.parentId == nil {
+            if !thread.isWorker {
                 ToolbarItem {
                     Menu {
                         if inspector == nil {
@@ -389,16 +386,16 @@ struct ChatView: View {
             // before the centred pill to its left, and a parent's items are declared first.
             if let inspector {
                 ToolbarSpacer(.flexible)
-                if let agent = thread.only, let percent = agent.contextFullness {
+                if let percent = agent.contextFullness {
                     ToolbarItem { ContextMeter(percent: percent, identity: looks[agent.name]).padding(.horizontal, 6) }
                 }
-                if thread.only?.parentId != nil || thread.only == nil {
+                if thread.isWorker {
                     ToolbarItem { export }
                 }
                 ToolbarItem {
                     Button("Inspector", systemImage: "sidebar.trailing") { inspector.wrappedValue.toggle() }
                 }
-            } else if thread.only?.parentId != nil || thread.only == nil {
+            } else if thread.isWorker {
                 ToolbarItem { export }
             }
             #endif
@@ -449,7 +446,10 @@ struct ChatView: View {
         .onAppear {
             guard pasteMonitor == nil else { return }
             pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                guard editing, event.charactersIgnoringModifiers == "v",
+                // `editing` stays true while another window is key, and a desktop window's ⌘V
+                // belongs to the agent's screen.
+                guard editing, event.window?.firstResponder is NSText,
+                      event.charactersIgnoringModifiers == "v",
                       event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command,
                       pasteImages()
                 else { return event }
@@ -462,21 +462,19 @@ struct ChatView: View {
         }
         #endif
         .sheet(isPresented: $dressing) {
-            if let agent = thread.only {
-                AgentLookSheet(session: session, agent: agent, identity: looks[agent.name])
-            }
+            AgentLookSheet(session: session, agent: agent, identity: looks[agent.name])
         }
-        .task(id: rows.trigger == nil ? nil : thread.only?.name) {
-            if rows.trigger != nil, let agent = thread.only, agent.parentId == nil { await watchTriggers(agent.name) }
+        .task(id: PollKey(value: rows.trigger == nil ? nil : agent.name, phase: pollPhase)) {
+            if rows.trigger != nil, !thread.isWorker { await watchTriggers(agent.name) }
         }
         .sheet(item: $filling, onDismiss: takeScreenAfterForm) { item in
             if let form = item.form {
-                FormSheet(agent: thread.only?.title ?? item.agent, form: form) { fill in
+                FormSheet(agent: agent.title, form: form) { fill in
                     let cursor = newestId(loaded)
                     try await session.run { try await $0.fillForm(agent: item.agent, id: form.id, fill: fill) }
                     mark = Int.max
                     jumpPending = true
-                    await catchUp(after: cursor)
+                    await reporting { try await catchUp(after: cursor) }
                 } onScreen: {
                     screenAfterForm = true
                     filling = nil
@@ -489,12 +487,10 @@ struct ChatView: View {
             }
         }
         .sheet(item: Binding(get: { forwarder.pending }, set: { forwarder.pending = $0 })) { forwarding in
-            ForwardSheet(session: session, forwarding: forwarding, excluding: thread.only?.name)
+            ForwardSheet(session: session, forwarding: forwarding, excluding: agent.name)
         }
         .sheet(item: $pages) { page in
-            if let agent = thread.only {
-                RoutinesAndActivity(session: session, agent: agent, page: page)
-            }
+            RoutinesAndActivity(session: session, agent: agent, page: page)
         }
         .confirmationDialog("Clear this thread?", isPresented: $clearing, titleVisibility: .visible) {
             Button("Clear", role: .destructive) { Task { await clear() } }
@@ -505,49 +501,48 @@ struct ChatView: View {
         #if os(iOS)
         .fullScreenCover(isPresented: $watching) { desktop }
         #endif
-        // Keyed by the thread, not by the agent's name: a group thread carries the same name as
-        // one of its members, so without the whole source a switch between them would keep one
-        // view and carry a half-typed draft into the other thread.
         .task(id: thread.source) {
             await open()
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
-                await catchUp()
-            }
+            opened = true
+        }
+        // Apart from the open above, so a change of phase restarts the poll without reloading
+        // the thread and losing the reader's place.
+        .task(id: PollKey(value: opened, phase: pollPhase)) {
+            guard opened else { return }
+            await session.poll(every: .seconds(2), pollPhase, failed: pollFailed) { try await catchUp() }
         }
         // Keyed by the whole thread, so the loop restarts with a fresh state every list poll and
         // the `busy` test below is never reading a stale one.
-        .task(id: thread) {
-            // The reply a model is still writing belongs to one agent. A shared thread would have
-            // to ask every participant, so it shows none — the web UI makes the same call.
-            guard let agent = thread.only, agent.state.busy else {
+        .task(id: PollKey(value: thread, phase: pollPhase)) {
+            guard agent.state.busy else {
                 if live != nil {
-                    await catchUp()
+                    await reporting { try await catchUp() }
                     live = nil
                 }
                 return
             }
-            while !Task.isCancelled {
-                await pollLive(agent.name)
-                try? await Task.sleep(for: .seconds(1))
-            }
+            await session.poll(every: .seconds(1), pollPhase, failed: pollFailed) { try await pollLive(agent.name) }
         }
         // Reading the newest row is what marks the thread seen, wherever the row came from: the
         // first page, a poll, an older page, or the owner's own send.
         .onChange(of: loaded.last?.id) { _, newest in
             guard let newest, unread.see(thread.source, through: newest) else { return }
             let source = thread.source
-            Task { try? await session.run { try await $0.markRead(source, through: newest) } }
+            Task {
+                do {
+                    try await session.run { try await $0.markRead(source, through: newest) }
+                } catch {
+                    pollFailed(error)
+                }
+            }
         }
     }
 
     /// Compact width only, where there is no inspector to open it from. Presented rather than
     /// pushed: the detail column is not a `NavigationStack`, and the desktop wants the whole screen.
-    @ViewBuilder private var desktop: some View {
-        if let agent = thread.only {
-            NavigationStack {
-                DesktopView(session: session, agent: agent)
-            }
+    private var desktop: some View {
+        NavigationStack {
+            DesktopView(session: session, agent: agent)
         }
     }
 
@@ -555,7 +550,7 @@ struct ChatView: View {
     /// pages the reader has not walked back to are not fetched for this.
     private var export: some View {
         ShareLink(
-            item: ThreadExport(messages: loaded, title: thread.title, titles: titles(thread.members)),
+            item: ThreadExport(messages: loaded, title: thread.title, titles: titles([agent])),
             preview: SharePreview(thread.title)
         ) {
             Label("Export as Markdown", systemImage: "square.and.arrow.up")
@@ -571,26 +566,11 @@ struct ChatView: View {
     /// Profile page sends.
     @ViewBuilder private var empty: some View {
         VStack(spacing: 16) {
-            if let agent = thread.only {
-                BloubView(state: .idle, identity: looks[agent.name], size: 120)
-            } else {
-                HStack(alignment: .top, spacing: 16) {
-                    ForEach(thread.members) { member in
-                        VStack(spacing: 6) {
-                            BloubView(state: .idle, identity: looks[member.name], size: 88)
-                            Text(member.title).font(.subheadline.weight(.semibold)).fontDesign(.rounded)
-                            if let tagline = member.tagline {
-                                Text(tagline).font(.caption).foregroundStyle(Theme.muted).lineLimit(2)
-                            }
-                        }
-                        .frame(maxWidth: 140)
-                    }
-                }
-            }
+            BloubView(state: .idle, identity: looks[agent.name], size: 120)
             Text(thread.title)
                 .font(.title2.weight(.bold))
                 .fontDesign(.rounded)
-            if let agent = thread.only, agent.parentId == nil, agent.profile == nil {
+            if !thread.isWorker, agent.profile == nil {
                 Text("It has no profile yet. Let it interview you about what it should be and do, or just start writing to it.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -612,50 +592,30 @@ struct ChatView: View {
         .padding(24)
     }
 
-    @ViewBuilder private var pill: some View {
-        if let agent = thread.only {
-            // The pill is also the way into the agent's look: there is nowhere else the owner is
-            // already looking at the avatar they want to change.
-            Button { dressing = true } label: {
-                HStack(spacing: 8) {
-                    BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 26)
-                        .busyHalo(agent.state.busy, color: looks[agent.name].color)
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text(agent.title).font(.headline).fontDesign(.rounded)
-                        StateLine(state: agent.state, identity: looks[agent.name], font: .caption2.weight(.semibold))
-                    }
-                }
-                .lineLimit(1)
-                .padding(.leading, 2)
-                .padding(.trailing, 6)
-            }
-            // The Mac's toolbar already sets its items on glass; iOS leaves a custom principal
-            // item bare, so only there does the button bring its own.
-            #if os(iOS)
-            .buttonStyle(.glass)
-            #else
-            .buttonStyle(.plain)
-            #endif
-            .accessibilityLabel("\(agent.title), \(agent.state.label). Change its name and appearance")
-        } else {
-            HStack(spacing: 10) {
-                ForEach(thread.members) { member in
-                    HStack(spacing: 5) {
-                        BloubView(state: member.state.bloub, identity: looks[member.name], size: 22)
-                            .busyHalo(member.state.busy, color: looks[member.name].color)
-                        Text(member.title).font(.subheadline.weight(.semibold)).fontDesign(.rounded)
-                    }
+    private var pill: some View {
+        // The pill is also the way into the agent's look: there is nowhere else the owner is
+        // already looking at the avatar they want to change.
+        Button { dressing = true } label: {
+            HStack(spacing: 8) {
+                BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 26)
+                    .busyHalo(agent.state.busy, color: looks[agent.name].color)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(agent.title).font(.headline).fontDesign(.rounded)
+                    StateLine(state: agent.state, identity: looks[agent.name], font: .caption2.weight(.semibold))
                 }
             }
             .lineLimit(1)
-            #if os(iOS)
-            .padding(.vertical, 5)
-            .padding(.leading, 6)
-            .padding(.trailing, 12)
-            .glassEffect(.regular, in: .capsule)
-            #endif
-            .accessibilityLabel("thread with \(thread.title)")
+            .padding(.leading, 2)
+            .padding(.trailing, 6)
         }
+        // The Mac's toolbar already sets its items on glass; iOS leaves a custom principal
+        // item bare, so only there does the button bring its own.
+        #if os(iOS)
+        .buttonStyle(.glass)
+        #else
+        .buttonStyle(.plain)
+        #endif
+        .accessibilityLabel("\(agent.title), \(agent.state.label). Change its name and appearance")
     }
 
     #if os(macOS)
@@ -663,7 +623,7 @@ struct ChatView: View {
         HStack(spacing: 14) {
             headerTitle
             Spacer(minLength: 0)
-            if let agent = thread.only, let percent = agent.contextFullness {
+            if let percent = agent.contextFullness {
                 ContextMeter(percent: percent, identity: looks[agent.name])
                     .padding(.leading, 9)
                     .padding(.trailing, 12)
@@ -676,47 +636,32 @@ struct ChatView: View {
         .padding(EdgeInsets(top: 16, leading: 24, bottom: 10, trailing: 20))
         .background {
             Rectangle()
-                .fill(palette.map { AnyShapeStyle($0.tint.color) } ?? AnyShapeStyle(Theme.ground))
+                .fill(palette.tint.color)
                 .ignoresSafeArea(edges: .top)
         }
     }
 
-    @ViewBuilder private var headerTitle: some View {
-        if let agent = thread.only {
-            Button { dressing = true } label: {
-                HStack(spacing: 14) {
-                    BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 44)
-                        .busyHalo(agent.state.busy, color: looks[agent.name].color)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(agent.title).font(.system(size: 22, weight: .bold, design: .rounded))
-                        StateLine(state: agent.state, identity: looks[agent.name], font: .system(size: 13, weight: .semibold))
-                    }
-                }
-                .lineLimit(1)
-                .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            .help("Change its name and appearance")
-            .accessibilityLabel("\(agent.title), \(agent.state.label). Change its name and appearance")
-        } else {
+    private var headerTitle: some View {
+        Button { dressing = true } label: {
             HStack(spacing: 14) {
-                HStack(spacing: -10) {
-                    ForEach(thread.members) { member in
-                        BloubView(state: member.state.bloub, identity: looks[member.name], size: 34)
-                            .busyHalo(member.state.busy, color: looks[member.name].color)
-                    }
+                BloubView(state: agent.state.bloub, identity: looks[agent.name], size: 44)
+                    .busyHalo(agent.state.busy, color: looks[agent.name].color)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(agent.title).font(.system(size: 22, weight: .bold, design: .rounded))
+                    StateLine(state: agent.state, identity: looks[agent.name], font: .system(size: 13, weight: .semibold))
                 }
-                Text(thread.title).font(.system(size: 22, weight: .bold, design: .rounded))
             }
             .lineLimit(1)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("thread with \(thread.title)")
+            .contentShape(.rect)
         }
+        .buttonStyle(.plain)
+        .help("Change its name and appearance")
+        .accessibilityLabel("\(agent.title), \(agent.state.label). Change its name and appearance")
     }
 
     private var headerTools: some View {
         HStack(spacing: 2) {
-            if let agent = thread.only, agent.parentId == nil {
+            if !thread.isWorker {
                 headerButton("Routines and triggers", symbol: "bolt.badge.clock") { pages = .routines }
                 headerButton("Memory", symbol: "book.closed") { pages = .memory }
                 headerButton("\(agent.title)'s settings", symbol: "gearshape", action: onOpenSettings)
@@ -743,8 +688,8 @@ struct ChatView: View {
     }
 
     private func headerButton(_ title: String, symbol: String, active: Bool = false, action: @escaping () -> Void) -> some View {
-        let text = active ? palette.map { AnyShapeStyle($0.softText.color) } ?? AnyShapeStyle(Theme.ink) : AnyShapeStyle(Theme.ink)
-        let fill = active ? palette.map { AnyShapeStyle($0.soft.color) } ?? AnyShapeStyle(Theme.ink.opacity(0.06)) : AnyShapeStyle(.clear)
+        let text = active ? AnyShapeStyle(palette.softText.color) : AnyShapeStyle(Theme.ink)
+        let fill = active ? palette.soft.color : .clear
         return Button(title, systemImage: symbol, action: action)
             .labelStyle(.iconOnly)
             .font(.system(size: 16, weight: .medium))
@@ -764,7 +709,7 @@ struct ChatView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                if thread.only?.state.busy == true { stopButton }
+                if agent.state.busy { stopButton }
             }
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 24)
@@ -772,14 +717,6 @@ struct ChatView: View {
         } else {
             GlassEffectContainer(spacing: 12) {
             VStack(spacing: 10) {
-                if thread.only == nil {
-                    Text("Agents stop writing to each other after a few messages without you. Posting here is what clears that.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 8)
-                }
-
                 #if os(macOS)
                 if !workers.isEmpty {
                     ViewThatFits(in: .horizontal) {
@@ -830,7 +767,7 @@ struct ChatView: View {
                 }
 
                 // Keyed by the call, so a second round of questions starts from a blank form.
-                if let agent = thread.only, !agent.state.busy, let interview = rows.interview {
+                if !agent.state.busy, let interview = rows.interview {
                     InterviewCard(interview: interview, agent: agent.title) { text in
                         await send(text)
                     }
@@ -838,7 +775,7 @@ struct ChatView: View {
                     .actionCard(bubble)
                 }
 
-                if let agent = thread.only, agent.parentId == nil, !agent.state.busy, let hang = rows.browserHang {
+                if !thread.isWorker, !agent.state.busy, let hang = rows.browserHang {
                     BrowserHungCard(agent: agent.title, onScreen: showScreen) { desktop in
                         await restartBrowser(agent.name, desktop: desktop)
                     }
@@ -846,7 +783,7 @@ struct ChatView: View {
                     .actionCard(bubble)
                 }
 
-                if let agent = thread.only, agent.parentId == nil, !agent.state.busy, let handOver = rows.handOver {
+                if !thread.isWorker, !agent.state.busy, let handOver = rows.handOver {
                     HandOverCard(agent: agent.title, reason: handOver.reason) {
                         await takeScreen(agent.name)
                     }
@@ -854,7 +791,7 @@ struct ChatView: View {
                     .actionCard(bubble)
                 }
 
-                if let agent = thread.only, agent.parentId == nil, !agent.state.busy, let pending = rows.form,
+                if !thread.isWorker, !agent.state.busy, let pending = rows.form,
                    let item = forms.first(where: { $0.messageId == pending.messageId }), let form = item.form {
                     FormCard(agent: agent.title, form: form) {
                         filling = item
@@ -866,7 +803,7 @@ struct ChatView: View {
                 }
 
                 // Not held back while the agent is busy: turning it on starts the turn that offers the test.
-                if let agent = thread.only, agent.parentId == nil, let pending = rows.trigger,
+                if !thread.isWorker, let pending = rows.trigger,
                    let trigger = triggers.first(where: { $0.id == pending.triggerId }), trigger.state != .off {
                     TriggerCard(
                         trigger: trigger,
@@ -922,9 +859,8 @@ struct ChatView: View {
                     }
 
                     HStack(spacing: 8) {
-                        // Only where there is one agent to hand the file to: a shared thread has
-                        // several homes and a worker has none of its own.
-                        if let agent = thread.only, agent.parentId == nil {
+                        // A worker has no home of its own to hand the file to.
+                        if !thread.isWorker {
                             Menu {
                                 Button("Photo…", systemImage: "photo") { pickingPhotos = true }
                                 Button("File…", systemImage: "doc") { picking = true }
@@ -987,7 +923,7 @@ struct ChatView: View {
                             }
                             .font(.canvas(15, .body))
 
-                        if thread.only?.state.busy == true { stopButton }
+                        if agent.state.busy { stopButton }
 
                         Button("Send", systemImage: "arrow.up") { Task { await send() } }
                             .labelStyle(.iconOnly)
@@ -996,9 +932,9 @@ struct ChatView: View {
                             .disabled(!canSend)
                     }
                     #if os(macOS)
-                    .padding(.leading, thread.only?.parentId == nil && thread.only != nil ? 8 : 18)
+                    .padding(.leading, thread.isWorker ? 18 : 8)
                     #else
-                    .padding(.leading, thread.only?.parentId == nil && thread.only != nil ? 12 : 18)
+                    .padding(.leading, thread.isWorker ? 18 : 12)
                     #endif
                     .padding(.trailing, 6)
                     .padding(.vertical, 6)
@@ -1051,7 +987,7 @@ struct ChatView: View {
         case .compact:
             await compact()
         case .stop:
-            if thread.members.contains(where: \.state.busy) { stop() } else { notice = "Nothing is running." }
+            if agent.state.busy { stop() } else { notice = "Nothing is running." }
         case .retry:
             let reply = loaded.last { $0.role == .assistant }
             if let request = reply.flatMap(rewindable(retrying:)) { ask(request) } else { refuseRewind("no reply to ask again") }
@@ -1061,7 +997,7 @@ struct ChatView: View {
         case .remember:
             await remember(argument)
         case .interview:
-            if let agent = thread.only { await send(interviewRequest(hasProfile: agent.profile != nil)) }
+            await send(interviewRequest(hasProfile: agent.profile != nil))
         case .screen:
             showScreen()
         case .profile:
@@ -1079,9 +1015,6 @@ struct ChatView: View {
         trouble = rewindAllowed ? "There is \(why)." : "Stop the turn first."
     }
 
-    /// `rewind` from the first id there is: every row and every summary goes, the thread stays.
-    /// Not a delete of the conversation, which would leave a shared thread's row — and its
-    /// place in the sidebar — gone from under this view.
     private func rate(_ message: Message, _ rating: FeedbackRating?) {
         if rating == .down {
             faulting = message
@@ -1101,6 +1034,7 @@ struct ChatView: View {
         if let index = loaded.firstIndex(where: { $0.id == id }) { loaded[index].feedback = stored }
     }
 
+    /// `rewind` from the first id there is: every row and every summary goes, the thread stays.
     private func clear() async {
         do {
             try await session.run { try await $0.rewind(thread.source, from: 1, retry: false) }
@@ -1116,7 +1050,7 @@ struct ChatView: View {
         notice = "Folding the thread into a summary…"
         do {
             let result = try await session.run { try await $0.compact(thread.source) }
-            notice = compactionNotice(result, titles: titles(thread.members))
+            notice = compactionNotice(result)
         } catch {
             notice = nil
             if !error.isCancellation { trouble = error.localizedDescription }
@@ -1126,7 +1060,6 @@ struct ChatView: View {
     /// The owner's own line in `MEMORY.md`, through the same read-and-rewrite the Memory page
     /// uses, so nothing the agent wrote is lost around it.
     private func remember(_ note: String) async {
-        guard let agent = thread.only else { return }
         guard !note.isEmpty else {
             trouble = "Say what to remember: /remember <note>"
             return
@@ -1190,15 +1123,13 @@ struct ChatView: View {
     }
     #endif
 
-    /// Every agent in the thread that is mid-turn: one behind an agent's own thread, any number
-    /// behind a shared one.
     private func stop() {
-        let busy = thread.members.filter(\.state.busy)
-        guard !busy.isEmpty, !stopping else { return }
+        guard agent.state.busy, !stopping else { return }
         stopping = true
+        let name = agent.name
         Task {
             do {
-                for agent in busy { _ = try await session.run { try await $0.stop(agent: agent.name) } }
+                _ = try await session.run { try await $0.stop(agent: name) }
                 trouble = nil
             } catch {
                 if !error.isCancellation { trouble = error.localizedDescription }
@@ -1208,7 +1139,7 @@ struct ChatView: View {
     }
 
     private var recipient: String {
-        thread.only.map { "Message \($0.title)" } ?? "Message this thread"
+        "Message \(agent.title)"
     }
 
     private var placeholder: String {
@@ -1243,18 +1174,20 @@ struct ChatView: View {
         mark = unread.lastSeen(thread.source)
         do {
             var page = try await session.run { try await $0.messages(thread.source) }
-            more = !atStart(page, PAGE)
+            var walk = OlderPages()
+            walk.opened(page)
             if let focus {
-                for _ in 0..<10 where more && !page.contains(where: { $0.id <= focus }) {
+                for _ in 0..<10 where walk.more && !page.contains(where: { $0.id <= focus }) {
                     guard let before = oldestId(page) else { break }
                     let older = try await session.run {
                         try await $0.messages(thread.source, window: MessageWindow(before: before))
                     }
                     page = merge(page, older)
-                    more = !atStart(older, PAGE)
+                    walk.opened(older)
                 }
                 following = false
             }
+            paging = walk
             loaded = page
             if focus != nil, !page.isEmpty { focusPending = true } else { jumpPending = !page.isEmpty }
             trouble = nil
@@ -1263,20 +1196,21 @@ struct ChatView: View {
         }
     }
 
-    private func catchUp() async {
-        await catchUp(after: newestId(loaded))
+    private func catchUp() async throws {
+        try await catchUp(after: newestId(loaded))
     }
 
     /// Two callers, and the difference between them is the whole point: a poll walks on from the
     /// newest row it holds, a send from the cursor it held before it. `nil` is a real answer — an
     /// empty thread asks for the newest page — so it cannot be spelled as a default.
-    private func catchUp(after cursor: Int?) async {
-        guard let rows = try? await session.run({
+    private func catchUp(after cursor: Int?) async throws {
+        let rows = try await session.run {
             try await $0.messages(thread.source, window: catchUpWindow(after: cursor))
-        }), !rows.isEmpty else { return }
+        }
+        guard !rows.isEmpty else { return }
         let newest = newestId(loaded) ?? 0
         let fresh = rows.filter { $0.id > newest }
-        let answer = fresh.last { $0.role == .assistant && $0.hasBubble && $0.sender == thread.only?.name }
+        let answer = fresh.last { $0.role == .assistant && $0.hasBubble && $0.sender == agent.name }
         if folding { return }
         if answer != nil, thinkingOpen {
             folding = true
@@ -1296,17 +1230,17 @@ struct ChatView: View {
         }
     }
 
+    /// A failure goes on the Retry row at the top, not the strip by the composer: the reader is
+    /// at the top, and the strip would keep a poll's own failures out while it showed.
     private func older() async {
-        guard !loadingOlder, let before = oldestId(loaded) else { return }
-        loadingOlder = true
+        guard let before = paging.begin(loaded) else { return }
         do {
             let page = try await session.run {
                 try await $0.messages(thread.source, window: MessageWindow(before: before))
             }
             if phase != .idle { heldPage = page } else { prepend(page) }
         } catch {
-            loadingOlder = false
-            if !error.isCancellation { trouble = error.localizedDescription }
+            paging.failed(error.isCancellation ? nil : error.localizedDescription)
         }
     }
 
@@ -1316,12 +1250,11 @@ struct ChatView: View {
         // Rows that only join the tool line on top add no item and no height, and a flag left up
         // would shift the view at the next unrelated change instead.
         prepending = rows.items.count != before
-        more = !atStart(page, PAGE)
-        loadingOlder = false
+        paging.landed(page)
     }
 
     private var rewindAllowed: Bool {
-        !thread.isWorker && !thread.members.contains { $0.state.busy }
+        !thread.isWorker && !agent.state.busy
     }
 
     private func rewindable(restoring message: Message) -> Rewind? {
@@ -1353,11 +1286,11 @@ struct ChatView: View {
         mark = Int.max
     }
 
-    private func pollLive(_ name: String) async {
-        guard let next = try? await session.run({ try await $0.live(agent: name) }) else { return }
+    private func pollLive(_ name: String) async throws {
+        let next = try await session.run { try await $0.live(agent: name) }
         if next.isEmpty {
             if live != nil {
-                await catchUp()
+                try await catchUp()
                 if !folding { live = nil }
             }
         } else if live != next {
@@ -1373,9 +1306,8 @@ struct ChatView: View {
     /// Takes the agent's mouse and keyboard, then opens its desktop where "Give it back" is.
     /// Polled, not pushed: a fire and a login entered elsewhere both change what the card shows.
     private func watchTriggers(_ name: String) async {
-        while !Task.isCancelled {
-            if let rows = try? await session.run({ try await $0.triggers(agent: name) }) { triggers = rows }
-            try? await Task.sleep(for: .seconds(3))
+        await session.poll(every: .seconds(3), pollPhase, failed: pollFailed) {
+            triggers = try await session.run { try await $0.triggers(agent: name) }
         }
     }
 
@@ -1395,7 +1327,8 @@ struct ChatView: View {
 
     /// A sheet can't present over one still going away, so the screen waits for the form to close.
     private func takeScreenAfterForm() {
-        guard screenAfterForm, let name = thread.only?.name else { return }
+        guard screenAfterForm else { return }
+        let name = agent.name
         screenAfterForm = false
         Task { await takeScreen(name) }
     }
@@ -1406,7 +1339,7 @@ struct ChatView: View {
             try await session.run { try await $0.restartBrowser(agent: name, desktop: desktop) }
             mark = Int.max
             jumpPending = true
-            await catchUp(after: cursor)
+            await reporting { try await catchUp(after: cursor) }
         } catch {
             if !error.isCancellation { trouble = error.localizedDescription }
         }
@@ -1415,7 +1348,7 @@ struct ChatView: View {
     private func retryModel(_ name: String, useBackup: Bool) async {
         do {
             try await session.run { try await $0.retryModel(agent: name, useBackup: useBackup) }
-            await pollLive(name)
+            await reporting { try await pollLive(name) }
         } catch {
             if !error.isCancellation { trouble = error.localizedDescription }
         }
@@ -1447,7 +1380,7 @@ struct ChatView: View {
             // Files first, so the message can name where they landed. One that fails stops the
             // send with the daemon's reason, and the rest stay attached for the retry.
             let files = attachments.filter { $0.image == nil }
-            if let agent = thread.only, !files.isEmpty {
+            if !files.isEmpty {
                 var paths: [String] = []
                 for attachment in files {
                     let landed = try await session.run {
@@ -1473,7 +1406,7 @@ struct ChatView: View {
             for message in sent { arrivals.from[message.id] = 0 }
             loaded = merge(loaded, sent)
             jumpPending = true
-            await catchUp(after: cursor)
+            await reporting { try await catchUp(after: cursor) }
         } catch {
             trouble = error.localizedDescription
         }
@@ -1565,6 +1498,31 @@ private let dayFormatter: DateFormatter = {
     formatter.doesRelativeDateFormatting = true
     return formatter
 }()
+
+/// Where the walk back through the thread stopped on a failed page.
+struct OlderFailedRow: View {
+    let reason: String
+    let retry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Theme.failed)
+                .accessibilityHidden(true)
+            Text("Couldn't load older messages")
+            Text("·").accessibilityHidden(true)
+            Button("Retry", action: retry)
+                .buttonStyle(.borderless)
+                .fontWeight(.semibold)
+                .foregroundStyle(Theme.ink)
+        }
+        .font(dividerFont)
+        .foregroundStyle(Theme.muted)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .help(reason)
+    }
+}
 
 struct DaySeparator: View {
     let millis: Int
@@ -1759,6 +1717,7 @@ struct MessageRow: View, Equatable {
         case (.down, false): "Bad reply"
         case (.up, true): "Remove thumbs up"
         case (.down, true): "Remove thumbs down"
+        case (.unknown, _): "Feedback"
         }
     }
 
@@ -2016,13 +1975,11 @@ final class Arrivals {
 /// off a rail under it, the way a build log sits under its target.
 struct ToolRun: View, Equatable {
     let run: [ToolStep]
-    /// Who did it, in a thread where several agents work. An agent's own thread names nobody.
-    var by: String? = nil
 
     @State private var open = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.run == rhs.run && lhs.by == rhs.by
+        lhs.run == rhs.run
     }
 
     var body: some View {
@@ -2053,7 +2010,7 @@ struct ToolRun: View, Equatable {
             HStack(spacing: 6) {
                 Image(systemName: "wrench.and.screwdriver")
                     .font(.caption2)
-                Text(by.map { "\($0): \(summary)" } ?? summary)
+                Text(summary)
                     .font(.canvas(13, .footnote))
                     .lineLimit(1)
             }

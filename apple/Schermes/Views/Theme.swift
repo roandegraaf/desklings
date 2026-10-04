@@ -184,6 +184,7 @@ extension AgentState {
         case .waiting_for_task_worker: ("hourglass", "Waiting for a task worker", .quiet)
         case .failed: ("exclamationmark.triangle", "Failed", .failed)
         case .completed: ("checkmark.circle", "Done", .done)
+        case .unknown: ("questionmark.circle", "Unknown state", .quiet)
         }
     }
 }
@@ -269,7 +270,7 @@ struct ContextMeter: View {
         HStack(spacing: 6) {
             ContextRing(percent: percent, identity: identity, radius: 8.5)
             Text("\(ContextFullness.clamped(percent))%")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.canvas(12, .caption, weight: .semibold))
                 .monospacedDigit()
                 .foregroundStyle(Theme.secondary)
         }

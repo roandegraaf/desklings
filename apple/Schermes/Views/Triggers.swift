@@ -168,6 +168,7 @@ struct TriggersSection: View {
 
     @State private var triggers: [Trigger]?
     @State private var trouble: String?
+    @Environment(\.pollPhase) private var pollPhase
 
     var body: some View {
         Section {
@@ -193,12 +194,9 @@ struct TriggersSection: View {
         } footer: {
             Text("Each one starts a turn in \(agent.title)'s thread when it fires. Fires past its hourly limit are dropped.")
         }
-        .task(id: agent.name) {
-            while !Task.isCancelled {
-                if let rows = try? await session.run({ try await $0.triggers(agent: agent.name) }) {
-                    triggers = rows
-                }
-                try? await Task.sleep(for: .seconds(5))
+        .task(id: PollKey(value: agent.name, phase: pollPhase)) {
+            await session.poll(every: .seconds(5), pollPhase, failed: { session.note($0, in: &trouble) }) {
+                triggers = try await session.run { try await $0.triggers(agent: agent.name) }
             }
         }
     }
@@ -226,7 +224,7 @@ struct TriggersSection: View {
 
 struct TriggerRow: View {
     let trigger: Trigger
-    let onSwitch: (Bool) -> Void
+    let onSwitch: @MainActor (Bool) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -267,6 +265,7 @@ struct TriggerRow: View {
         case .proposed: trigger.needsLogin ? "Waiting for the login" : "Proposed"
         case .on: "On"
         case .off: "Off"
+        case .unknown: "Unknown state"
         }
         let fired = trigger.lastFiredAt.map {
             "last fired " + Date(timeIntervalSince1970: Double($0) / 1000).formatted(date: .abbreviated, time: .shortened)

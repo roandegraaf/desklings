@@ -5,6 +5,7 @@ import { findAgentById } from './agents.ts';
 import { SYSTEM_SENDER, appendMessage, conversationFor, recordEvent } from './conversations.ts';
 import { log } from './log.ts';
 import { schedules } from './schema.ts';
+import { readTimezone } from './settings.ts';
 import type { Db } from './db.ts';
 import type { Runner } from './loop.ts';
 import type { ToolDef } from './provider.ts';
@@ -29,11 +30,11 @@ export type ScheduleRequest = { cron: string; prompt: string };
  * be syntactically fine and still have no future — `0 0 30 2 *` is February the 30th — which is
  * a row that would otherwise sit permanently due.
  */
-export function nextRun(cron: string, after: number): number | undefined {
+export function nextRun(cron: string, after: number, timezone?: string): number | undefined {
   try {
     // No callback: croner only starts a timer of its own when it is given a function, and this
     // is the daemon's tick asking a question, not a second scheduler.
-    return new Cron(cron).nextRun(new Date(after))?.getTime();
+    return new Cron(cron, timezone === undefined ? {} : { timezone }).nextRun(new Date(after))?.getTime();
   } catch {
     return undefined;
   }
@@ -95,7 +96,7 @@ export function insertSchedule(
   if (held >= MAX_SCHEDULES) {
     return { error: `you already hold ${MAX_SCHEDULES} schedules; cancel one before adding another` };
   }
-  const due = nextRun(request.cron, now);
+  const due = nextRun(request.cron, now, readTimezone(db));
   if (due === undefined) return { error: `${request.cron} has no next run` };
   const row = db
     .insert(schedules)
@@ -116,9 +117,27 @@ export function insertSchedule(
  * otherwise be due the instant it came back and fire a turn nobody asked for.
  */
 export function setPaused(db: Db, schedule: Schedule, paused: boolean, now: number): Schedule {
-  const nextRunAt = paused ? schedule.nextRunAt : (nextRun(schedule.cron, now) ?? schedule.nextRunAt);
+  const nextRunAt = paused ? schedule.nextRunAt : (nextRun(schedule.cron, now, readTimezone(db)) ?? schedule.nextRunAt);
   db.update(schedules).set({ paused, nextRunAt }).where(eq(schedules.id, schedule.id)).run();
   return { ...schedule, paused, nextRunAt };
+}
+
+/**
+ * After the owner's zone changed: every unpaused row's next run, read again in the new zone. A
+ * row the new zone gives no next run keeps its old one rather than being dropped; the tick decides
+ * that the usual way when it comes due. A paused row is recomputed when it resumes.
+ */
+export function rescheduleAll(db: Db, now: number): number {
+  const timezone = readTimezone(db);
+  let moved = 0;
+  for (const row of db.select().from(schedules).where(eq(schedules.paused, false)).all()) {
+    const due = nextRun(row.cron, now, timezone);
+    if (due === undefined || due === row.nextRunAt) continue;
+    db.update(schedules).set({ nextRunAt: due }).where(eq(schedules.id, row.id)).run();
+    moved += 1;
+  }
+  if (moved > 0) log.info('schedules moved to a new timezone', { timezone, moved });
+  return moved;
 }
 
 export function deleteSchedule(db: Db, schedule: Schedule): void {
@@ -147,8 +166,8 @@ function delivery(schedule: Schedule): string {
  * One pass of the tick: every due row starts a turn in its agent's own thread with the owner.
  *
  * Delivery is the messaging path and nothing else — a row and a `runner.start` — so a busy agent
- * picks the job up through the same drain a peer's message goes through, and no queue or second
- * runner is needed. The message is written as the owner's, because an agent-authored one is
+ * picks the job up through the same drain a peer's message goes through, and one at the loop cap
+ * waits in the runner's queue. The message is written as the owner's, because an agent-authored one is
  * excluded from `pendingConversation` (the agent would never wake) or counted by `agentChain`
  * (six fired jobs would refuse its next `send_message`).
  *
@@ -157,6 +176,7 @@ function delivery(schedule: Schedule): string {
  */
 export function runDue(db: Db, runner: Runner, now: number = Date.now()): number {
   let fired = 0;
+  const timezone = readTimezone(db);
   for (const row of dueRows(db, now)) {
     const agent = findAgentById(db, row.agentId);
     if (agent === undefined) {
@@ -167,7 +187,7 @@ export function runDue(db: Db, runner: Runner, now: number = Date.now()): number
     const schedule = toSchedule(row, agent.name);
     // From now, never from the slot that was missed: that is the whole of "a run missed while
     // the daemon was down runs once at boot".
-    const due = nextRun(schedule.cron, now);
+    const due = nextRun(schedule.cron, now, timezone);
     if (due === undefined) {
       log.error('schedule has no next run left, dropping it', { schedule: row.id, cron: row.cron });
       // The owner's only trace of a row that vanished on its own. The drop above it gets none:
@@ -180,7 +200,7 @@ export function runDue(db: Db, runner: Runner, now: number = Date.now()): number
 
     const conversationId = conversationFor(db, agent.id);
     appendMessage(db, conversationId, { role: 'user', content: delivery(schedule), sender: SYSTEM_SENDER });
-    runner.start(agent, conversationId);
+    runner.start(agent, conversationId, undefined, 'schedule');
     fired += 1;
     log.info('schedule fired', { schedule: schedule.id, agent: agent.name, nextRunAt: due });
   }
@@ -208,15 +228,16 @@ export function startScheduler(db: Db, runner: Runner): () => void {
 
 /** The agent's own schedules, for the once-per-turn prompt tail, so it knows what it already
  * set up and does not set it up again. */
-export function schedulePrompt(list: readonly Schedule[]): string {
+export function schedulePrompt(list: readonly Schedule[], timezone: string): string {
+  const clock = `Cron expressions are read in the owner's timezone, ${timezone}.`;
   if (list.length === 0) {
     return (
       'You have no scheduled tasks. schedule_task is how you get a turn without anyone writing ' +
-      'to you: use it for anything you are asked to do regularly, or to check on something later.'
+      `to you: use it for anything you are asked to do regularly, or to check on something later. ${clock}`
     );
   }
   return [
-    'Your scheduled tasks. Each one starts a turn here when it is due, with the prompt shown:',
+    `Your scheduled tasks. Each one starts a turn here when it is due, with the prompt shown. ${clock}`,
     ...list.map(
       (schedule) =>
         `- ${schedule.id}: ${schedule.cron}${schedule.paused ? ' (paused)' : ''} — ${schedule.prompt}`,
@@ -225,7 +246,7 @@ export function schedulePrompt(list: readonly Schedule[]): string {
 }
 
 const CRON_HELP =
-  'a cron expression in the daemon\'s local time, five fields (minute hour day-of-month month ' +
+  'a cron expression in the owner\'s timezone (named with your scheduled tasks), five fields (minute hour day-of-month month ' +
   'day-of-week) or six with seconds in front. Natural language is not accepted: translate it ' +
   'yourself, so "every weekday at 9" is "0 9 * * 1-5".';
 

@@ -5,9 +5,8 @@ private func agent(_ name: String, parentId: Int? = nil) -> Agent {
     Agent(id: 1, name: name, display: 1, state: .idle, parentId: parentId, createdAt: 0)
 }
 
-private let own = ChatThread.agent(agent("alpha"))
-private let group = ChatThread.group(id: 7, members: [agent("alpha"), agent("bravo")])
-private let worker = ChatThread.agent(agent("alpha-w1", parentId: 1))
+private let own = ChatThread(agent: agent("alpha"))
+private let worker = ChatThread(agent: agent("alpha-w1", parentId: 1))
 
 @Test func aSlashListsEveryCommandAndLettersNarrowIt() {
     #expect(commandMatches("/", in: own) == SlashCommand.allCases)
@@ -23,8 +22,7 @@ private let worker = ChatThread.agent(agent("alpha-w1", parentId: 1))
     #expect(commandMatches("", in: own).isEmpty)
 }
 
-@Test func aSharedThreadOffersOnlyWhatHasNoSingleAgentBehindIt() {
-    #expect(commandMatches("/", in: group) == [.new, .compact, .stop, .retry, .undo])
+@Test func aWorkerThreadOffersNoCommands() {
     #expect(commandMatches("/", in: worker).isEmpty)
 }
 
@@ -35,17 +33,15 @@ private let worker = ChatThread.agent(agent("alpha-w1", parentId: 1))
     #expect(parseCommand("/new", in: own)?.argument == "")
     #expect(parseCommand("/home/agent-alpha/workspace/report.md", in: own) == nil)
     #expect(parseCommand("/newest", in: own) == nil)
-    #expect(parseCommand("/screen", in: group) == nil)
+    #expect(parseCommand("/screen", in: worker) == nil)
     #expect(parseCommand("look at /new", in: own) == nil)
 }
 
 @Test func compactionIsReportedInWords() {
-    let titles = ["alpha": "Alpha", "bravo": "Bob"]
-    #expect(compactionNotice(CompactResult(compacted: ["alpha": 42]), titles: titles) == "Folded 42 messages into a summary.")
-    #expect(compactionNotice(CompactResult(compacted: ["alpha": 1]), titles: titles) == "Folded 1 message into a summary.")
-    #expect(compactionNotice(CompactResult(compacted: ["alpha": 0]), titles: titles) == "Nothing new to fold in since the last summary.")
-    #expect(compactionNotice(CompactResult(compacted: ["bravo": 3, "alpha": 5]), titles: titles) == "Folded into a summary for Alpha (5), Bob (3).")
-    #expect(compactionNotice(CompactResult(compacted: ["bravo": 0, "alpha": 5]), titles: titles) == "Folded into a summary for Alpha (5).")
+    #expect(compactionNotice(CompactResult(compacted: ["alpha": 42])) == "Folded 42 messages into a summary.")
+    #expect(compactionNotice(CompactResult(compacted: ["alpha": 1])) == "Folded 1 message into a summary.")
+    #expect(compactionNotice(CompactResult(compacted: ["alpha": 0])) == "Nothing new to fold in since the last summary.")
+    #expect(compactionNotice(CompactResult(compacted: [:])) == "Nothing new to fold in since the last summary.")
 }
 
 @Test func aNoteLandsAsOneListItemAtTheEnd() {

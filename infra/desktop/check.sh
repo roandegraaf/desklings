@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Runnable check for the schermes desktop foundation.
 #
-# Creates three agents, gives each its own Xvnc desktop and Chromium profile, drives them with
-# xdotool, captures a screenshot per desktop, and verifies that a cookie survives a Chromium
-# restart and that nothing listens outside loopback. Idempotent: safe to run repeatedly.
+# Creates three agents, gives each its own sandbox with an Xvnc desktop and Chromium profile,
+# drives them with xdotool, captures a screenshot per desktop, and verifies that a cookie survives
+# a Chromium restart and that nothing listens outside loopback. Idempotent: safe to run repeatedly.
 set -euo pipefail
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -29,7 +29,7 @@ agent_home() { getent passwd "agent-$1" | cut -d: -f6; }
 
 on_agent() {
   local a=$1 d=$2; shift 2
-  sudo -n -u "agent-$a" env \
+  sudo -n -u "agent-$a" "$here/sandbox.sh" enter env --chdir="$(agent_home "$a")" \
     HOME="$(agent_home "$a")" USER="agent-$a" LOGNAME="agent-$a" \
     DISPLAY=":$d" XAUTHORITY="$(agent_home "$a")/.Xauthority" "$@"
 }
@@ -79,12 +79,11 @@ stop_chromium() {
   fail "agent $a: chromium did not exit after SIGTERM"
 }
 
-say "serving the test page on 127.0.0.1:$port"
-python3 -m http.server "$port" --bind 127.0.0.1 --directory "$here/testpage" >/dev/null 2>&1 &
-http_pid=$!
-trap 'kill "$http_pid" 2>/dev/null || true' EXIT
-for _ in $(seq 20); do curl -fsS "$base/" >/dev/null 2>&1 && break; sleep 1; done
-curl -fsS "$base/" >/dev/null || fail "test page server did not start"
+stop_pages() {
+  local a
+  for a in "${agents[@]}"; do on_agent "$a" 0 pkill -f "http.server $port" >/dev/null 2>&1 || true; done
+}
+trap stop_pages EXIT
 
 declare -A nonce
 for i in "${!agents[@]}"; do
@@ -93,6 +92,13 @@ for i in "${!agents[@]}"; do
   sudo -n /opt/schermes/infra/desktop/create-agent-user.sh "$a"
   "$here/start-desktop.sh" "$a" "$d"
   nonce[$a]=$(mcookie | cut -c1-10)
+
+  # The sandbox's loopback is its own, so each one serves the test page to itself.
+  echo "   serving the test page on its 127.0.0.1:$port"
+  on_agent "$a" 0 pkill -f "http.server $port" >/dev/null 2>&1 || true
+  on_agent "$a" 0 setsid --fork python3 -m http.server "$port" --bind 127.0.0.1 --directory "$here/testpage" >/dev/null 2>&1
+  for _ in $(seq 20); do on_agent "$a" 0 curl -fsS "$base/" >/dev/null 2>&1 && break; sleep 1; done
+  on_agent "$a" 0 curl -fsS "$base/" >/dev/null || fail "agent $a: test page server did not start"
 done
 
 for i in "${!agents[@]}"; do
@@ -112,7 +118,8 @@ for i in "${!agents[@]}"; do
 
   title=$(wait_title "$a" "$d" "SCHERMES agent=$a")
   echo "   title: $title"
-  on_agent "$a" "$d" scrot -o "$out/$a.png"
+  # The sandbox's /tmp is its own too; the capture comes out on stdout.
+  on_agent "$a" "$d" sh -c 'scrot -o "$HOME/.schermes-check.png" && cat "$HOME/.schermes-check.png" && rm -f "$HOME/.schermes-check.png"' > "$out/$a.png"
   echo "   screenshot: $out/$a.png"
 done
 

@@ -6,7 +6,7 @@ import type { BrowserTimings, Connect, FillStep } from './browser.ts';
 import type { Db } from './db.ts';
 import type { ToolDef } from './provider.ts';
 import { MAX_HANDS_REASON_CHARS } from './control.ts';
-import { forms, formVault } from './schema.ts';
+import { forms, formVault, hiddenValues } from './schema.ts';
 import { decrypt, encrypt } from './secrets.ts';
 import { field } from './web.ts';
 
@@ -250,21 +250,47 @@ export function filledLine(origin: string, steps: readonly { label: string; secr
   return `${FILLED}${origin}: ${names}. Nothing was submitted; carry on from there.`;
 }
 
-// ponytail: memory only, so a daemon restart forgets which values to hide; an agent reading a
-// filled field back after a restart would see it. Persist hashes if that ever matters.
-const typed = new Map<number, Set<string>>();
+const typed = new WeakMap<Db, Map<number, Set<string>>>();
 const MIN_HIDDEN_CHARS = 4;
+const MAX_HIDDEN_VALUES = 200;
 export const HIDDEN = '[hidden]';
 
-/** Secret values just typed for this agent, hidden from whatever its tools read back. */
-export function hideFromAgent(agentId: number, values: readonly string[]): void {
-  const set = typed.get(agentId) ?? new Set<string>();
-  for (const value of values) if (value.length >= MIN_HIDDEN_CHARS) set.add(value);
-  typed.set(agentId, set);
+function hiddenFor(db: Db): Map<number, Set<string>> {
+  const cached = typed.get(db) ?? new Map<number, Set<string>>();
+  typed.set(db, cached);
+  return cached;
 }
 
-export function redactSecrets(agentId: number, text: string): string {
+/** Fills the cache from the stored rows; run once at boot, before any turn can read a page. */
+export function loadHidden(db: Db, masterKey: Buffer): void {
+  const cache = new Map<number, Set<string>>();
+  for (const row of db.select().from(hiddenValues).all()) {
+    cache.set(row.agentId, new Set(JSON.parse(decrypt(masterKey, row.values)) as string[]));
+  }
+  typed.set(db, cache);
+}
+
+/** Secret values just typed for this agent, hidden from whatever its tools read back, now and
+ * after a restart. The oldest are forgotten past `MAX_HIDDEN_VALUES`. */
+export function hideFromAgent(db: Db, masterKey: Buffer, agentId: number, values: readonly string[]): void {
+  const cache = hiddenFor(db);
+  const set = cache.get(agentId) ?? new Set<string>();
+  for (const value of values) {
+    if (value.length < MIN_HIDDEN_CHARS) continue;
+    set.delete(value);
+    set.add(value);
+  }
+  for (const oldest of [...set].slice(0, Math.max(0, set.size - MAX_HIDDEN_VALUES))) set.delete(oldest);
+  cache.set(agentId, set);
+  const row = { values: encrypt(masterKey, JSON.stringify([...set])), updatedAt: Date.now() };
+  db.insert(hiddenValues)
+    .values({ agentId, ...row })
+    .onConflictDoUpdate({ target: hiddenValues.agentId, set: row })
+    .run();
+}
+
+export function redactSecrets(db: Db, agentId: number, text: string): string {
   let out = text;
-  for (const value of typed.get(agentId) ?? []) out = out.replaceAll(value, HIDDEN);
+  for (const value of typed.get(db)?.get(agentId) ?? []) out = out.replaceAll(value, HIDDEN);
   return out;
 }

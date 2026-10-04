@@ -25,8 +25,7 @@ func catchUpWindow(after cursor: Int?) -> MessageWindow {
 
 /// The proxy is a byte pipe with no RFB parser, so view-only is enforced by this client and
 /// nothing else. Unknown ownership is therefore view-only: the safe answer is the one that cannot
-/// put a pointer event on a desktop an agent is driving. The mirror of `viewOnly` in
-/// `ui/src/thread.ts`.
+/// put a pointer event on a desktop an agent is driving.
 nonisolated func viewOnly(_ held: Bool?) -> Bool {
     held != true
 }
@@ -34,6 +33,52 @@ nonisolated func viewOnly(_ held: Bool?) -> Bool {
 /// A page shorter than what was asked for is the start of the thread: there is nothing older.
 func atStart(_ page: [Message], _ limit: Int) -> Bool {
     page.count < limit
+}
+
+/// Walking back through a thread a page at a time. A failed page leaves a row the reader can
+/// retry from: the spinner's load is keyed on the oldest row, which a failure does not change, so
+/// without one the walk would stop there for good.
+struct OlderPages: Equatable {
+    enum Phase: Equatable {
+        case idle
+        case loading
+        case failed(String)
+    }
+
+    private(set) var more = false
+    private(set) var phase = Phase.idle
+
+    var failure: String? {
+        if case .failed(let why) = phase { why } else { nil }
+    }
+
+    /// The newest page, or the walk back to a search hit. Starts over, a past failure included.
+    mutating func opened(_ page: [Message]) {
+        more = !atStart(page, PAGE)
+        phase = .idle
+    }
+
+    /// Where the next page starts, or nil when there is nothing to ask for: the start was reached,
+    /// a page is already on its way, or the last one failed and waits on Retry.
+    mutating func begin(_ loaded: [Message]) -> Int? {
+        guard more, phase == .idle, let before = oldestId(loaded) else { return nil }
+        phase = .loading
+        return before
+    }
+
+    mutating func landed(_ page: [Message]) {
+        more = !atStart(page, PAGE)
+        phase = .idle
+    }
+
+    /// A cancellation is the reader leaving, not a failure, and asks for no Retry.
+    mutating func failed(_ why: String?) {
+        phase = why.map(Phase.failed) ?? .idle
+    }
+
+    mutating func retry() {
+        if failure != nil { phase = .idle }
+    }
 }
 
 func oldestId(_ loaded: [Message]) -> Int? {
@@ -189,6 +234,7 @@ extension AgentState {
         case .waiting_for_task_worker: "waiting for a task worker"
         case .failed: "failed"
         case .completed: "completed"
+        case .unknown: "in a state this app does not know"
         }
     }
 
@@ -515,21 +561,10 @@ func interviewAnswers(_ content: String) -> [InterviewAnswer]? {
     return answers.isEmpty ? nil : answers
 }
 
-/// The owner's word for whoever wrote a row, for a thread where that is worth saying.
-func speaker(of message: Message, among members: [Agent]) -> String? {
-    message.sender.map { titles(members)[$0] ?? $0 }
-}
-
-/// The name over a bubble. An agent's own rows in its own thread carry none. A `user` row with
-/// a sender in a two-agent thread is one writing to the other, and reads nothing like that
-/// agent's reply to the owner unless the label says so.
-func speakerLabel(of message: Message, own: String?, among members: [Agent]) -> String? {
+/// The name over a bubble. An agent's own rows in its own thread carry none.
+func speakerLabel(of message: Message, own: String) -> String? {
     guard let sender = message.sender, sender != own else { return nil }
-    let name = titles(members)[sender] ?? sender
-    if message.role == .user, members.count == 2, let other = members.first(where: { $0.name != sender }) {
-        return "\(name) to \(other.title)"
-    }
-    return name
+    return sender
 }
 
 /// "Ran 2 shell commands, called browser 3 times". Results are not counted: each answers a call.

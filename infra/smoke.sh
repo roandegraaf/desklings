@@ -63,15 +63,27 @@ setup_required=$(jq -r '.setupRequired' "$tmp/body")
 echo "   ok, setupRequired=$setup_required"
 
 if [ "$setup_required" = "true" ]; then
-  say "first visit: setting the owner password"
+  say "first visit: setup is refused without the token from the daemon log"
   req POST /api/auth/setup "{\"password\":\"$password\"}"
+  expect 403 "setup without a token"
+
+  setup_token=${SCHERMES_SETUP_TOKEN:-}
+  if [ -z "$setup_token" ] && [ "$harness" = true ]; then
+    # Every boot without an owner prints a fresh one, so the newest line is the live token.
+    setup_token=$(compose logs --no-log-prefix schermes 2>/dev/null \
+      | grep '"msg":"first-run setup token"' | tail -1 | jq -r '.code // empty' || true)
+  fi
+  [ -n "$setup_token" ] || fail "no setup token: set SCHERMES_SETUP_TOKEN to the code in the daemon log"
+
+  say "first visit: setting the owner password"
+  req POST /api/auth/setup "{\"password\":\"$password\",\"setupToken\":\"$setup_token\"}"
   expect 201 "setup"
 else
   say "owner password already set, skipping setup"
 fi
 
 say "setup refuses to run a second time"
-req POST /api/auth/setup '{"password":"attacker-chosen-password"}'
+req POST /api/auth/setup '{"password":"attacker-chosen-password","setupToken":"attacker-guess"}'
 expect 409 "second setup"
 
 say "the auth guard rejects an unauthenticated request"
@@ -95,6 +107,19 @@ say "logging in issues a session cookie"
 req POST /api/auth/login "{\"password\":\"$password\"}"
 expect 200 "login"
 grep -q schermes_session "$tmp/jar" || fail "login did not set a session cookie"
+
+say "the session list and the audit log see this login, and never show the session id"
+login_sid=$(awk '$6 == "schermes_session" {print $7}' "$tmp/jar" | tail -1)
+req GET /api/auth/sessions
+expect 200 "list sessions"
+jq -e 'any(.[]; .current == true and (.handle | length) == 16)' "$tmp/body" >/dev/null \
+  || fail "the session list does not mark this session: $(body)"
+grep -qF "$login_sid" "$tmp/body" && fail "the session list returned the raw session id"
+req GET '/api/audit?limit=5'
+expect 200 "read the audit log"
+jq -e '.[0].action == "login" and .[0].detail.method == "password"' "$tmp/body" >/dev/null \
+  || fail "the audit log does not start with this login: $(body)"
+echo "   listed by handle, and the login is the newest audit entry"
 
 agent_one=smoke-one
 agent_two=smoke-two
@@ -262,9 +287,15 @@ req GET /api/models
 expect 200 "list models"
 first_default=$(jq -r '[.[] | select(.isDefault)][0].id // empty' "$tmp/body")
 [ -n "$first_default" ] || fail "the settings round-trip left no default model: $(body)"
+# The endpoint and its key belong to a provider; a model names one.
+req POST /api/providers \
+  "$(jq -nc --arg n "$registry_name" --arg u "$base_url" --arg k "$registry_key" '{name: $n, baseUrl: $u, apiKey: $k}')"
+expect 201 "create a provider"
+grep -q shouldnevershowup "$tmp/body" && fail "the new provider's key came back in the create response"
+registry_provider=$(jq -r '.id' "$tmp/body")
 req POST /api/models \
-  "$(jq -nc --arg n "$registry_name" --arg u "$base_url" --arg m "$model-registry" --arg k "$registry_key" \
-     '{name: $n, baseUrl: $u, model: $m, apiKey: $k}')"
+  "$(jq -nc --arg n "$registry_name" --arg m "$model-registry" --argjson p "$registry_provider" \
+     '{name: $n, model: $m, providerId: $p}')"
 expect 201 "create a model"
 grep -q shouldnevershowup "$tmp/body" && fail "the new model's key came back in the create response"
 registry_id=$(jq -r '.id' "$tmp/body")
@@ -312,6 +343,8 @@ expect 200 "put $agent_one back on the default"
 jq -e 'has("modelId") | not' "$tmp/body" >/dev/null || fail "$agent_one still has a model: $(body)"
 req DELETE "/api/models/$registry_id"
 expect 200 "delete the unused model"
+req DELETE "/api/providers/$registry_provider"
+expect 200 "delete its provider"
 echo "   409 while $agent_one used it, deleted once it did not"
 
 if [ "$harness" = true ]; then
@@ -322,18 +355,18 @@ fi
 # ---------------------------------------------------------------- rules
 
 say "the owner reads and sets $agent_one's rules, and passwords stay the owner's"
-req PUT "/api/agents/$agent_one/rules" '{"levels":{"delete_files":"ask_first"},"preApproved":[]}'
+req PUT "/api/agents/$agent_one/rules" '{"levels":{"delete_files":"ask_first"},"preApproved":{"browse":[]}}'
 expect 200 "set $agent_one's rules"
 req GET "/api/agents/$agent_one/rules"
 expect 200 "read $agent_one's rules"
-jq -e '.levels.delete_files == "ask_first" and .levels.passwords_security == "hand_to_you" and .preApproved == []' \
+jq -e '.levels.delete_files == "ask_first" and .levels.passwords_security == "hand_to_you" and .preApproved == {}' \
   "$tmp/body" >/dev/null || fail "the rules did not round-trip: $(body)"
 req PUT "/api/agents/$agent_one/rules" '{"levels":{"passwords_security":"on_its_own"}}'
 expect 400 "hand passwords to the agent"
-req PUT "/api/agents/$agent_one/rules" '{"preApproved":["Example.com","example.com"]}'
+req PUT "/api/agents/$agent_one/rules" '{"preApproved":{"browse":["Example.com","example.com"]}}'
 expect 200 "a pre-approved site"
-jq -e '.preApproved == ["example.com"]' "$tmp/body" >/dev/null || fail "the list was not lowercased and deduped: $(body)"
-req PUT "/api/agents/$agent_one/rules" '{"preApproved":[]}'
+jq -e '.preApproved == {"browse": ["example.com"]}' "$tmp/body" >/dev/null || fail "the list was not lowercased and deduped: $(body)"
+req PUT "/api/agents/$agent_one/rules" '{"preApproved":{"browse":[]}}'
 expect 200 "clear the list"
 echo "   Ask first for deletes, passwords refused, the list lowercased and deduped"
 
@@ -668,6 +701,202 @@ jq -e '.exitCode == 0 and (.stdout | test("Hello"))' "$tmp/body" >/dev/null \
   || fail "the installed package does not run: $(body)"
 echo "   installed hello and ran it"
 
+# ---------------------------------------------------------------- the sandbox
+
+run_on() {
+  local agent=$1 cmd=$2 timeout=${3:-120000} background=${4:-false}
+  req POST "/api/agents/$agent/command" \
+    "$(jq -nc --arg c "$cmd" --argjson t "$timeout" --argjson b "$background" \
+       '{command: $c, timeoutMs: $t, background: $b}')"
+}
+
+say "agents have no host sudo, and the daemon is an agent only through its sandbox"
+desktop_dir=/opt/schermes/infra/desktop
+in_container test ! -e /etc/sudoers.d/agents || fail "/etc/sudoers.d/agents still grants host root"
+in_container sh -c "! grep -rqsE '^[[:space:]]*%agents' /etc/sudoers /etc/sudoers.d" \
+  || fail "a host sudoers rule still grants %agents: $(in_container sh -c "grep -rsE '^[[:space:]]*%agents' /etc/sudoers /etc/sudoers.d")"
+in_container runuser -u "agent-$agent_one" -- sudo -n true >/dev/null 2>&1 \
+  && fail "agent-$agent_one has passwordless sudo outside its sandbox"
+in_container runuser -u schermes -- sudo -n -u "agent-$agent_one" id >/dev/null 2>&1 \
+  && fail "the daemon can still run anything as agent-$agent_one"
+in_container runuser -u schermes -- sudo -n /usr/bin/apt-get --version >/dev/null 2>&1 \
+  && fail "the daemon can still run apt-get as root"
+[ "$(in_container runuser -u schermes -- sudo -n -u "agent-$agent_one" "$desktop_dir/sandbox.sh" enter id -u | tr -d '\r')" \
+  = "$(in_container id -u "agent-$agent_one" | tr -d '\r')" ] \
+  || fail "the daemon cannot run a command in $agent_one's sandbox"
+echo "   no %agents grant; the daemon gets a refusal for a bare command and apt-get, and a shell through enter"
+
+say "an agent's desktop and its commands run in a user namespace of their own"
+container_ns=$(in_container readlink /proc/self/ns/user | tr -d '\r')
+xvnc_ns=$(in_container runuser -u "agent-$agent_one" -- readlink "/proc/$(xvnc_pid "$agent_one" "$display_one")/ns/user" | tr -d '\r')
+run_cmd 'readlink /proc/self/ns/user' 10000
+expect 200 "the namespace of a command"
+command_ns=$(jq -r '.stdout' "$tmp/body" | tr -d '\n')
+[ -n "$xvnc_ns" ] && [ "$xvnc_ns" != "$container_ns" ] || fail "Xvnc runs in the container's userns ($xvnc_ns)"
+[ "$command_ns" = "$xvnc_ns" ] || fail "a command ran in $command_ns, not in the sandbox's $xvnc_ns"
+echo "   container $container_ns; Xvnc and a command both $xvnc_ns"
+
+say "from inside $agent_one's sandbox the daemon, its secrets and $agent_two are out of reach"
+daemon_port=$(in_container printenv SCHERMES_PORT | tr -d '\r')
+daemon_pid=$(in_container pgrep -u schermes -o -f 'daemon/src/main.ts' | tr -d '\r')
+container_ip=$(in_container sh -c "ip -4 -o addr show eth0 | awk '{print \$4}' | cut -d/ -f1" | tr -d '\r')
+gateway=$(in_container sh -c "ip route | awk '/^default/ {print \$3; exit}'" | tr -d '\r')
+vnc_two=$((5900 + display_two)) cdp_two=$((9222 + display_two))
+xvnc_two=$(xvnc_pid "$agent_two" "$display_two")
+# Each denial below is only worth something if the thing is there and reachable from outside.
+in_container test -s /var/lib/schermes/master.key || fail "no master.key to be denied"
+in_container test -s /var/lib/schermes/schermes.db || fail "no database to be denied"
+in_container test -d "/home/agent-$agent_two/memory" || fail "$agent_two has no home to be denied"
+[ -n "$daemon_pid" ] && [ -n "$xvnc_two" ] && [ -n "$container_ip" ] && [ -n "$gateway" ] \
+  || fail "could not find the daemon ($daemon_pid), $agent_two's Xvnc ($xvnc_two), the IP ($container_ip) or the gateway ($gateway)"
+[ "$(in_container bash -c "exec 3<>/dev/tcp/127.0.0.1/$vnc_two; head -c 3 <&3" | tr -d '\r')" = RFB ] \
+  || fail "$agent_two's VNC does not answer on the container loopback"
+in_container curl -fsS -o /dev/null "http://127.0.0.1:$cdp_two/json/version" 2>/dev/null \
+  || run_on "$agent_two" "python3 -m http.server $cdp_two --bind 127.0.0.1" 10000 true
+for _ in $(seq 20); do
+  [ "$(in_container curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$cdp_two/" | tr -d '\r')" != 000 ] && break
+  sleep 0.5
+done
+[ "$(in_container curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$cdp_two/" | tr -d '\r')" != 000 ] \
+  || fail "nothing answers on $agent_two's CDP port $cdp_two from the container loopback"
+read -r -d '' probe <<PROBE || true
+leaks=0
+denied() {
+  local what=\$1; shift
+  if timeout 5 "\$@" >/dev/null 2>&1; then echo "LEAK: \$what"; leaks=\$((leaks + 1)); else echo "ok (denied): \$what"; fi
+}
+denied 'master.key as the agent' cat /var/lib/schermes/master.key
+denied 'master.key as sandbox root' sudo -n cat /var/lib/schermes/master.key
+denied 'the database as the agent' cat /var/lib/schermes/schermes.db
+denied 'the database as sandbox root' sudo -n cat /var/lib/schermes/schermes.db
+denied 'the database through the daemon root' cat /proc/$daemon_pid/root/var/lib/schermes/schermes.db
+denied 'the database through the daemon root, as sandbox root' sudo -n cat /proc/$daemon_pid/root/var/lib/schermes/schermes.db
+denied 'the daemon fds' ls /proc/$daemon_pid/fd
+denied 'the daemon fds, as sandbox root' sudo -n ls /proc/$daemon_pid/fd
+denied '$agent_two home' ls /home/agent-$agent_two
+denied '$agent_two home, as sandbox root' sudo -n ls /home/agent-$agent_two
+denied '$agent_two memory, as sandbox root' sudo -n cat /home/agent-$agent_two/memory/MEMORY.md
+denied '$agent_two root through its Xvnc, as sandbox root' sudo -n ls /proc/$xvnc_two/root/
+for host in 127.0.0.1 $container_ip $gateway; do
+  for port in $vnc_two $cdp_two; do denied "$agent_two port \$port via \$host" bash -c "exec 3<>/dev/tcp/\$host/\$port"; done
+done
+for host in 127.0.0.1 $container_ip; do denied "the daemon port via \$host" bash -c "exec 3<>/dev/tcp/\$host/$daemon_port"; done
+code=\$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://$gateway:$daemon_port/api/settings)
+case \$code in
+  000|401) echo "ok: the daemon port via the gateway answers \$code, as it does any network client" ;;
+  *) echo "LEAK: the daemon port via the gateway answers \$code"; leaks=\$((leaks + 1)) ;;
+esac
+exit \$leaks
+PROBE
+run_cmd "$probe" 120000
+expect 200 "the isolation probe"
+jq -r '.stdout' "$tmp/body" | sed 's/^/   /'
+jq -e '.exitCode == 0' "$tmp/body" >/dev/null || fail "$agent_one reached something it must not: $(body)"
+run_on "$agent_two" "pkill -f 'http.server $cdp_two'; true" 10000
+
+# A pre-existing agent is one made before the sandbox: a plain useradd user with useradd's own
+# subordinate-id line, a home, a Chromium profile and memory. Creating the agent through the API
+# is the same create-agent-user.sh pass boot runs over every agent.
+legacy=smoke-legacy
+legacy_home=/home/agent-$legacy
+
+say "an agent made before the sandbox moves into one with its home, Chromium profile and memory"
+req DELETE "/api/agents/$legacy"
+in_container "$desktop_dir/delete-agent-user.sh" "$legacy" >/dev/null
+in_container useradd --create-home --shell /bin/bash --groups agents "agent-$legacy"
+for file in /etc/subuid /etc/subgid; do
+  in_container sh -c "grep -q '^agent-$legacy:' $file || echo 'agent-$legacy:100000:65536' >> $file"
+done
+legacy_note="- remembered before the sandbox $$"
+in_container runuser -u "agent-$legacy" -- sh -c "mkdir -p ~/memory && printf '%s\n' '$legacy_note' > ~/memory/MEMORY.md"
+in_container runuser -u "agent-$legacy" -- sh -c \
+  'cd && chromium --headless --no-first-run --user-data-dir=$HOME/.chromium-profile --dump-dom about:blank >/dev/null 2>&1; echo legacy > ~/.chromium-profile/smoke-marker'
+in_container test -s "$legacy_home/.chromium-profile/Local State" || fail "the legacy Chromium wrote no profile"
+profile_sum() { echo "cd \"\$HOME/.chromium-profile\" && find . -type f ! -name 'Singleton*' -print0 | sort -z | xargs -0 sha256sum | sha256sum"; }
+legacy_sum=$(in_container runuser -u "agent-$legacy" -- bash -c "$(profile_sum)" | tr -d '\r')
+legacy_uid=$(in_container id -u "agent-$legacy" | tr -d '\r')
+
+req POST /api/agents "$(jq -nc --arg n "$legacy" '{name: $n, profile: "A smoke-test agent from before the sandbox."}')"
+expect 201 "adopt the legacy user as an agent"
+legacy_block=$(in_container cat "/var/lib/schermes-sandboxes/$legacy/subid" | tr -d '\r')
+[ "$(in_container grep -c "^agent-$legacy:" /etc/subuid | tr -d '\r')" = 1 ] \
+  && in_container grep -qx "agent-$legacy:$legacy_block:65536" /etc/subuid \
+  || fail "useradd's subuid line was not replaced by the recorded block $legacy_block"
+[ "$legacy_block" != "$(in_container cat "/var/lib/schermes-sandboxes/$agent_one/subid" | tr -d '\r')" ] \
+  || fail "the legacy agent shares $agent_one's subuid block"
+run_on "$legacy" "id -u; readlink /proc/self/ns/user; $(profile_sum)" 30000
+expect 200 "read the migrated profile"
+read -r inside_uid inside_ns inside_sum <<<"$(jq -r '.stdout' "$tmp/body" | awk '{print $1}' | tr '\n' ' ')"
+[ "$inside_uid" = "$legacy_uid" ] || fail "the legacy agent runs as $inside_uid inside, not $legacy_uid"
+[ "$inside_ns" != "$container_ns" ] || fail "the legacy agent's commands are not sandboxed"
+[ "$inside_sum" = "${legacy_sum%% *}" ] || fail "the Chromium profile changed in the move: $(body)"
+req GET "/api/agents/$legacy/memory"
+expect 200 "the legacy agent's memory"
+jq -e --arg n "$legacy_note" '.lasting | contains($n)' "$tmp/body" >/dev/null || fail "the memory did not survive: $(body)"
+# Without DISPLAY: with a live X display, headless Chromium prints the page and then never exits.
+run_on "$legacy" 'env -u DISPLAY chromium --headless --no-first-run --user-data-dir=$HOME/.chromium-profile --dump-dom about:blank 2>/dev/null' 60000
+jq -e '.exitCode == 0 and (.stdout | contains("<html"))' "$tmp/body" >/dev/null \
+  || fail "Chromium in the sandbox does not open the migrated profile: $(body)"
+echo "   uid $legacy_uid, block $legacy_block, profile $inside_sum unchanged, memory kept, Chromium opens it"
+
+say "deleting an agent removes its user, home and sandbox, with the daemon racing it"
+run_on "$legacy" 'echo kept > ~/workspace/keep.txt && sudo -n touch /etc/smoke-layer-marker' 30000
+jq -e '.exitCode == 0' "$tmp/body" >/dev/null || fail "could not write into the legacy sandbox: $(body)"
+in_container test -e "/var/lib/schermes-sandboxes/$legacy/upper/etc/smoke-layer-marker" \
+  || fail "the sandbox write did not land in the layer"
+# The daemon's own route into a sandbox, the one search, idle and triggers take, run flat out:
+# any start landing between the stop and the userdel would leave a sandbox behind.
+in_container rm -f /tmp/smoke-hammer.stop /tmp/smoke-hammer.pid
+compose exec -d -T schermes runuser -u schermes -- sh -c \
+  "echo \$\$ > /tmp/smoke-hammer.pid; while [ ! -e /tmp/smoke-hammer.stop ]; do sudo -n -u agent-$legacy $desktop_dir/sandbox.sh enter true >/dev/null 2>&1; done"
+for _ in $(seq 20); do in_container test -s /tmp/smoke-hammer.pid && break; sleep 0.2; done
+req DELETE "/api/agents/$legacy"
+expect 200 "delete the legacy agent"
+in_container touch /tmp/smoke-hammer.stop
+for _ in $(seq 50); do in_container sh -c 'kill -0 "$(cat /tmp/smoke-hammer.pid)" 2>/dev/null' || break; sleep 0.2; done
+in_container id -u "agent-$legacy" >/dev/null 2>&1 && fail "agent-$legacy is still a user"
+in_container test ! -e "$legacy_home" || fail "$legacy_home is still there"
+in_container test ! -e "/var/lib/schermes-sandboxes/$legacy" || fail "the sandbox layer of $legacy is still there"
+in_container sh -c "! grep -q '^agent-$legacy:' /etc/subuid /etc/subgid" || fail "agent-$legacy still has subordinate ids"
+left=$(in_container ps -eo pid=,uid=,args= | awk -v uid="$legacy_uid" -v lo="$legacy_block" \
+  '$2 == uid || ($2 >= lo && $2 < lo + 65536) || /schermes-sandboxes\/'"$legacy"'\// { print }')
+[ -z "$left" ] || fail "processes of the deleted agent are still running:
+$left"
+echo "   user, home, layer and subid lines gone; nothing left running"
+
+say "an agent recreated under a deleted agent's name starts empty"
+req POST /api/agents "$(jq -nc --arg n "$legacy" '{name: $n, profile: "A smoke-test agent, born again."}')"
+expect 201 "recreate the legacy agent"
+run_on "$legacy" 'ls -A ~ ~/workspace ~/memory ~/.chromium-profile; test ! -e /etc/smoke-layer-marker && echo no-layer-marker' 30000
+expect 200 "list the new home"
+jq -e '(.stdout | contains("no-layer-marker")) and (.stdout | test("keep.txt|MEMORY.md|smoke-marker|Local State") | not)' \
+  "$tmp/body" >/dev/null || fail "the recreated agent inherited something: $(body)"
+req GET "/api/agents/$legacy/memory"
+jq -e '.lasting == ""' "$tmp/body" >/dev/null || fail "the recreated agent remembers: $(body)"
+echo "   an empty home and a fresh layer"
+
+say "a rename with the daemon racing it moves the user and the sandbox"
+moved="$legacy-2"
+req DELETE "/api/agents/$moved"
+in_container "$desktop_dir/delete-agent-user.sh" "$moved" >/dev/null
+in_container rm -f /tmp/smoke-hammer.stop /tmp/smoke-hammer.pid
+compose exec -d -T schermes runuser -u schermes -- sh -c \
+  "echo \$\$ > /tmp/smoke-hammer.pid; while [ ! -e /tmp/smoke-hammer.stop ]; do sudo -n -u agent-$legacy $desktop_dir/sandbox.sh enter true >/dev/null 2>&1; done"
+for _ in $(seq 20); do in_container test -s /tmp/smoke-hammer.pid && break; sleep 0.2; done
+req PATCH "/api/agents/$legacy" "$(jq -nc --arg n "$moved" '{name: $n}')"
+expect 200 "rename while the daemon enters the sandbox"
+in_container touch /tmp/smoke-hammer.stop
+in_container id -u "agent-$moved" >/dev/null || fail "agent-$moved was not created by the rename"
+in_container test -d "/var/lib/schermes-sandboxes/$moved" -a ! -e "/var/lib/schermes-sandboxes/$moved/disabled" \
+  || fail "the sandbox layer did not move, or is still marked as retired"
+run_on "$moved" 'id -un' 30000
+jq -e --arg u "agent-$moved" '.exitCode == 0 and (.stdout | contains($u))' "$tmp/body" >/dev/null \
+  || fail "the renamed agent's sandbox does not run commands: $(body)"
+req DELETE "/api/agents/$moved"
+expect 200 "delete the renamed agent"
+in_container id -u "agent-$moved" >/dev/null 2>&1 && fail "agent-$moved is still a user after its delete"
+echo "   renamed to $moved, its sandbox back up under the new name, and deleted"
+
 # ---------------------------------------------------------------- the agent loop
 
 # A scripted OpenAI-compatible endpoint on loopback, so the run exercises the real model client
@@ -803,6 +1032,22 @@ done
 transcript_length=$(jq -r 'length' "$tmp/body")
 echo "   $transcript_length messages, screenshot and command output both fed back"
 
+say "the screenshot is stored as a file on the data volume, not in the database"
+shot_sha=$(jq -r '[.[] | select(.role == "tool" and .image.mediaType == "image/png" and .image.base64 != "")] | last | .image.base64' "$tmp/body" \
+  | in_container sh -c 'base64 -d | sha256sum' | cut -d' ' -f1)
+in_container test -f "/var/lib/schermes/images/$(printf '%s' "$shot_sha" | cut -c1-2)/$shot_sha" \
+  || fail "no image file named $shot_sha under /var/lib/schermes/images"
+counts=$(in_container runuser -u schermes -- sh -c 'cd /opt/schermes/daemon && node --input-type=commonjs -' <<JS | tr -d '\r'
+const db = new (require('better-sqlite3'))('/var/lib/schermes/schermes.db', { readonly: true });
+const refs = db.prepare("SELECT count(*) AS n FROM messages WHERE json_extract(image_ref, '\$.sha256') = ?").get('$shot_sha').n;
+const inline = db.prepare('SELECT count(*) AS n FROM messages WHERE image IS NOT NULL').get().n;
+process.stdout.write(refs + ' ' + inline);
+JS
+)
+[ "${counts%% *}" -ge 1 ] 2>/dev/null && [ "${counts##* }" = 0 ] \
+  || fail "expected a row naming the screenshot's file and no inline base64 left, got refs/inline: $counts"
+echo "   images/$(printf '%s' "$shot_sha" | cut -c1-12)… holds the screenshot; no row carries base64"
+
 say "the events say what the agent did, without the payloads"
 req GET "/api/agents/$agent_one/events"
 expect 200 "read the events"
@@ -887,41 +1132,25 @@ echo "   $transcript_length messages, the agent state and the encrypted settings
 
 say "the rebuilt container rebuilds the linux users and desktops from the surviving rows"
 assert_desktops
+
+say "a package $agent_one installed with sudo apt-get survived the rebuild"
+run_cmd 'hello && dpkg -s hello | grep -qx "Status: install ok installed"' 30000
+expect 200 "run hello after the rebuild"
+jq -e '.exitCode == 0 and (.stdout | test("Hello"))' "$tmp/body" >/dev/null \
+  || fail "hello did not survive the rebuild: $(body)"
+echo "   hello still installed and runs, from $agent_one's layer on the sandboxes volume"
 # The container took the scripted endpoint down with it, and everything below needs one.
 start_stub "echo $nonce; id -un" 30000
 
 # ---------------------------------------------------------------- agents talking
 
-say "the owner opens the thread the two agents share"
-req GET "/api/agents/$agent_one/conversations"
-expect 200 "list conversations"
-jq -e --arg a "$agent_one" '[.[] | select(.participants == [$a])] | length == 1' "$tmp/body" \
-  >/dev/null || fail "$agent_one has no owner thread of its own: $(body)"
-
-req GET /api/agents/nobody/conversations
-expect 404 "conversations for an unknown agent"
-req POST /api/conversations "$(jq -nc --arg a "$agent_one" '{participants: [$a, "nobody"]}')"
-expect 400 "a participant list naming an agent that does not exist"
-req POST /api/conversations '{"participants":[]}'
-expect 400 "an empty participant list"
+# Every agent has exactly one thread, the one it shares with the owner; agents talk across
+# threads (docs/architecture.md, "Messaging"). There are no shared or group threads to open.
+say "a thread that does not exist is a 404"
 req GET /api/conversations/999999/messages
 expect 404 "an unknown conversation"
-
-req POST /api/conversations \
-  "$(jq -nc --arg a "$agent_one" --arg b "$agent_two" '{participants: [$a, $b]}')"
-expect 201 "create the shared thread"
-shared=$(jq -r '.id' "$tmp/body")
-jq -e --arg a "$agent_one" --arg b "$agent_two" \
-  '(.participants | sort) == ([$a, $b] | sort)' "$tmp/body" >/dev/null \
-  || fail "the thread does not hold both agents: $(body)"
-echo "   thread $shared holds $agent_one and $agent_two"
-
-# A conversation is its participant set, so asking for the same pair again is the same row —
-# which is what keeps this run repeatable and what send_message finds.
-req POST /api/conversations \
-  "$(jq -nc --arg a "$agent_two" --arg b "$agent_one" '{participants: [$a, $b]}')"
-expect 201 "ask for the same pair again"
-[ "$(jq -r '.id' "$tmp/body")" = "$shared" ] || fail "the same pair opened a second thread"
+req GET /api/agents/nobody/messages
+expect 404 "the thread of an unknown agent"
 
 say "a message to a busy agent is taken rather than refused"
 start_stub 'sleep 8' 30000 busy
@@ -961,92 +1190,56 @@ done
 settle "$agent_one"
 echo "   both messages answered, $before -> $after turns"
 
-say "$agent_one writes to $agent_two, which answers and wakes it"
+say "$agent_one writes to $agent_two, whose answer comes back to $agent_one and wakes it"
 start_stub "echo $nonce; id -un" 30000 talk "$agent_one" "$agent_two"
 
-req GET "/api/conversations/$shared/messages"
-expect 200 "the shared thread before the exchange"
-shared_last=$(jq -r '[.[].id] | max // 0' "$tmp/body")
+last_id() { req GET "/api/agents/$1/messages"; jq -r '[.[].id] | max // 0' "$tmp/body"; }
+# A fresh agent's thread is empty, and after=0 is not a message id.
+thread_since() { req GET "/api/agents/$1/messages$([ "$2" -gt 0 ] && echo "?after=$2")"; }
+one_last=$(last_id "$agent_one")
+two_last=$(last_id "$agent_two")
 
 req POST "/api/agents/$agent_one/messages" \
   "$(jq -nc --arg b "$agent_two" '{text: ("Ask " + $b + " for its hostname, then tell me.")}')"
 expect 202 "the message that starts the exchange"
 
-# The exchange crosses both agents and comes back: $agent_one ends its turn waiting, and the
-# reply is what starts it again. Waiting for one agent to settle is not the end of it.
-exchange() {
-  jq -e --argjson since "$shared_last" --arg a "$agent_one" --arg b "$agent_two" '
-    [.[] | select(.id > $since)] as $new
-    | ([$new[] | select(.role == "assistant" and .sender == $a)] | length) >= 1
-    and ([$new[] | select(.role == "assistant" and .sender == $b)] | length) >= 1
+# The exchange crosses both threads and comes back: $agent_one ends its turn, $agent_two's
+# answer lands in $agent_one's thread, and that is what starts $agent_one again.
+woken() {
+  thread_since "$agent_one" "$one_last"
+  jq -e --arg a "$agent_one" --arg b "$agent_two" '
+    any(.[]; .role == "assistant" and .sender == $a and (.content | test("heard=[^ ]*" + $b)))
   ' "$tmp/body" >/dev/null
 }
-for _ in $(seq 120); do
-  req GET "/api/conversations/$shared/messages"
-  exchange && break
-  sleep 1
-done
-req GET "/api/conversations/$shared/messages"
-exchange || fail "the two agents never both spoke in the thread: $(body)"
+for _ in $(seq 120); do woken && break; sleep 1; done
+woken || fail "$agent_one was never woken by $agent_two's answer: $(body)"
 
-jq -e --argjson since "$shared_last" --arg a "$agent_one" --arg n "$nonce" '
-  [.[] | select(.id > $since)] as $new
-  | ([$new[] | select(.role == "user" and .sender == $a and (.content | contains($n)))] | length)
-      == 1
-' "$tmp/body" >/dev/null || fail "the message $agent_one sent is not stored under its name: $(body)"
+jq -e --arg b "$agent_two" '
+  any(.[]; .role == "user" and .sender == $b and (.content | contains("agent=" + $b)))
+' "$tmp/body" >/dev/null || fail "$agent_two's answer is not in $agent_one's thread under its name: $(body)"
 
-heard_by() {
-  jq -r --argjson since "$shared_last" --arg who "$1" \
-    '[.[] | select(.id > $since and .role == "assistant" and .sender == $who)] | last | .content' \
-    "$tmp/body"
-}
-two_said=$(heard_by "$agent_two")
-one_said=$(heard_by "$agent_one")
-for want in "agent=$agent_two" "heard=$agent_one" 'valid=yes'; do
+thread_since "$agent_two" "$two_last"
+expect 200 "$agent_two's thread after the exchange"
+jq -e --arg a "$agent_one" --arg n "$nonce" '
+  [.[] | select(.role == "user" and .sender == $a and (.content | contains($n)))] | length == 1
+' "$tmp/body" >/dev/null || fail "the message $agent_one sent is not in $agent_two's thread under its name: $(body)"
+two_said=$(jq -r --arg b "$agent_two" '[.[] | select(.role == "assistant" and .sender == $b)] | last | .content' "$tmp/body")
+for want in "agent=$agent_two" 'valid=yes'; do
   case $two_said in *"$want"*) ;; *) fail "$agent_two never saw $want — it reported: $two_said" ;; esac
 done
-case $one_said in
-  *"heard=$agent_two"*) ;;
-  *) fail "$agent_one was never shown the reply as coming from $agent_two: $one_said" ;;
+case $two_said in
+  *heard=*"$agent_one"*) ;;
+  *) fail "$agent_two was not shown the message as coming from $agent_one: $two_said" ;;
 esac
-echo "   $agent_two answered $agent_one, and $agent_one was woken by the reply"
+echo "   $agent_two answered $agent_one in its own thread, and the answer woke $agent_one"
 
 req GET "/api/agents/$agent_one/events"
 expect 200 "the events of the exchange"
 jq -e --arg b "$agent_two" \
   '[.[] | select(.type == "tool_result" and .data.to == $b)] | length >= 1' "$tmp/body" \
   >/dev/null || fail "no send_message result is in the history: $(body)"
-
-say "one message to the group thread is answered by both agents"
-start_stub "echo $nonce; id -un" 30000 talk
-
-req GET "/api/conversations/$shared/messages"
-expect 200 "the group thread before the fan-out"
-shared_last=$(jq -r '[.[].id] | max // 0' "$tmp/body")
-
-req POST "/api/conversations/$shared/messages" '{"text":"Who is around? One line each."}'
-expect 202 "post to the group thread"
-jq -e '.message.role == "user" and (.message | has("sender") | not)' "$tmp/body" >/dev/null \
-  || fail "the owner message was stored under an agent name: $(body)"
-
-for _ in $(seq 120); do
-  req GET "/api/conversations/$shared/messages"
-  exchange && break
-  sleep 1
-done
-req GET "/api/conversations/$shared/messages"
-exchange || fail "one message to the group did not get a reply from each agent: $(body)"
-
-for name in "$agent_one" "$agent_two"; do
-  said=$(heard_by "$name")
-  case $said in
-    *"agent=$name"*heard=*the_owner*) ;;
-    *) fail "$name did not answer the owner in the group thread: $said" ;;
-  esac
-done
 settle "$agent_one"
 settle "$agent_two"
-echo "   both agents answered the owner in thread $shared"
 
 # ---------------------------------------------------------------- task workers
 
@@ -1294,18 +1487,41 @@ for _ in $(seq 120); do
 done
 [ "$state" = using_terminal ] || fail "$agent_two is $state, expected using_terminal"
 
-say "a turn above the loop cap is refused with an error that names the cap"
-refused=$(in_container curl -sS -w '\n%{http_code}' \
+say "a turn above the loop cap is taken and queued, and a daemon sharing the queue runs it"
+# Any daemon on this database drains the queue: the container's own one sweeps it within
+# SWEEP_MS. So the stub answers everyone straight away before the turn is posted, or the
+# queued turn would start on the sleep that parks $agent_two. That sleep is already running
+# and does not ask the stub again.
+start_stub true 5000 memory
+queued_turn_lines() {
+  compose logs --no-log-prefix schermes 2>/dev/null \
+    | jq -R --arg a "$agent_one" -c 'fromjson? | select(.msg == "queued turn started" and .agent == $a and .kind == "message")' \
+    | wc -l | tr -d ' '
+}
+queued_before=$(queued_turn_lines)
+over_cap=$(in_container curl -sS -w '\n%{http_code}' \
   -X POST -H 'content-type: application/json' -H "cookie: schermes_session=$sid" \
   -d '{"text":"And answer me too, please."}' \
   "http://127.0.0.1:$second_port/api/agents/$agent_one/messages" | tr -d '\r')
-[ "$(printf '%s' "$refused" | tail -1)" = 429 ] \
-  || fail "the second daemon took a turn above its cap of $second_max_loops: $refused"
-case $refused in
-  *"agent loops can run at once"*) ;;
-  *) fail "the refusal does not say which cap was hit: $refused" ;;
-esac
-echo "   refused with 429 while its one loop was busy"
+[ "$(printf '%s' "$over_cap" | tail -1)" = 202 ] \
+  || fail "the second daemon did not take the turn above its cap of $second_max_loops: $over_cap"
+await_log 'turn queued at the loop cap' 1 \
+  || fail "the second daemon never said it queued the turn — $(cat "$tmp/reconcile.log")"
+grep -h 'turn queued at the loop cap' "$tmp/reconcile.log" \
+  | jq -e --arg a "$agent_one" -s 'any(.[]; .agent == $a and .kind == "message")' >/dev/null \
+  || fail "the queued turn is not $agent_one's message — $(cat "$tmp/reconcile.log")"
+echo "   202, and queued while the second daemon's one loop was busy"
+
+settle "$agent_one"
+[ "$state" = waiting_for_user ] || fail "$agent_one is $state after its queued turn"
+[ "$(queued_turn_lines)" -gt "$queued_before" ] \
+  || fail "$agent_one answered, but not from the queue: the container daemon logged no queued turn for it"
+req GET "/api/agents/$agent_one/messages"
+expect 200 "$agent_one's thread after the queued turn"
+jq -e '(map(.role == "user" and ((.content // "") | contains("And answer me too"))) | index(true)) as $asked
+       | $asked != null and (.[$asked + 1:] | any(.role == "assistant"))' "$tmp/body" >/dev/null \
+  || fail "the queued message was never answered: $(body)"
+echo "   the container daemon started it from the queue, and $agent_one answered"
 
 req GET "/api/agents/$agent_two/messages"
 expect 200 "the half-written transcript"
@@ -1478,7 +1694,7 @@ fired=''
 for _ in $(seq 90); do
   req GET "/api/agents/$agent_one/messages?after=$before"
   fired=$(jq -r --arg n "$nonce" \
-    '[.[] | select(.role == "user" and .sender == null and (.content | contains($n)))] | first | .content // ""' \
+    '[.[] | select(.role == "user" and .sender == "System" and (.content | contains($n)))] | first | .content // ""' \
     "$tmp/body")
   [ -n "$fired" ] && break
   sleep 1
@@ -1657,9 +1873,9 @@ printf '\nOK: health, setup, login, auth guard, an api-only surface on the one e
 printf '    settings, the model registry, rules, two agents with adopted desktops,\n'
 printf '    a tool layer that screenshots, drives input, uses the clipboard and runs commands,\n'
 printf '    an agent loop that reaches a model, calls both tools and answers durably,\n'
-printf '    a message taken by a busy agent, two agents holding a conversation the owner can\n'
-printf '    read, a group thread answered by both, a task worker that did its job as its parent\n'
-printf '    and reported back, a loop cap that refuses with a 429, a vnc stream proxied to the\n'
+printf '    a message taken by a busy agent, one agent asking another across their threads and\n'
+printf '    woken by the answer, a task worker that did its job as its parent\n'
+printf '    and reported back, a turn queued at the loop cap and run by another daemon, a vnc stream proxied to the\n'
 printf '    owner and an agent stood down while a human held its mouse, and a daemon killed mid\n'
 printf '    tool call whose agent comes back repaired and answerable, and an agent that\n'
 printf '    remembers a fact, survives a restart and is handed it back in its next prompt, and a\n'

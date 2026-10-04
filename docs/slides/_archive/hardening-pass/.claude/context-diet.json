@@ -1,0 +1,21 @@
+{
+  "_note": "written by context-diet on 2026-10-04; edit freely, an existing file is never regenerated except by /diet init",
+  "mcp": [
+    "plugin_legal_atlassian",
+    "plugin_legal_docusign",
+    "plugin_legal_egnyte",
+    "plugin_legal_slack",
+    "plugin_stripe_stripe",
+    "Neon"
+  ],
+  "skills": [
+    "kicad-happy:*",
+    "legal:*",
+    "stripe:*",
+    "apple-hig",
+    "ios-hig-design"
+  ],
+  "agents": [
+    "stripe:Company Researcher"
+  ]
+}

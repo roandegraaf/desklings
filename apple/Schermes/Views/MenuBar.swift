@@ -31,42 +31,6 @@ func quickMessage(_ input: String, agents: [String]) -> QuickMessage {
 import AppKit
 import Carbon.HIToolbox
 
-/// The menu bar's own poll: the console window can be closed while the extra stays.
-@Observable
-final class MenuBarFeed {
-    private(set) var agents: [Agent] = []
-    private(set) var needs: [NeedsYouItem] = []
-    var shown = false
-
-    private var session: Session?
-    private var looks: AgentLooks?
-
-    func start(session: Session, looks: AgentLooks) {
-        guard self.session == nil else { return }
-        self.session = session
-        self.looks = looks
-        Task {
-            while true {
-                await refresh()
-                try? await Task.sleep(for: .seconds(shown ? 2 : 10))
-            }
-        }
-    }
-
-    func refresh() async {
-        guard let session, session.phase == .ready,
-              let rows = try? await session.run({ try await $0.agents() })
-        else { return }
-        if agents != rows { agents = rows }
-        looks?.adopt(rows)
-        if let pending = try? await session.run({ try await $0.needsYou() }), pending != needs { needs = pending }
-    }
-
-    func drop(_ id: String) {
-        needs.removeAll { $0.id == id }
-    }
-}
-
 extension NeedsYouItem {
     /// Only yes and no are answered from the panel; anything else becomes Open, into the console.
     var answeredInPlace: NeedsYouItem {
@@ -81,21 +45,21 @@ extension NeedsYouItem {
 struct MenuBarLabel: View {
     let session: Session
     let looks: AgentLooks
-    let feed: MenuBarFeed
+    let feed: AgentFeed
 
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: feed.needs.isEmpty ? "bell" : "bell.badge.fill")
             if !feed.needs.isEmpty { Text("\(feed.needs.count)") }
         }
-        .onAppear { feed.start(session: session, looks: looks) }
+        .onAppear { feed.start() }
     }
 }
 
 struct MenuBarPanel: View {
     let session: Session
     let looks: AgentLooks
-    let feed: MenuBarFeed
+    let feed: AgentFeed
 
     @Environment(\.openWindow) private var openWindow
     @AppStorage("schermes.quickTarget") private var lastTarget = ""
@@ -127,6 +91,7 @@ struct MenuBarPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if session.phase == .ready {
+                TroubleBanner(session: session).padding(.horizontal, -12)
                 quick
                 ScrollView {
                     VStack(alignment: .leading, spacing: 6) {
@@ -161,10 +126,10 @@ struct MenuBarPanel: View {
         .frame(width: 370)
         .background(Theme.panel)
         .onAppear {
-            feed.start(session: session, looks: looks)
+            feed.start()
             feed.shown = true
             typing = true
-            Task { await feed.refresh() }
+            Task { await refreshFeed() }
         }
         .onDisappear { feed.shown = false }
         .onChange(of: draft) { _, now in
@@ -259,9 +224,18 @@ struct MenuBarPanel: View {
         do {
             try await session.run { try await $0.act(onNeedsYou: item.id, action) }
             feed.drop(item.id)
-            await feed.refresh()
         } catch {
             if !error.isCancellation { note = error.localizedDescription }
+            return
+        }
+        await refreshFeed()
+    }
+
+    private func refreshFeed() async {
+        do {
+            try await feed.refresh()
+        } catch {
+            if let complaint = session.complaint(about: error) { note = complaint }
         }
     }
 
@@ -276,7 +250,7 @@ struct MenuBarPanel: View {
                 picked = nil
                 draft = ""
                 note = "Sent to \(titles[target] ?? target)."
-                await feed.refresh()
+                await refreshFeed()
             } catch {
                 if !error.isCancellation { note = error.localizedDescription }
             }

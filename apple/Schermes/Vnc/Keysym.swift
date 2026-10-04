@@ -21,9 +21,26 @@ nonisolated enum Keysym {
     static let control: UInt32 = 0xffe3
     /// `Alt_L`, and `Super_L` for Command: a Mac keyboard's Command sits where a PC's Super does,
     /// and mapping it to Alt would make every Cmd chord fire the desktop's Alt shortcut instead.
+    /// The editing chords in `controlShortcut` are the exception, and go as Control.
     static let alt: UInt32 = 0xffe9
     static let meta: UInt32 = 0xffeb
     static let delete: UInt32 = 0xffff
+    static let v: UInt32 = 0x76
+
+    /// Copy, paste, cut, select all and undo (redo with Shift) are Command on a Mac and Control on
+    /// the agent's Linux desktop, so those five Command chords are sent as Control ones; every other
+    /// Command chord stays a Super chord. With Shift held the capital is sent, because Xvnc
+    /// presses or lifts Shift itself to match the keysym it is given, and a small z under a held
+    /// Shift would come out as undo rather than redo.
+    static func controlShortcut(_ character: Character, shift: Bool) -> UInt32? {
+        let letter = Character(character.lowercased())
+        guard ["c", "v", "x", "a", "z"].contains(letter) else { return nil }
+        return of(shift ? Character(letter.uppercased()) : letter)
+    }
+
+    static func isPaste(_ keysym: UInt32) -> Bool {
+        keysym == v || keysym == 0x56
+    }
 
     private static let firstFunction: UInt32 = 0xffbe
 

@@ -38,17 +38,114 @@ struct ModelEntry: Codable, Sendable, Identifiable, Equatable {
     var model: String
     var apiKeySet: Bool
     var extraBody: String
+    /// In tokens, or nil when unknown. Absent on a daemon from before model capabilities.
+    var contextWindow: Int? = nil
+    /// Absent on a daemon from before model capabilities, which sent images to every model.
+    var vision: Bool? = nil
     var isDefault: Bool
     var isBackup: Bool
     var createdAt: Int
+
+    var seesImages: Bool { vision ?? true }
 }
 
 /// `POST /api/models` needs name, providerId and model; `PUT /api/models/:id` keeps what is left out.
+/// `contextWindow` is doubly optional: `nil` leaves it out, `.some(nil)` sends `null`, which clears it.
 struct ModelUpdate: Encodable, Sendable, Equatable {
     var name: String? = nil
     var providerId: Int? = nil
     var model: String? = nil
     var extraBody: String? = nil
+    var contextWindow: Int?? = nil
+    var vision: Bool? = nil
+
+    private enum Keys: String, CodingKey { case name, providerId, model, extraBody, contextWindow, vision }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: Keys.self)
+        try container.encodeIfPresent(name, forKey: .name)
+        try container.encodeIfPresent(providerId, forKey: .providerId)
+        try container.encodeIfPresent(model, forKey: .model)
+        try container.encodeIfPresent(extraBody, forKey: .extraBody)
+        if let contextWindow {
+            if let contextWindow { try container.encode(contextWindow, forKey: .contextWindow) }
+            else { try container.encodeNil(forKey: .contextWindow) }
+        }
+        try container.encodeIfPresent(vision, forKey: .vision)
+    }
+}
+
+/// The owner's clock and how long agent screenshots are kept. Both are absent on an older daemon.
+struct GeneralSettings: Sendable, Equatable {
+    var timezone: String?
+    var imageRetentionDays: Int?
+}
+
+struct GeneralSettingsUpdate: Codable, Sendable {
+    var timezone: String? = nil
+    var imageRetentionDays: Int? = nil
+}
+
+/// One signed-in client. `handle` names it for a revoke; the session id itself is the cookie and
+/// is never sent.
+struct SessionEntry: Codable, Sendable, Identifiable, Equatable {
+    var handle: String
+    var createdAt: Int
+    var lastSeenAt: Int?
+    var userAgent: String?
+    var current: Bool
+
+    var id: String { handle }
+}
+
+struct PasswordChanged: Codable, Sendable {
+    /// How many other sessions the change signed out.
+    var signedOut: Int
+}
+
+struct TotpStatus: Codable, Sendable, Equatable {
+    var enabled: Bool
+    var pending: Bool
+    var recoveryCodesLeft: Int
+}
+
+struct TotpSetup: Codable, Sendable, Equatable {
+    /// Base32, for typing into an authenticator by hand.
+    var secret: String
+    var uri: String
+}
+
+struct TotpConfirmed: Codable, Sendable {
+    /// Shown once: the daemon keeps only their hashes.
+    var recoveryCodes: [String]
+}
+
+enum AuditAction: String, Codable, Sendable, TolerantEnum {
+    case setup
+    case login
+    case login_failed
+    case logout
+    case password_changed
+    case password_change_failed
+    case session_revoked
+    case totp_enabled
+    case totp_disabled
+    case recovery_code_used
+    case settings_changed
+    case provider_changed
+    case model_changed
+    case mcp_changed
+    case rules_changed
+    case unknown
+}
+
+struct AuditEvent: Codable, Sendable, Identifiable, Equatable {
+    var id: Int
+    var at: Int
+    var action: AuditAction
+    var ip: String?
+    var userAgent: String?
+    var detail: [String: JSONValue]?
 }
 
 struct WebSettings: Codable, Sendable {
@@ -92,7 +189,7 @@ struct PushTestResult: Codable, Sendable {
 }
 
 struct McpServerSummary: Codable, Sendable {
-    enum Transport: String, Codable, Sendable { case stdio, http }
+    enum Transport: String, Codable, Sendable, TolerantEnum { case stdio, http, unknown }
     var name: String
     var transport: Transport
     var command: String?
@@ -111,9 +208,24 @@ struct McpTestResult: Codable, Sendable {
 /// it has read one.
 struct ApiError: Codable, Sendable {
     var error: String
+    /// On a login's 401: the password was right and a code has to go with it.
+    var totpRequired: Bool?
 }
 
-enum AgentState: String, Codable, CaseIterable, Sendable {
+/// A raw-value enum the daemon sends, decoded so that a value a newer daemon adds becomes
+/// `unknown` instead of failing the whole page it arrived in.
+nonisolated protocol TolerantEnum: RawRepresentable, Decodable where RawValue == String {
+    static var unknown: Self { get }
+}
+
+nonisolated extension TolerantEnum {
+    init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = Self(rawValue: raw) ?? .unknown
+    }
+}
+
+enum AgentState: String, Codable, CaseIterable, Sendable, TolerantEnum {
     case idle
     case thinking
     case using_computer
@@ -123,6 +235,7 @@ enum AgentState: String, Codable, CaseIterable, Sendable {
     case waiting_for_task_worker
     case failed
     case completed
+    case unknown
 }
 
 struct LiveReply: Codable, Sendable, Equatable {
@@ -215,6 +328,8 @@ struct ComputerAction: Codable, Sendable {
 struct Base64Image: Codable, Sendable, Hashable {
     var mediaType: String
     var base64: String
+    /// The daemon pruned the bytes past its retention window; `base64` is then empty.
+    var expired: Bool? = nil
 }
 
 /// What `POST .../compact` did: how many rows each agent's new summary stands for. Zero is an
@@ -311,8 +426,8 @@ struct ToolCall: Codable, Sendable, Hashable, Identifiable {
     var arguments: String
 }
 
-enum MessageRole: String, Codable, Sendable {
-    case user, assistant, tool
+enum MessageRole: String, Codable, Sendable, TolerantEnum {
+    case user, assistant, tool, unknown
 }
 
 struct Message: Codable, Sendable, Identifiable, Hashable {
@@ -328,8 +443,8 @@ struct Message: Codable, Sendable, Identifiable, Hashable {
     var createdAt: Int
 }
 
-enum FeedbackRating: String, Codable, Sendable, Hashable {
-    case up, down
+enum FeedbackRating: String, Codable, Sendable, Hashable, TolerantEnum {
+    case up, down, unknown
 }
 
 struct MessageFeedback: Codable, Sendable, Hashable {
@@ -367,7 +482,7 @@ struct Schedule: Codable, Sendable, Identifiable, Hashable {
     var createdAt: Int
 }
 
-enum EventType: String, Codable, Sendable {
+enum EventType: String, Codable, Sendable, TolerantEnum {
     case tool_call
     case tool_result
     case state
@@ -378,6 +493,7 @@ enum EventType: String, Codable, Sendable {
     case approval
     case stop
     case turn
+    case unknown
 }
 
 struct ProviderTestResult: Codable, Sendable {
@@ -461,11 +577,14 @@ struct SearchAnswer: Decodable, Sendable, Hashable {
     var hits: [SearchResult]
 }
 
-enum ApprovalKind: String, Codable, Sendable {
+enum ApprovalKind: String, Codable, Sendable, TolerantEnum {
     case agent
     case conversation
     /// Anything else the agent wants to do first: spend, send, install, share.
     case action
+
+    /// A kind a newer daemon adds is something to ask about, never a deletion to confirm.
+    static var unknown: ApprovalKind { .action }
 }
 
 /// A destructive change an agent has asked for and the owner has not answered yet. Nothing is
@@ -480,8 +599,6 @@ struct Approval: Codable, Sendable, Identifiable, Hashable {
     var target: String
     var amount: String?
     var origin: String?
-    /// The agents in the thread a `conversation` request names. Empty for an `agent` request.
-    var participants: [String]
     var reason: String
     var createdAt: Int
     /// The `request_approval` or `request_deletion` call that asked, which places it in the thread.
@@ -784,8 +901,8 @@ enum TriggerKind: Hashable, Sendable, Codable {
     }
 }
 
-enum TriggerState: String, Codable, Sendable {
-    case proposed, on, off
+enum TriggerState: String, Codable, Sendable, TolerantEnum {
+    case proposed, on, off, unknown
 }
 
 enum TriggerAction: String, Codable, Sendable {

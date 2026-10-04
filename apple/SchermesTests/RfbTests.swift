@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import SwiftUI
 import Synchronization
 import Testing
 import zlib
@@ -149,11 +150,13 @@ private func gradientPixels(_ count: Int) -> [UInt8] {
 private struct Played {
     var frames: [CGImage]
     var written: [Data]
+    var cuts: [String] = []
 }
 
-private func play(_ stream: Data) async -> Played {
-    let server = CannedServer(stream)
+private func play(_ stream: Data, holding: Bool = false, chunk: Int = 7) async -> Played {
+    let server = CannedServer(stream, chunk: chunk)
     let client = RfbClient(transport: server)
+    if holding { await client.hold(true) }
     async let collected: [CGImage] = {
         var frames: [CGImage] = []
         for await event in client.events {
@@ -161,8 +164,13 @@ private func play(_ stream: Data) async -> Played {
         }
         return frames
     }()
+    async let cuts: [String] = {
+        var cuts: [String] = []
+        for await text in client.cuts { cuts.append(text) }
+        return cuts
+    }()
     await client.run()
-    return Played(frames: await collected, written: server.written)
+    return Played(frames: await collected, written: server.written, cuts: await cuts)
 }
 
 /// Reads a pixel back out of the finished image as blue, green, red — the framebuffer's own order.
@@ -317,6 +325,7 @@ private func pixel(_ image: CGImage, _ x: Int, _ y: Int) -> [UInt8] {
     stream.append(Data([3, 0, 0, 0] + be32(2) + Array("hi".utf8))) // ServerCutText.
 
     let played = await play(stream)
+    #expect(played.cuts.isEmpty) // The desktop's clipboard is not surfaced to a watcher.
 
     // The handshake writes three raw replies of its own; after those, every message a client with
     // no hold is allowed to send is SetPixelFormat, SetEncodings or FramebufferUpdateRequest.
@@ -397,3 +406,227 @@ private func pixel(_ image: CGImage, _ x: Int, _ y: Int) -> [UInt8] {
     #expect(Array(server.written[2]) == [5, 0, 0, 7, 0, 9])
     #expect(Array(server.written[3]) == [4, 0, 0, 0, 0, 0, 0xff, 0xe3])
 }
+
+// MARK: - Clipboard
+
+private func serverCutText(_ bytes: [UInt8]) -> Data {
+    Data([3, 0, 0, 0] + be32(bytes.count) + bytes)
+}
+
+@Test func theDesktopsClipboardReachesAViewerThatHoldsItAsLatin1() async throws {
+    var stream = greeting(width: 4, height: 2)
+    stream.append(serverCutText([0x63, 0x61, 0x66, 0xe9, 0x0a, 0x21])) // "café\n!" in Latin-1.
+    stream.append(update([rect(0, 0, 4, 2, 0, gradient(8))]))
+
+    let played = await play(stream, holding: true)
+
+    #expect(played.cuts == ["café\n!"])
+    #expect(played.frames.count == 1) // Still in step after it.
+}
+
+@Test func anAbsurdlyLongCutTextIsSteppedOverWithoutLosingTheStream() async throws {
+    var stream = greeting(width: 4, height: 2)
+    stream.append(Data([3, 0, 0, 0] + be32(maxCutText + 1)))
+    stream.append(Data(repeating: 0x41, count: maxCutText + 1))
+    stream.append(update([rect(0, 0, 4, 2, 0, gradient(8))]))
+
+    let played = await play(stream, holding: true, chunk: 4096)
+
+    #expect(played.cuts.isEmpty)
+    let screen = try #require(played.frames.last)
+    #expect(pixel(screen, 3, 1) == [21, 22, 23])
+}
+
+@Test func aLengthNoDesktopCouldSendIsDroppedRatherThanAllocated() async throws {
+    // Four gigabytes announced and a stream that ends: the client reads until the socket closes and
+    // never tries to hold the whole of it.
+    var stream = greeting(width: 4, height: 2)
+    stream.append(Data([3, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]))
+    stream.append(Data(repeating: 0, count: 64))
+
+    let played = await play(stream, holding: true)
+    #expect(played.cuts.isEmpty)
+}
+
+@Test func pastingSendsTheOwnersClipboardThenControlV() async throws {
+    let server = CannedServer(Data())
+    let client = RfbClient(transport: server)
+    await client.hold(true)
+
+    await client.paste("hé\r\nyo")
+
+    #expect(server.written.count == 5)
+    #expect(Array(server.written[0]) == [6, 0, 0, 0] + be32(5) + [0x68, 0xe9, 0x0a, 0x79, 0x6f])
+    #expect(Array(server.written[1]) == [4, 1, 0, 0, 0, 0, 0xff, 0xe3]) // Control down.
+    #expect(Array(server.written[2]) == [4, 1, 0, 0, 0, 0, 0, 0x76])    // v down.
+    #expect(Array(server.written[3]) == [4, 0, 0, 0, 0, 0, 0, 0x76])    // v up.
+    #expect(Array(server.written[4]) == [4, 0, 0, 0, 0, 0, 0xff, 0xe3]) // Control up.
+}
+
+@Test func aPasteOrShortcutWithoutTheDesktopWritesNothing() async throws {
+    let server = CannedServer(Data())
+    let client = RfbClient(transport: server)
+
+    await client.paste("secret")
+    await client.shortcut(0x63)
+
+    #expect(server.written.isEmpty)
+}
+
+@Test func aPasteTooLongToCarryIsNotPastedAtAll() async throws {
+    let server = CannedServer(Data())
+    let client = RfbClient(transport: server)
+    await client.hold(true)
+
+    let long = String(repeating: "a", count: maxCutText + 1)
+    #expect(!RfbClient.canCarry(long))
+    #expect(RfbClient.canCarry(String(repeating: "a", count: maxCutText)))
+    await client.paste(long)
+
+    // No Control+V either: the agent would paste its own clipboard instead.
+    #expect(server.written.isEmpty)
+}
+
+@Test func aCommandShortcutGoesAsAControlChord() async throws {
+    let server = CannedServer(Data())
+    let client = RfbClient(transport: server)
+    await client.hold(true)
+
+    await client.shortcut(try #require(Keysym.controlShortcut("c", shift: false)))
+
+    #expect(server.written.map(Array.init) == [
+        [4, 1, 0, 0, 0, 0, 0xff, 0xe3],
+        [4, 1, 0, 0, 0, 0, 0, 0x63],
+        [4, 0, 0, 0, 0, 0, 0, 0x63],
+        [4, 0, 0, 0, 0, 0, 0xff, 0xe3],
+    ])
+}
+
+@Test func onlyTheEditingCommandChordsBecomeControl() {
+    #expect(Keysym.controlShortcut("c", shift: false) == 0x63)
+    #expect(Keysym.controlShortcut("v", shift: false) == 0x76)
+    #expect(Keysym.controlShortcut("x", shift: false) == 0x78)
+    #expect(Keysym.controlShortcut("a", shift: false) == 0x61)
+    #expect(Keysym.controlShortcut("z", shift: false) == 0x7a)
+    // Redo: the capital, since Xvnc fits Shift to the keysym and a small z would lift it.
+    #expect(Keysym.controlShortcut("Z", shift: true) == 0x5a)
+    #expect(Keysym.controlShortcut("z", shift: true) == 0x5a)
+    #expect(Keysym.controlShortcut("V", shift: false) == 0x76)
+    for other: Character in ["q", "w", "t", ",", "`", "1"] {
+        #expect(Keysym.controlShortcut(other, shift: false) == nil)
+    }
+    #expect(Keysym.isPaste(0x76) && Keysym.isPaste(0x56) && !Keysym.isPaste(0x63))
+}
+
+@Test func textLatin1CannotCarryIsReplacedNotCrashedOn() {
+    #expect(latin1Bytes("é") == [0xe9])
+    #expect(latin1Bytes("e\u{301}") == [0xe9])          // A combining accent, composed first.
+    #expect(latin1Bytes("5 €") == [0x35, 0x20, 0x3f])
+    #expect(latin1Bytes("a👨‍👩‍👧b") == [0x61, 0x3f, 0x62]) // One mark for the whole emoji.
+    #expect(latin1Bytes("1\r\n2\r3\n") == [0x31, 0x0a, 0x32, 0x0a, 0x33, 0x0a])
+    #expect(latin1Text([0x63, 0xe9, 0xff]) == "cé\u{ff}")
+}
+
+private final class FakeClipboard: Clipboard {
+    var text: String?
+    var written: [String] = []
+    init(_ text: String?) { self.text = text }
+    func put(_ text: String) { written.append(text) }
+}
+
+@Test func aPasteTheDesktopCannotCarrySaysSoAndOneItCanSaysNothing() {
+    let long = DesktopLink(clipboard: FakeClipboard(String(repeating: "a", count: maxCutText + 1)))
+    #expect(long.pasteClipboard()?.contains("256 KB") == true)
+
+    #expect(DesktopLink(clipboard: FakeClipboard("hello")).pasteClipboard() == nil)
+    #expect(DesktopLink(clipboard: FakeClipboard(nil)).pasteClipboard() == nil) // A bare Ctrl+V.
+}
+
+#if os(macOS)
+
+/// Through the hosting view the way AppKit asks, so a SwiftUI layer that stopped forwarding key
+/// equivalents to the input view would show up here and not only on a real desktop. Never ordered
+/// front: a direct call, no posted event, no focus taken.
+@Test func commandChordsReachTheDesktopAsControlAndTheMenuKeepsTheRest() throws {
+    var sent: [DesktopInputEvent] = []
+    let host = NSHostingView(rootView: DesktopInput { sent.append($0) })
+    host.sizingOptions = []
+    host.frame = CGRect(x: 0, y: 0, width: 200, height: 120)
+    let container = NSView(frame: host.frame)
+    container.addSubview(host)
+    let window = NSWindow(
+        contentRect: CGRect(x: -30000, y: -30000, width: 200, height: 120),
+        styleMask: [.borderless], backing: .buffered, defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.contentView = container
+    defer { window.close() }
+    host.layoutSubtreeIfNeeded()
+
+    func find(_ view: NSView) -> DesktopInputNSView? {
+        if let input = view as? DesktopInputNSView { return input }
+        return view.subviews.lazy.compactMap(find).first
+    }
+    let input = try #require(find(container))
+    #expect(window.makeFirstResponder(input))
+
+    func chord(_ characters: String, _ flags: NSEvent.ModifierFlags, keyCode: UInt16) -> Bool {
+        let event = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: characters,
+            charactersIgnoringModifiers: characters, isARepeat: false, keyCode: keyCode
+        )!
+        return container.performKeyEquivalent(with: event)
+    }
+
+    #expect(chord("c", .command, keyCode: 8))
+    #expect(chord("Z", [.command, .shift], keyCode: 6))
+    #expect(!chord("q", .command, keyCode: 12))
+    #expect(!chord("c", [.command, .control], keyCode: 8))
+
+    let shortcuts = sent.compactMap { event -> UInt32? in
+        if case .shortcut(let keysym) = event { keysym } else { nil }
+    }
+    #expect(shortcuts == [0x63, 0x5a])
+    #expect(sent.count == 2)
+}
+
+/// Each move to a window used to add one more resign-key observer and never drop the last, so the
+/// window the view had left could still let go of keys held in the one it was in.
+@Test func onlyTheInputViewsCurrentWindowLetsGoOfItsKeys() throws {
+    func offscreen() -> NSWindow {
+        let window = NSWindow(
+            contentRect: CGRect(x: -30000, y: -30000, width: 200, height: 120),
+            styleMask: [.borderless], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        return window
+    }
+    let first = offscreen()
+    let second = offscreen()
+    defer { first.close(); second.close() }
+
+    var sent: [DesktopInputEvent] = []
+    let input = DesktopInputNSView(frame: CGRect(x: 0, y: 0, width: 200, height: 120))
+    input.send = { sent.append($0) }
+    first.contentView?.addSubview(input)
+    input.removeFromSuperview()
+    second.contentView?.addSubview(input)
+
+    let press = try #require(NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+        windowNumber: second.windowNumber, context: nil, characters: "a",
+        charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0
+    ))
+    input.keyDown(with: press)
+    func released() -> Bool {
+        sent.contains { if case .key(_, down: false) = $0 { true } else { false } }
+    }
+
+    NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: first)
+    #expect(!released())
+    NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: second)
+    #expect(released())
+}
+
+#endif

@@ -79,13 +79,19 @@ struct SchermesApp: App {
 
     /// Lifted out of `RootView` because the Mac's desktop windows and menu bar panel are scenes of
     /// their own and need the same one.
-    @State private var session = Session()
+    @State private var session: Session
     /// Up here for the same reason: the Mac's desktop windows are a scene of their own.
-    @State private var looks = AgentLooks()
+    @State private var looks: AgentLooks
     @State private var desktops = Desktops()
-    #if os(macOS)
-    @State private var feed = MenuBarFeed()
-    #endif
+    @State private var feed: AgentFeed
+
+    init() {
+        let session = Session()
+        let looks = AgentLooks()
+        _session = State(initialValue: session)
+        _looks = State(initialValue: looks)
+        _feed = State(initialValue: AgentFeed(session: session, looks: looks))
+    }
 
     var body: some Scene {
         WindowGroup(id: consoleWindowID) {
@@ -93,6 +99,7 @@ struct SchermesApp: App {
                 RootView(session: session)
                     .environment(looks)
                     .environment(desktops)
+                    .environment(feed)
                     .tint(Theme.ink)
             }
         }
@@ -128,6 +135,7 @@ struct SchermesApp: App {
                 DesktopWindow(session: session, name: name)
                     .environment(looks)
                     .environment(desktops)
+                    .environment(feed)
                     .tint(Theme.ink)
             }
         }

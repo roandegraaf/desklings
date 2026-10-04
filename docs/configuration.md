@@ -13,7 +13,7 @@ is an APNs key file that cannot be read or is not a `.p8`: that is a log line, a
 | `SCHERMES_PORT`        | `7777`              | The one port schermes exposes. Must be 1–65535.               |
 | `SCHERMES_DATA_DIR`    | `/var/lib/schermes` | Holds `schermes.db`, `master.key` and `desktops/`.            |
 | `SCHERMES_GEOMETRY`    | `1920x1200`         | Desktop size. The model sees it shrunk to fit 1280x800.        |
-| `SCHERMES_MAX_LOOPS`   | `8`                 | Concurrent agent turns. A request above it gets a 429.         |
+| `SCHERMES_MAX_LOOPS`   | `8`                 | Concurrent agent turns. A turn above it waits in a queue.      |
 | `SCHERMES_MAX_WORKERS` | `4`                 | Concurrent task workers, counted across all parents.           |
 | `SCHERMES_APNS_KEY_FILE` | unset             | An APNs `.p8`, stored encrypted at boot like a pasted one. Empty or missing is no key. |
 | `SCHERMES_APNS_KEY_ID` | from the file name  | The key id. Needed when the file is not named `AuthKey_<KEYID>.p8`; the daemon refuses to start without one. |
@@ -48,7 +48,21 @@ Only the runnable checks, and only to point themselves at a daemon that is alrea
 | `SCHERMES_SMOKE_PASSWORD`    | `smoke-test-password`    | `infra/smoke.sh`               |
 | `SCHERMES_SMOKE_SECOND_PORT` | `7778`                   | `infra/smoke.sh`, second daemon |
 | `SCHERMES_SMOKE_STUB_PORT`   | `7790`                   | `infra/smoke.sh`, provider stub |
+| `SCHERMES_SETUP_TOKEN`       | read from `docker compose logs` | `infra/smoke.sh`, to claim a fresh daemon off the Docker harness |
 | `SCHERMES_CHECK_PORT`        | `8899`                   | `infra/desktop/check.sh`       |
+
+Two more are internal plumbing, not knobs. The daemon starts `start-desktop.sh` with
+`SCHERMES_STATE_DIR` set to its own `SCHERMES_DATA_DIR`, so the desktop state follows the data
+directory, and `SCHERMES_GEOMETRY` passed through. `infra/install.sh` uses `SCHERMES_HOME` as a
+fixed shell variable (`/var/lib/schermes`), not something it reads from the environment.
+
+## First-run setup token
+
+A daemon with no owner prints a fresh **setup token** at boot, in the log line
+`{"msg":"first-run setup token","code":"…"}`. `POST /api/auth/setup` needs it as `setupToken`
+beside the password and answers 403 without it; the app's setup screen has a field for it. It is
+not configurable and not stored: each boot without an owner prints a new one, and it stops
+existing once the owner is set. See [deployment](deployment.md#docker).
 
 ## Models
 
@@ -62,7 +76,13 @@ owner wants to use.
 | `baseUrl`   | The OpenAI-compatible endpoint, `http` or `https`. Required.                   |
 | `model`     | The model id the endpoint expects. Required.                                   |
 | `apiKey`    | AES-GCM encrypted with the master key, never returned and never logged — the listing answers `apiKeySet` as a boolean. |
-| `extraBody` | An optional JSON object merged under every request: OpenRouter's `provider` routing block, `reasoning`, `max_tokens`. Anything that is not an object is a 400. |
+| `extraBody` | An optional JSON object merged under every request: OpenRouter's `provider` routing block, `reasoning`, `max_tokens`. Anything that is not an object is a 400. A `max_tokens` too low for the work shows up as replies marked "cut off"; a tool call cut off twice in one turn fails it. |
+| `contextWindow` | Optional. The model's context window in **tokens**, a positive integer; `null` (the default) is unknown. Compaction sizes the replay from it; see [Context compaction](#context-compaction). Set it for any model under ~150k tokens, a local one especially. |
+| `vision`    | Whether the model can see images. Default `true`. With `false`, no request to it carries an image: each screenshot or picture the owner sent becomes a line of text saying it is left out and how to read the screen instead. |
+
+Both new fields are optional on `POST` and `PUT /api/models[/:id]`: a body that leaves them out
+(an older app) keeps what is stored, and a new model starts with an unknown window and vision on.
+The app has no controls for them yet; set them through the API.
 
 Which entry runs is two settings and one column, none of them typed by hand; a fourth key is the
 daemon's own:
@@ -70,7 +90,7 @@ daemon's own:
 | Setting / column          | Meaning                                                             |
 | ------------------------- | ------------------------------------------------------------------- |
 | `models.default`          | The id every agent without its own model uses. The first entry created becomes it. |
-| `models.backup`           | Optional. The id a retrying turn may switch to (`POST /api/agents/:name/retry` `{action: "backup"}`). Never the model already running. |
+| `models.backup`           | Optional. The id a retrying turn may switch to (`POST /api/agents/:name/retry` `{action: "backup"}`). Never the model already running, and not offered while its key is recorded as refused. The backup gets a fresh five attempts, and compaction resizes to its context window. |
 | `agents.model_id`         | Per agent, set with `PUT /api/agents/:name/model` `{id}`; `null` means the default. A task worker always runs on its parent's. |
 | `models.authFailed.<id>`  | Written by the daemon, not the owner: the endpoint answered 401 or 403. One Needs you item per model, cleared by a new key, a delete, a passing test or any call that answers. |
 
@@ -92,6 +112,47 @@ write. The app no longer uses them.
 A consequence worth knowing: an empty string is a value. The daemon stores whatever it is
 handed, so a write that includes `apiKey: ""` — on `/api/settings` or `PUT /api/models/:id` —
 erases the stored key. The app omits the field entirely when it is untouched.
+
+### Endpoint notes
+
+The daemon always streams, always sends tools with `tool_choice: "auto"`, and sends back whatever
+an endpoint needs from its earlier replies (see `### The model provider` in
+[architecture.md](architecture.md)). Two local servers need setting up first.
+
+**vLLM.** Tool calling with `tool_choice: "auto"` is off unless the server starts with
+`--enable-auto-tool-choice` and a `--tool-call-parser` that matches the model's family, plus a
+chat template that knows tools when the model's own does not. Without them every request with
+tools is refused.
+
+```sh
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --enable-auto-tool-choice \
+  --tool-call-parser llama3_json \
+  --chat-template examples/tool_chat_template_llama3.1_json.jinja
+```
+
+The parser names (`hermes`, `mistral`, `llama3_json` and others) are listed in vLLM's tool
+calling docs. Set `contextWindow` to the server's `--max-model-len`. Strict Mistral- and
+Llama-style templates refuse two messages of the same role in a row; the daemon already merges
+them, so no template change is needed for that.
+
+**Ollama.** Ollama's OpenAI-compatible `/v1` endpoint has no way to set the context size per
+request, so an `options.num_ctx` in `extraBody` does nothing. Ollama's default context, 4096 tokens
+per its FAQ, is far below what an agent's system prompt and tools take, and a longer prompt may be
+cut short instead of refused, which the daemon cannot see. Raise it on the server, then tell the
+daemon the same number:
+
+- for every model, start the server with `OLLAMA_CONTEXT_LENGTH=32768 ollama serve`; or
+- per model, build a variant from a Modelfile with `PARAMETER num_ctx 32768`
+  (`ollama create mymodel-32k -f Modelfile`) and use that name as `model`.
+
+Then set the model's `contextWindow` to that same value, so compaction keeps the replay inside it.
+The base URL is `http://<host>:11434/v1`, and Ollama takes any non-empty key. Set `vision: false`
+for a model without an image encoder.
+
+**Gemini.** Through `generativelanguage.googleapis.com/v1beta/openai/` (or Vertex AI's OpenAI
+endpoint), or any model whose id contains `gemini`, tool parameters are rewritten to the subset of
+JSON Schema Gemini accepts. The tools still validate their input against the full schema.
 
 ## Web search settings
 
@@ -233,6 +294,10 @@ stop", not because anything reads them from the environment. Changing one is a c
 | `MAX_FULL_OBSERVATIONS`   | 8                  | `daemon/src/loop.ts`      | Tool results carried in full; older ones are cut to 400 chars |
 | `MAX_TRANSCRIPT_CHARS`    | 400 000            | `daemon/src/loop.ts`      | When a thread is compacted: the characters `transcript` would send, screenshots excluded |
 | `COMPACTION_TAIL_CHARS`   | 260 000            | `daemon/src/loop.ts`      | How much of the end of a compacted thread is replayed verbatim behind the summary |
+| `CHARS_PER_TOKEN`         | 3                  | `daemon/src/loop.ts`      | How a model's `contextWindow` in tokens becomes a character budget |
+| `REPLY_RESERVE_TOKENS`    | 8 192              | `daemon/src/loop.ts`      | Window kept free for the reply (a quarter of a smaller window) |
+| `IMAGE_RESERVE_TOKENS`    | 1 600              | `daemon/src/loop.ts`      | Window kept free per replayed image               |
+| `TOOL_SCHEMA_RESERVE_CHARS` | 24 000           | `daemon/src/loop.ts`      | Room for the tool schemas (the built-in ones are ~19 500) |
 | `MAX_AGENT_CHAIN`         | 6                  | `conversations.ts`        | Agent-to-agent messages between owner messages    |
 | `MAX_MESSAGE_CHARS`       | 8 192              | `conversations.ts`        | One message                                       |
 | `MAX_BRIEF_CHARS`         | 4 096              | `daemon/src/workers.ts`   | A task worker's brief                             |
@@ -270,7 +335,12 @@ stop", not because anything reads them from the environment. Changing one is a c
 | `APNS_TOKEN_TTL_MS`       | 50 min             | `daemon/src/push.ts`      | How long one provider JWT is reused; APNs refuses one older than an hour |
 | `MAX_PUSH_BODY_CHARS`     | 200                | `daemon/src/push.ts`      | The body of a push; the thread has the rest       |
 | `MAX_IMAGE_BYTES`         | 5 000 000          | `daemon/src/app.ts`       | A picture the owner sends with a message, decoded |
+| `KEEP_SNAPSHOTS_MS`       | 7 days             | `daemon/src/snapshots.ts` | How old a workspace snapshot may get before it is pruned and no longer offered for a rewind |
+| `KEEP_SNAPSHOTS_COUNT`    | 50                 | `daemon/src/snapshots.ts` | Workspace snapshots one agent keeps; the oldest go first, the newest never |
+| `KEEP_SNAPSHOT_BYTES`     | 2 GiB              | `daemon/src/snapshots.ts` | Disk one agent's snapshots may take, a hard-linked tar counted once; the newest stays even over it |
+| `MAX_IMAGE_RETENTION_DAYS` | 3650              | `daemon/src/settings.ts`  | The largest `imageRetentionDays` the settings accept |
 | `MAX_TRIGGERS`            | 20                 | `daemon/src/triggers.ts`  | Triggers one agent may hold                       |
+| `MAX_API_BODY_BYTES`      | 40 MB              | `daemon/src/app.ts`       | Any request body under `/api`; more is a 413. The largest legitimate one is a 25 MB file upload, base64-encoded |
 | `MAX_HOOK_BYTES`          | 64 KiB             | `daemon/src/triggers.ts`  | One webhook body; more is a 413                   |
 | `MAX_HELPERS`             | 6                  | `daemon/src/goals.ts`     | Helpers one goal may add                          |
 | `MAX_QUESTION_CHARS`      | 300                | `daemon/src/search.ts`    | One `POST /api/search` question                   |
@@ -287,8 +357,9 @@ label, a look or a profile in the row alone. A `name` in the same request moves 
 desktop is stopped, `rename-agent-user.sh` moves the Linux user and its home (`usermod
 --move-home`), every `sender` and approval target spelling the old name is rewritten, and the
 desktop starts again under the new one. It is refused while the agent is in a turn (409), for a
-name another agent holds (409), and when a deleted agent's user still occupies the new name
-(500, from the script). An agent renames itself with `set_name`; the move waits for its turn to
+name another agent holds (409), and when a Linux user or sandbox layer left behind by hand
+still occupies the new name (500, from the script). Deleting an agent removes its user, home
+and layer, so a deleted agent's name is free again. An agent renames itself with `set_name`; the move waits for its turn to
 end, because the turn is running as the old user. Its task workers keep the names they were born
 with.
 
@@ -326,7 +397,28 @@ Chromium debugging port is `9222 + display`, both bound to loopback only. The la
 
 ## Context compaction
 
-Neither constant is a setting either, but they depend on each other and on the trimming above.
+The budget follows the turn's model. With `contextWindow` unknown it is `MAX_TRANSCRIPT_CHARS`
+and `COMPACTION_TAIL_CHARS`. With a window it is
+
+    transcript = (window − min(8 192, window/4) − 3 × 1 600) × 3 − 24 000   characters,
+
+capped at `MAX_TRANSCRIPT_CHARS` (a bigger window is a ceiling, not a target) and floored at
+8 000. The tail keeps the same 65 % share, also capped so that it plus the system text plus the
+summary fit the transcript budget, and a summary is clipped to an eighth of the budget, at most
+`MAX_OBSERVATION_CHARS`. A 32 768-token model therefore compacts at about 35 000 characters. The
+summariser's own input is clipped to the transcript budget, and the context fullness on
+`GET /api/agents` is measured against it.
+
+A 400 or 413 whose body says the context length was exceeded (OpenAI's
+`context_length_exceeded`, "maximum context length", "prompt is too long" and the like) compacts
+once more within the turn, to a quarter of each budget, and asks the same step again. A second
+overflow in the same turn fails it, as any other rejected request does.
+
+After "Use backup model" the budget is the backup's: the next step compacts to its window first
+when the replay no longer fits. Summariser calls count as the turn's tokens, in the `turn` event
+and against an idle pass's daily budget. The owner's `/compact` is logged instead.
+
+These constants are not settings either. They depend on each other and on the trimming above.
 `COMPACTION_TAIL_CHARS` has to clear what no cut can remove — the last `MAX_FULL_OBSERVATIONS`
 tool results, each of which `describe` may have clipped stdout *and* stderr to
 `MAX_OBSERVATION_CHARS` — or compaction fires every turn and shrinks nothing. Raising
@@ -336,7 +428,7 @@ Screenshot bytes are deliberately not counted towards `MAX_TRANSCRIPT_CHARS`:
 `MAX_REPLAYED_IMAGES` already bounds them, and counting them would put every desktop-driving
 agent permanently over a budget compaction cannot bring it back under.
 
-A summary is stored clipped to `MAX_OBSERVATION_CHARS`, like any other text the transcript
+A summary is stored clipped to at most `MAX_OBSERVATION_CHARS`, like any other text the transcript
 carries, so a model that answers with the whole conversation back cannot grow the requests the
 feature exists to shrink.
 
@@ -363,9 +455,28 @@ once per tick rather than once per second.
 A schedule the tick drops because its cron ran out of runs records a `schedule_dropped` event,
 which is the owner's only trace of it: the row itself is gone from the list.
 
-Cron expressions are resolved in the **daemon's local time**, which in the container is whatever
-`TZ` says and UTC by default. The daily note's `<date>` is UTC, so the two can disagree by a few
-hours on a host that sets `TZ`; neither is configurable and the schedule is the one that matters.
+Cron expressions are resolved in the **owner's timezone**, the `timezone` field of
+`PUT /api/settings`: an IANA name such as `Europe/Amsterdam`, refused with a 400 unless both the
+runtime and the cron library know it. Unset, it is the daemon's local zone, which in the container
+is whatever `TZ` says and UTC by default. Schedules follow DST: `0 9 * * *` stays 09:00 local on
+both sides of the change. Changing the zone moves every unpaused schedule's next run at once.
+The idle window and the idle budget's day use the same zone. The daily note's `<date>` is UTC,
+so it can disagree with the owner's day by a few hours.
+
+| Field      | What it is |
+| ---------- | ---------- |
+| `timezone` | IANA zone for schedules, the idle window and the idle budget's day. Default: the daemon's own zone. Set in the app under Settings ▸ Daemon. |
+
+## Screenshot retention
+
+Message pictures are files under `$SCHERMES_DATA_DIR/images/`, one per distinct picture. Agent
+screenshots older than `imageRetentionDays` are deleted every hour. Each one then reads as
+"screenshot expired", to the app and to the agent. Pictures the owner sent, and a recording's
+picture, are never deleted.
+
+| Field                | What it is |
+| -------------------- | ---------- |
+| `imageRetentionDays` | Days an agent screenshot is kept, `PUT /api/settings`. A whole number from 0 to 3650; 0 keeps every screenshot. Default 30. Set in the app under Settings ▸ Daemon. |
 
 ## Search and OCR
 
@@ -377,7 +488,8 @@ text in stored screenshots and pictures.
 That text comes from **`tesseract`**, which `infra/install.sh` installs as `tesseract-ocr` (with
 English data only, Debian's default). The indexer checks `command -v tesseract` on every pass; when
 it is missing, OCR is skipped entirely and nothing is marked as read, so installing it later picks
-up every old picture. A few pictures are read per pass, newest first.
+up every old picture. A few pictures are read per pass, newest first. An expired screenshot is
+skipped, and text read from it before it expired stays searchable.
 
 ## Triggers and the webhook URL
 
@@ -411,7 +523,8 @@ path can read it and fire the trigger.
 
 **The rate cap is the agent's to propose**: `maxPerHour` defaults to 6 and may not exceed 60. A
 folder or command check runs every `everyMinutes` (default 5, at most 1 440), on the schedules'
-30-second tick.
+30-second tick. Due checks run at once, each limited to 45 seconds, so a mail server that never
+answers costs only its own trigger a `lastError`.
 
 ## Per-agent settings in the app
 
@@ -422,7 +535,7 @@ row rather than in `settings`. What they do at runtime is in [architecture](arch
 | ------------------- | ------------------------------------ | ------------------------------------------ |
 | Model               | `PUT /api/agents/:name/model`        | The registry's default                     |
 | Rules               | `GET`/`PUT /api/agents/:name/rules`  | Browse, run commands, write files: on its own. Send messages: if pre-approved. Delete, spend, install, share outside: ask first. Passwords and security: always "Hand to you", not changeable |
-| When idle           | `GET`/`PUT /api/agents/:name/idle`   | Off; 01:00–06:00 daemon local time, 200 000 tokens a day, 20 model calls a turn, the agent's own model |
+| When idle           | `GET`/`PUT /api/agents/:name/idle`   | Off; 01:00–06:00 in the owner's timezone, 200 000 tokens a day, 20 model calls a turn, the agent's own model |
 | Routines and triggers | `/api/agents/:name/schedules`, `/api/agents/:name/triggers`, `POST /api/triggers/:id` | None |
 
 Task workers have none of these: they run on their parent's model and under its rules. Idle work

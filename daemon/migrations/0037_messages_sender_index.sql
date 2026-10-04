@@ -1,0 +1,1 @@
+CREATE INDEX `messages_sender_idx` ON `messages` (`sender`);

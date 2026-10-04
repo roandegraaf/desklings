@@ -7,14 +7,16 @@ import SwiftUI
 struct ConsoleView: View {
     let session: Session
 
-    @State private var agents: [Agent] = []
     @State private var goals: [Goal] = []
     /// The newest message of each thread, keyed by `ThreadSource.key`.
     @State private var previews: [String: Message] = [:]
     @State private var selection: SidebarPick?
     @State private var openWorkers: Set<String> = []
     @State private var query = ""
+    /// Why the last refresh failed, cleared by the next one that works.
     @State private var trouble: String?
+    /// An action that failed, kept until the owner dismisses it.
+    @State private var failure: String?
     @State private var creating = false
     /// The settings sheet, and the page it opens on: none for the gear, Models for a refused key.
     @State private var settingsOpen: SettingsRequest?
@@ -27,8 +29,6 @@ struct ConsoleView: View {
     @State private var inspecting = true
     /// The file open beside the chat, if any. One per console: switching threads closes it.
     @State private var artifacts = Artifacts()
-    /// Everything waiting on the owner. The sidebar count and the page both read this one list.
-    @State private var needs: [NeedsYouItem] = []
     /// The form item whose sheet is up, and the item whose screen to take once it is down.
     @State private var filling: NeedsYouItem?
     @State private var screenAfterForm: NeedsYouItem?
@@ -92,7 +92,7 @@ struct ConsoleView: View {
             switch self {
             case .agent(let agent):
                 let workers = agent.parentId == nil ? "its task workers, " : ""
-                return "This takes \(workers)its threads, its routines and everything it has said, and cannot be undone. Its files on the machine stay."
+                return "This takes \(workers)its threads, its routines, everything it has said, and its computer: its files, memory, browser profile and installed software. It cannot be undone."
             }
         }
     }
@@ -101,10 +101,18 @@ struct ConsoleView: View {
     @Environment(Unread.self) private var unread
     @Environment(PushRegistration.self) private var registration
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(AgentFeed.self) private var feed
 
-    /// A Mac window stays `.active` behind other apps, so there it also takes the app being in front.
+    private var agents: [Agent] { feed.agents }
+    /// Everything waiting on the owner. The sidebar count and the page both read this one list.
+    private var needs: [NeedsYouItem] { feed.needs }
+
+    /// A Mac window stays `.active` behind other apps and under other windows, so there it also
+    /// takes the app being in front and the window being visible.
     @State private var frontmost = true
-    private var awake: Bool { scenePhase == .active && frontmost }
+    @State private var windowVisible = true
+    private var pollPhase: PollPhase { .of(scene: scenePhase, frontmost: frontmost, visible: windowVisible) }
+    private var awake: Bool { pollPhase == .active }
 
     /// The owner is at this device: the app in front on a phone, any input in the last two
     /// minutes on a Mac, whose banners then stand in for the phone's pushes.
@@ -166,7 +174,7 @@ struct ConsoleView: View {
         switch picked {
         case .agent(let name):
             guard let agent = agents.first(where: { $0.name == name }) else { return nil }
-            return .agent(agent)
+            return ChatThread(agent: agent)
         case .conversation, nil:
             return nil
         }
@@ -174,16 +182,18 @@ struct ConsoleView: View {
 
     var body: some View {
         split
-        // Keyed by the scene phase: a window nobody is looking at asks less often, and what it
-        // finds is announced rather than drawn. On iOS the process is suspended anyway; on a Mac
-        // this is what lets a turn finishing behind another app reach the owner.
-        .task(id: awake) {
-            while !Task.isCancelled {
-                await refresh()
-                try? await Task.sleep(for: .seconds(awake ? 2 : 10))
+        .environment(\.pollPhase, pollPhase)
+        // Keyed by the phase: a window nobody is looking at asks less often, and what it finds is
+        // announced rather than drawn. An iPhone in the background stops; on a Mac this is what
+        // lets a turn finishing behind another app reach the owner.
+        .task(id: pollPhase) {
+            await session.poll(every: .seconds(2), pollPhase, failed: noteRefreshFailure) {
+                try await load(ifOlderThan: .seconds(1))
             }
         }
+        .onDisappear { feed.attending = false }
         #if os(macOS)
+        .background(WindowVisibility { windowVisible = $0 })
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in frontmost = true }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in frontmost = false }
         #endif
@@ -362,6 +372,10 @@ struct ConsoleView: View {
         .scrollContentBackground(.hidden)
         .background(Theme.ground)
         #endif
+        // With room the detail beside it shows the banner; on a phone this is a screen of its own.
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if !roomy { TroubleBanner(session: session, failure: $failure, stale: trouble) }
+        }
         .navigationTitle("Agents")
         #if os(iOS)
         .navigationBarTitleDisplayMode(roomy ? .inline : .large)
@@ -376,7 +390,7 @@ struct ConsoleView: View {
                 ContentUnavailableView(
                     "No agents yet",
                     systemImage: "person.crop.circle.badge.plus",
-                    description: Text(trouble ?? "Create one to start talking.")
+                    description: Text(trouble ?? unreachable ?? "Create one to start talking.")
                 )
             } else if visible.isEmpty && answer == nil && !asking && searchTrouble == nil {
                 ContentUnavailableView.search(text: query)
@@ -461,7 +475,7 @@ struct ConsoleView: View {
         }
         #if os(macOS)
         .sheet(isPresented: $launchMenuBar) {
-            MenuBarPanel(session: session, looks: looks, feed: MenuBarFeed())
+            MenuBarPanel(session: session, looks: looks, feed: feed)
         }
         #endif
         #endif
@@ -469,7 +483,7 @@ struct ConsoleView: View {
             if let form = item.form {
                 FormSheet(agent: titles(agents)[item.agent] ?? item.agent, form: form) { fill in
                     try await session.run { try await $0.fillForm(agent: item.agent, id: form.id, fill: fill) }
-                    needs.removeAll { $0.id == item.id }
+                    feed.drop(item.id)
                     await refresh()
                 } onScreen: {
                     screenAfterForm = item
@@ -655,15 +669,13 @@ struct ConsoleView: View {
                     ContentUnavailableView("No such goal", systemImage: "flag", description: Text("It may have been deleted."))
                 }
             } else if let thread {
-                // Mounted fresh per thread, as the web UI keys its Chat by source: without this
-                // SwiftUI keeps one view across a switch and a half-typed draft goes to whichever
-                // thread the sidebar lands on next. A group thread carries the name of one of its
-                // members, so the source rather than the name is what has to be the identity.
+                // Mounted fresh per thread: without this SwiftUI keeps one view across a switch and
+                // a half-typed draft goes to whichever thread the sidebar lands on next.
                 ChatView(
                     session: session,
                     thread: thread,
                     inspector: roomy ? $inspecting : nil,
-                    workers: thread.only.map { activeWorkers(of: $0, in: agents) } ?? [],
+                    workers: activeWorkers(of: thread.agent, in: agents),
                     forms: needs.filter { $0.form != nil },
                     requests: needs.filter { $0.approval != nil },
                     onAct: { item, action in await act(item, action) },
@@ -674,7 +686,7 @@ struct ConsoleView: View {
                         picked = .agent(worker.name)
                     },
                     focus: focusedMessage(in: thread.source),
-                    onOpenSettings: { if let name = thread.only?.name { selection = .agentSettings(name) } }
+                    onOpenSettings: { selection = .agentSettings(thread.agent.name) }
                 )
                     .id("\(thread.source.key)#\(focusedMessage(in: thread.source) ?? 0)")
                     .environment(artifacts)
@@ -687,6 +699,9 @@ struct ConsoleView: View {
                     description: Text("Pick an agent, or create one.")
                 )
             }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            TroubleBanner(session: session, failure: $failure, stale: trouble)
         }
         #if os(macOS)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -739,11 +754,11 @@ struct ConsoleView: View {
         #endif
     }
 
-    /// The picked agent's screen and routines. A shared thread has several agents and a task worker
-    /// has no desktop, so neither has anything to show here.
+    /// The picked agent's screen and routines. A task worker has no desktop, so it has nothing to
+    /// show here.
     private var inspector: some View {
         Group {
-            if let agent = thread?.only, agent.parentId == nil {
+            if let agent = thread?.agent, agent.parentId == nil {
                 AgentInspector(
                     session: session,
                     agent: agent,
@@ -758,7 +773,7 @@ struct ConsoleView: View {
                 ContentUnavailableView(
                     "No screen",
                     systemImage: "display",
-                    description: Text("An agent's screen and routines show here. Shared threads and task workers have neither.")
+                    description: Text("An agent's screen and routines show here. A task worker has neither.")
                 )
             }
         }
@@ -793,10 +808,10 @@ struct ConsoleView: View {
                 try await session.run {
                     try await $0.decide(approval: approval.id, approve: action != .deny, always: action == .always)
                 }
-                needs.removeAll { $0.id == item.id }
+                feed.drop(item.id)
                 await refresh()
             } catch {
-                if !error.isCancellation { trouble = error.localizedDescription }
+                if !error.isCancellation { failure = error.localizedDescription }
             }
         case .retry:
             guard await retry(item) else { return await open(item) }
@@ -806,10 +821,10 @@ struct ConsoleView: View {
         case .restartBrowser, .restartDesktop:
             do {
                 try await session.run { try await $0.restartBrowser(agent: item.agent, desktop: action == .restartDesktop) }
-                needs.removeAll { $0.id == item.id }
+                feed.drop(item.id)
                 await refresh()
             } catch {
-                if !error.isCancellation { trouble = error.localizedDescription }
+                if !error.isCancellation { failure = error.localizedDescription }
             }
         case .screen:
             await open(item)
@@ -821,7 +836,7 @@ struct ConsoleView: View {
             do {
                 _ = try await session.run { try await $0.setControl(agent: item.agent, held: true) }
             } catch {
-                if !error.isCancellation { trouble = error.localizedDescription }
+                if !error.isCancellation { failure = error.localizedDescription }
                 return
             }
             await open(item)
@@ -854,22 +869,23 @@ struct ConsoleView: View {
         var loaded: [Message] = []
         var before = failure + 1
         // A failed turn can run to hundreds of rows, more than a page, before its prompt.
-        for _ in 0..<5 {
-            guard let page = try? await session.run({
-                try await $0.messages(source, window: MessageWindow(before: before, limit: 200, images: false))
-            }) else { return false }
-            loaded = page + loaded
-            if page.count < 200 || page.contains(where: { $0.role == .user }) { break }
-            before = page[0].id
-        }
-        guard let later = try? await session.run({
-            try await $0.messages(source, window: MessageWindow(after: failure, limit: 200, images: false))
-        }), let from = retryStart(loaded + later, failure: failure) else { return false }
         do {
+            for _ in 0..<5 {
+                let page = try await session.run {
+                    try await $0.messages(source, window: MessageWindow(before: before, limit: 200, images: false))
+                }
+                loaded = page + loaded
+                if page.count < 200 || page.contains(where: { $0.role == .user }) { break }
+                before = page[0].id
+            }
+            let later = try await session.run {
+                try await $0.messages(source, window: MessageWindow(after: failure, limit: 200, images: false))
+            }
+            guard let from = retryStart(loaded + later, failure: failure) else { return false }
             try await session.run { try await $0.rewind(source, from: from, retry: true) }
             return true
         } catch {
-            if !error.isCancellation { trouble = error.localizedDescription }
+            if !error.isCancellation { self.failure = error.localizedDescription }
             return false
         }
     }
@@ -887,10 +903,10 @@ struct ConsoleView: View {
                     if picked == .agent(agent.name) { picked = nil }
                     previews[ThreadSource.agent(agent.name).key] = nil
                 }
-                trouble = nil
+                failure = nil
                 await refresh()
             } catch {
-                if !error.isCancellation { trouble = error.localizedDescription }
+                if !error.isCancellation { failure = error.localizedDescription }
             }
         }
     }
@@ -915,7 +931,7 @@ struct ConsoleView: View {
                 do {
                     previewing = try await FileSource(session: session, agent: agent).fetch(path)
                 } catch {
-                    if !error.isCancellation { trouble = error.localizedDescription }
+                    if !error.isCancellation { failure = error.localizedDescription }
                 }
             }
         }
@@ -962,31 +978,50 @@ struct ConsoleView: View {
         unread.has(source, newest: previews[source.key]?.id)
     }
 
-    /// One `?limit=1` per agent alongside the list poll. Fine for the handful of agents one
-    /// machine runs; a `lastMessage` on `GET /api/agents` is the upgrade path if it ever hurts.
+    /// After an action: ask now, and say what went wrong without failing the action.
     private func refresh() async {
         do {
-            let attending = attending
-            let rows = try await session.run { try await $0.agents(attending: attending) }
-            if agents != rows { agents = rows }
-            looks.adopt(rows)
-            let pending = (try? await session.run { try await $0.needsYou() }) ?? needs
-            if needs != pending { needs = pending }
-            let listed = (try? await session.run { try await $0.goals() }) ?? goals
-            if goals != listed { goals = listed }
-            if let marks = try? await session.run({ try await $0.readMarks() }) { unread.adopt(marks) }
-            trouble = nil
-            for agent in rows where agent.parentId == nil {
-                await loadPreview(.agent(agent.name))
-            }
-            announce(rows, needs)
-            #if DEBUG
-            openLaunchTarget()
-            #endif
-            Notifier.badge(rows.filter { $0.parentId == nil && isUnread(.agent($0.name)) }.count + needs.count)
+            try await load()
         } catch {
-            if !error.isCancellation { trouble = error.localizedDescription }
+            noteRefreshFailure(error)
         }
+    }
+
+    private func noteRefreshFailure(_ error: any Error) {
+        if let complaint = session.complaint(about: error) { trouble = complaint }
+    }
+
+    private var unreachable: String? {
+        if case .unreachable(_, let message) = session.reachability { message } else { nil }
+    }
+
+    /// One `?limit=1` per agent alongside the list poll. Fine for the handful of agents one
+    /// machine runs; a `lastMessage` on `GET /api/agents` is the upgrade path if it ever hurts.
+    /// Each part runs even when one before it failed, so a broken goals route cannot stop the
+    /// previews and the announcements; the first failure is thrown at the end.
+    private func load(ifOlderThan age: Duration = .zero) async throws {
+        var first: (any Error)?
+        func attempt(_ part: () async throws -> Void) async {
+            do { try await part() } catch { if first == nil { first = error } }
+        }
+        feed.attending = attending
+        await attempt { try await feed.refresh(ifOlderThan: age) }
+        await attempt {
+            let listed = try await session.run { try await $0.goals() }
+            if goals != listed { goals = listed }
+        }
+        await attempt { unread.adopt(try await session.run { try await $0.readMarks() }) }
+        let rows = agents
+        for agent in rows where agent.parentId == nil {
+            await attempt { try await loadPreview(.agent(agent.name)) }
+        }
+        announce(rows, needs)
+        Notifier.badge(rows.filter { $0.parentId == nil && isUnread(.agent($0.name)) }.count + needs.count)
+        if let first { throw first }
+        trouble = nil
+        #if DEBUG
+        openLaunchTarget()
+        #endif
     }
 
     #if DEBUG
@@ -1001,7 +1036,7 @@ struct ConsoleView: View {
         case ("home", 1), ("needs-you", 1):
             selection = .home
         case ("goal", 2):
-            guard let id = Int(parts[1]) else { return trouble = "No goal id in -schermes.debugOpen \(target)" }
+            guard let id = Int(parts[1]) else { return failure = "No goal id in -schermes.debugOpen \(target)" }
             selection = .goal(id)
         case ("agent", 2):
             picked = .agent(parts[1])
@@ -1015,7 +1050,7 @@ struct ConsoleView: View {
         case ("pages", 3):
             guard let agent = agents.first(where: { $0.name == parts[1] }),
                   let page = AgentPages.Page(rawValue: parts[2])
-            else { return trouble = "No agent or page for -schermes.debugOpen \(target)" }
+            else { return failure = "No agent or page for -schermes.debugOpen \(target)" }
             picked = .agent(agent.name)
             launchPages = LaunchPages(agent: agent, page: page)
         case ("search", 2):
@@ -1035,13 +1070,13 @@ struct ConsoleView: View {
             let tab = UserDefaults.standard.string(forKey: SettingsCategory.storageKey).flatMap(SettingsCategory.init)
             settingsOpen = SettingsRequest(start: tab)
         default:
-            trouble = "Unknown -schermes.debugOpen target: \(target)"
+            failure = "Unknown -schermes.debugOpen target: \(target)"
         }
     }
     #endif
 
-    private func loadPreview(_ source: ThreadSource) async {
-        guard let last = try? await session.run({
+    private func loadPreview(_ source: ThreadSource) async throws {
+        guard let last = try await session.run({
             try await $0.messages(source, window: MessageWindow(limit: 1, images: false))
         }).last else { return }
         if previews[source.key] != last { previews[source.key] = last }

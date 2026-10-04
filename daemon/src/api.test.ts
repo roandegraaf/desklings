@@ -4,21 +4,22 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createApp } from './app.ts';
+import { MAX_API_BODY_BYTES, createApp } from './app.ts';
 import type { AppDeps } from './app.ts';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { connect as tcpConnect, createServer as createTcpServer } from 'node:net';
 import { openDb } from './db.ts';
-import { hashPassword, verifyPassword } from './auth.ts';
+import { SESSION_COOKIE, createLoginGuard, hashPassword, verifyPassword } from './auth.ts';
 import { encrypt as encryptForTest, loadMasterKey } from './secrets.ts';
+import { hideFromAgent } from './forms.ts';
 import { mcpServers, searchConfig } from './settings.ts';
 import { migrateModelProviders, migrateProviderSettings, modelConfig, providerConfig } from './models.ts';
 import { MAX_MCP_SERVERS } from './mcp.ts';
 import type { Exec, ExecOptions, ExecResult } from './exec.ts';
 import { openAiProvider } from './provider.ts';
 import type { ChatReply, Provider, ProviderConfig } from './provider.ts';
-import { MAX_TRANSCRIPT_CHARS, RUN_FAILED, STOPPED } from './loop.ts';
+import { MAX_TRANSCRIPT_CHARS, RUN_FAILED, STOPPED, fullnessStats } from './loop.ts';
 import { BROWSER_HUNG } from './browser.ts';
 import { KICKOFF, MAX_PROFILE_CHARS } from './interview.ts';
 import { eq } from 'drizzle-orm';
@@ -31,15 +32,17 @@ import {
   messages as messagesTable,
   models as modelsTable,
   providers as providersTable,
+  sessions,
   settings as settingsTable,
+  schedules as schedulesTable,
   triggers as triggersTable,
 } from './schema.ts';
 import { formPage } from './testpage.ts';
 import { SECRET_HEADER, TRIGGER_FOLDER, TRIGGER_SENDER, parseTriggerProposal, proposeTrigger, runTriggerChecks } from './triggers.ts';
 import type { Goal, Trigger } from '@schermes/shared';
 import { addHelperRow, applyGoalUpdate, isHelper } from './goals.ts';
-import { generateKeyPairSync } from 'node:crypto';
-import { HOME_APPEND, HOME_READ_MEMORY, HOME_WRITE_MEMORY } from './home.ts';
+import { generateKeyPairSync, scryptSync } from 'node:crypto';
+import { HOME_APPEND, HOME_READ_MEMORY, HOME_WRITE_MEMORY, MAX_FILE_BYTES } from './home.ts';
 import { findFeedback } from './feedback.ts';
 import { findAgent, findAgentById, insertWorker, listAgents, setAgentState } from './agents.ts';
 import { FILES_SCRIPT, indexAgentFiles, indexPass, runSearch } from './search.ts';
@@ -56,23 +59,40 @@ import {
   listEvents,
   listMessages,
   participantAgents,
+  rewindConversation,
   SYSTEM_SENDER,
 } from './conversations.ts';
 import { listNeedsYou } from './needs.ts';
 import { APPROVED, GO_AHEAD, MAX_PENDING_APPROVALS, describeApproval, insertApproval, listApprovals, pendingCount, settleApproval } from './approvals.ts';
 import { ATTENDING_HEADER, pushCategory } from './push.ts';
 import type { PushSend } from './push.ts';
-import { KEEP_SNAPSHOTS_MS, SNAPSHOTS, diffManifests, pruneSnapshots } from './snapshots.ts';
+import {
+  KEEP_SNAPSHOTS_COUNT,
+  KEEP_SNAPSHOTS_MS,
+  KEEP_SNAPSHOT_BYTES,
+  SNAPSHOTS,
+  type SnapshotFile,
+  diffManifests,
+  parseSnapshotSizes,
+  pruneSnapshots,
+  snapshotsToPrune,
+} from './snapshots.ts';
 import { guardCommand, readRules } from './rules.ts';
-import { listSchedules } from './schedules.ts';
+import { pruneImages } from './images.ts';
+import { insertSchedule, listSchedules, rescheduleAll, runDue } from './schedules.ts';
+import { wallClock } from './timezone.ts';
+import { PassThrough } from 'node:stream';
 import {
   IDLE_FACTS,
   IDLE_SENDER,
+  INTERRUPTED_REASON,
   addIdleOutput,
+  closeInterruptedPasses,
   idlePreCheck,
   listIdlePasses,
   parseFacts,
   runIdleChecks,
+  tokensToday,
   windowOpenedAt,
   DEFAULT_IDLE,
 } from './idle.ts';
@@ -80,14 +100,20 @@ import type { Agent, AgentRules, IdlePass, IdleSettings, Approval, LiveReply, Me
 
 const MIGRATIONS = resolve(import.meta.dirname, '../migrations');
 const PASSWORD = 'correct-horse-battery';
+const SETUP_TOKEN = 'a-fixed-setup-token';
 /** An agent created with a profile is not interviewed, so a test's scripted replies are its. */
 const PROFILED = 'A test agent.';
 
-function fixture(caps: Partial<Pick<AppDeps, 'maxLoops' | 'retryBaseMs' | 'makeProvider' | 'connect' | 'pushSend' | 'presence'>> = {}) {
-  const db = openDb(':memory:', MIGRATIONS);
-  const masterKey = loadMasterKey(join(mkdtempSync(join(tmpdir(), 'schermes-api-')), 'master.key'));
+function fixture(
+  caps: Partial<
+    Pick<AppDeps, 'db' | 'masterKey' | 'maxLoops' | 'retryBaseMs' | 'makeProvider' | 'connect' | 'pushSend' | 'presence' | 'loginGuard'>
+  > = {},
+) {
+  const db = caps.db ?? openDb(':memory:', MIGRATIONS);
+  const masterKey = caps.masterKey ?? loadMasterKey(join(mkdtempSync(join(tmpdir(), 'schermes-api-')), 'master.key'));
   const spawned: string[] = [];
   const stopped: string[] = [];
+  const removed: string[] = [];
   const moved: [string, string][] = [];
   const desktop = {
     ensure(name: string, display: number, tag?: string) {
@@ -101,6 +127,11 @@ function fixture(caps: Partial<Pick<AppDeps, 'maxLoops' | 'retryBaseMs' | 'makeP
     },
     stopDisplay(name: string, display: number) {
       stopped.push(`${name}:${display}`);
+      return Promise.resolve();
+    },
+    remove(name: string) {
+      if (name === 'unremovable') return Promise.reject(new Error('userdel: user agent-unremovable is busy'));
+      removed.push(name);
       return Promise.resolve();
     },
     rename(from: string, to: string) {
@@ -161,13 +192,14 @@ function fixture(caps: Partial<Pick<AppDeps, 'maxLoops' | 'retryBaseMs' | 'makeP
     if (reply === undefined) throw new Error('the script ran out of replies');
     return { text: reply.text ?? '', toolCalls: reply.toolCalls ?? [], ...(reply.usage === undefined ? {} : { usage: reply.usage }) };
   };
-  const created = createApp({ db, masterKey, desktop, exec, makeProvider, ...caps });
+  const created = createApp({ db, masterKey, desktop, exec, makeProvider, setupToken: SETUP_TOKEN, ...caps });
 
   return {
     db,
     masterKey,
     spawned,
     stopped,
+    removed,
     moved,
     ran,
     stdin,
@@ -181,6 +213,7 @@ function fixture(caps: Partial<Pick<AppDeps, 'maxLoops' | 'retryBaseMs' | 'makeP
     offered,
     memory,
     app: created.app,
+    desktop,
     runner: created.runner,
     recorder: created.recorder,
     /** Parks every turn started from now on, so a test can hold a loop open on purpose. */
@@ -236,13 +269,13 @@ test('health is public and reports that setup is required until an owner exists'
     status: 'ok',
     setupRequired: true,
   });
-  await post(app, '/api/auth/setup', { password: PASSWORD });
+  await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN });
   assert.equal((await json(await app.request('/api/health')))['setupRequired'], false);
 });
 
 test('every non-public route is denied without a session', async () => {
   const { app } = fixture();
-  await post(app, '/api/auth/setup', { password: PASSWORD });
+  await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN });
   for (const path of ['/api/settings', '/api/auth/logout', '/api/unknown']) {
     assert.equal((await app.request(path)).status, 401, `${path} should require a session`);
   }
@@ -250,8 +283,8 @@ test('every non-public route is denied without a session', async () => {
 
 test('setup refuses to run twice, so it cannot be used as a password reset', async () => {
   const { app } = fixture();
-  assert.equal((await post(app, '/api/auth/setup', { password: PASSWORD })).status, 201);
-  const second = await post(app, '/api/auth/setup', { password: 'attacker-chosen-pw' });
+  assert.equal((await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN })).status, 201);
+  const second = await post(app, '/api/auth/setup', { password: 'attacker-chosen-pw', setupToken: SETUP_TOKEN });
   assert.equal(second.status, 409);
   assert.equal((await post(app, '/api/auth/login', { password: 'attacker-chosen-pw' })).status, 401);
   assert.equal((await post(app, '/api/auth/login', { password: PASSWORD })).status, 200);
@@ -259,13 +292,223 @@ test('setup refuses to run twice, so it cannot be used as a password reset', asy
 
 test('setup rejects a short password', async () => {
   const { app } = fixture();
-  assert.equal((await post(app, '/api/auth/setup', { password: 'short' })).status, 400);
+  assert.equal((await post(app, '/api/auth/setup', { password: 'short', setupToken: SETUP_TOKEN })).status, 400);
   assert.equal((await json(await app.request('/api/health')))['setupRequired'], true);
+});
+
+const from = (remoteAddress: string) => ({ incoming: { socket: { remoteAddress } } });
+
+function postFrom(app: App, path: string, body: unknown, peer: string, headers: Record<string, string> = {}) {
+  return app.request(
+    path,
+    { method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json', ...headers } },
+    from(peer),
+  );
+}
+
+test('setup is refused without the first-run token, and with a wrong one', async () => {
+  const { app } = fixture();
+  const bare = await post(app, '/api/auth/setup', { password: PASSWORD });
+  assert.equal(bare.status, 403);
+  assert.match(String((await json(bare))['error']), /daemon log/);
+  assert.equal((await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: 'a-guessed-setup-tokn' })).status, 403);
+  assert.equal((await json(await app.request('/api/health')))['setupRequired'], true);
+  assert.equal((await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN })).status, 201);
+});
+
+test('a daemon booted with no owner makes up a setup token, and one with an owner has none', async () => {
+  const { db, masterKey, desktop, exec } = fixture();
+  const fresh = createApp({ db, masterKey, desktop, exec });
+  assert.match(fresh.setupToken ?? '', /^[A-Za-z0-9_-]{32}$/);
+  assert.notEqual(fresh.setupToken, createApp({ db, masterKey, desktop, exec }).setupToken);
+  assert.equal((await post(fresh.app, '/api/auth/setup', { password: PASSWORD, setupToken: fresh.setupToken })).status, 201);
+  const rebooted = createApp({ db, masterKey, desktop, exec });
+  assert.equal(rebooted.setupToken, undefined);
+  assert.equal((await post(rebooted.app, '/api/auth/setup', { password: 'attacker-chosen-pw', setupToken: '' })).status, 409);
+});
+
+test('a burst of wrong-password logins does not stall health', async () => {
+  const { app } = fixture();
+  await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN });
+  let settled = 0;
+  const logins = Array.from({ length: 16 }, () =>
+    Promise.resolve(post(app, '/api/auth/login', { password: 'not-the-password' })).then((res) => {
+      settled += 1;
+      return res.status;
+    }),
+  );
+  await new Promise((done) => setImmediate(done));
+  assert.equal((await app.request('/api/health')).status, 200);
+  assert.equal(settled, 0, 'health waited behind the logins');
+  assert.deepEqual(new Set(await Promise.all(logins)), new Set([401]));
+});
+
+test('repeated failures from one address back off with Retry-After, and a success resets them', async () => {
+  let clock = 1_000_000;
+  const loginGuard = createLoginGuard({ freeFailures: 3, baseMs: 1000, capMs: 8000, now: () => clock });
+  const { app } = fixture({ loginGuard });
+  await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN });
+  const attempt = (password: string, peer = '203.0.113.7') => postFrom(app, '/api/auth/login', { password }, peer);
+
+  for (let i = 0; i < 3; i += 1) assert.equal((await attempt('wrong-one')).status, 401);
+  assert.equal((await attempt('wrong-one')).status, 401);
+  const refused = await attempt(PASSWORD);
+  assert.equal(refused.status, 429, 'the right password is refused while backed off');
+  assert.equal(refused.headers.get('retry-after'), '1');
+  assert.equal((await attempt(PASSWORD, '198.51.100.9')).status, 200, 'another address is unaffected');
+
+  const waits: string[] = [];
+  for (let i = 0; i < 5; i += 1) {
+    clock += 60_000;
+    assert.equal((await attempt('wrong-one')).status, 401);
+    waits.push((await attempt('wrong-one')).headers.get('retry-after') ?? '');
+  }
+  assert.deepEqual(waits, ['2', '4', '8', '8', '8'], 'doubling, capped');
+
+  clock += 60_000;
+  assert.equal((await attempt(PASSWORD)).status, 200);
+  assert.equal((await attempt('wrong-one')).status, 401);
+  assert.equal((await attempt(PASSWORD)).status, 200, 'the success cleared the strikes');
+});
+
+test('X-Forwarded-For names the client only when a loopback proxy sends it', async () => {
+  const loginGuard = createLoginGuard({ freeFailures: 1, baseMs: 60_000 });
+  const { app } = fixture({ loginGuard });
+  await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN });
+  const wrong = { password: 'wrong-one' };
+
+  await postFrom(app, '/api/auth/login', wrong, '127.0.0.1', { 'x-forwarded-for': '10.9.9.9, 192.0.2.1' });
+  await postFrom(app, '/api/auth/login', wrong, '::ffff:127.0.0.1', { 'x-forwarded-for': '192.0.2.1' });
+  assert.equal((await postFrom(app, '/api/auth/login', wrong, '127.0.0.1', { 'x-forwarded-for': '192.0.2.1' })).status, 429);
+  assert.equal(
+    (await postFrom(app, '/api/auth/login', { password: PASSWORD }, '127.0.0.1', { 'x-forwarded-for': '192.0.2.2' })).status,
+    200,
+    'a different forwarded client has its own count',
+  );
+
+  await postFrom(app, '/api/auth/login', wrong, '203.0.113.7', { 'x-forwarded-for': '192.0.2.50' });
+  await postFrom(app, '/api/auth/login', wrong, '203.0.113.7', { 'x-forwarded-for': '192.0.2.51' });
+  assert.equal(
+    (await postFrom(app, '/api/auth/login', wrong, '203.0.113.7', { 'x-forwarded-for': '192.0.2.52' })).status,
+    429,
+    'a remote caller cannot rotate its forwarded address',
+  );
+});
+
+test('the failure table forgets the oldest address past its bound', () => {
+  const guard = createLoginGuard({ freeFailures: 0, maxEntries: 3 });
+  for (const ip of ['a', 'b', 'c', 'd']) guard.fail(ip);
+  assert.equal(guard.size(), 3);
+  assert.equal(guard.retryAfter('a'), 0);
+  assert.ok(guard.retryAfter('d') > 0);
+});
+
+test('setup token guesses count as failures too', async () => {
+  const loginGuard = createLoginGuard({ freeFailures: 2, baseMs: 60_000 });
+  const { app } = fixture({ loginGuard });
+  for (let i = 0; i < 3; i += 1) {
+    await postFrom(app, '/api/auth/setup', { password: PASSWORD, setupToken: `guess-${i}` }, '203.0.113.7');
+  }
+  assert.equal(
+    (await postFrom(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }, '203.0.113.7')).status,
+    429,
+  );
+});
+
+test('every login gets its own session row, and logging in sweeps expired ones', async () => {
+  const { app, db } = fixture();
+  await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN });
+  db.insert(sessions).values({ id: 'long-gone', createdAt: 1, expiresAt: 2 }).run();
+  const login = () =>
+    app.request('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ password: PASSWORD }),
+      headers: { 'content-type': 'application/json', 'user-agent': 'Schermes/1.0 test' },
+    });
+  const first = sessionCookie(await login());
+  const second = sessionCookie(await login());
+  assert.notEqual(first, second);
+  const rows = db.select().from(sessions).all();
+  assert.equal(rows.length, 3, 'setup plus two logins, the expired row gone');
+  assert.ok(!rows.some((row) => row.id === 'long-gone'));
+  const mine = rows.find((row) => `${SESSION_COOKIE}=${row.id}` === second);
+  assert.equal(mine?.userAgent, 'Schermes/1.0 test');
+  assert.ok((mine?.lastSeenAt ?? 0) > 0);
+  assert.equal((await app.request('/api/settings', { headers: { cookie: first } })).status, 200);
+  assert.equal((await app.request('/api/settings', { headers: { cookie: second } })).status, 200);
+});
+
+test('the cookie is Secure when the request came over TLS, and only then', async () => {
+  const { app } = fixture();
+  const plain = await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN });
+  assert.doesNotMatch(plain.headers.get('set-cookie') ?? '', /Secure/i);
+  const login = (headers: Record<string, string>, url = '/api/auth/login') =>
+    app.request(url, {
+      method: 'POST',
+      body: JSON.stringify({ password: PASSWORD }),
+      headers: { 'content-type': 'application/json', ...headers },
+    });
+  assert.match((await login({ 'x-forwarded-proto': 'https' })).headers.get('set-cookie') ?? '', /; Secure/);
+  assert.match((await login({ 'x-forwarded-proto': 'HTTPS, http' })).headers.get('set-cookie') ?? '', /; Secure/);
+  assert.match((await login({}, 'https://schermes.example/api/auth/login')).headers.get('set-cookie') ?? '', /; Secure/);
+  assert.doesNotMatch((await login({ 'x-forwarded-proto': 'http' })).headers.get('set-cookie') ?? '', /Secure/i);
+});
+
+test('logout deletes the row and clears the cookie', async () => {
+  const { app, db } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
+  const out = await app.request('/api/auth/logout', {
+    method: 'POST',
+    headers: { cookie, 'x-forwarded-proto': 'https' },
+  });
+  assert.equal(out.status, 200);
+  const cleared = out.headers.get('set-cookie') ?? '';
+  assert.match(cleared, new RegExp(`^${SESSION_COOKIE}=;`));
+  assert.match(cleared, /Max-Age=0/);
+  assert.match(cleared, /Path=\//);
+  assert.match(cleared, /; Secure/);
+  assert.equal(db.select().from(sessions).all().length, 0);
+});
+
+test('an /api body over the limit is a 413, and the largest upload the app sends is not', async () => {
+  const { app } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
+  const over = await app.request('/api/settings', {
+    method: 'PUT',
+    body: 'x'.repeat(MAX_API_BODY_BYTES + 1),
+    headers: { 'content-type': 'application/json', cookie },
+  });
+  assert.equal(over.status, 413);
+  assert.match(String((await json(over))['error']), /40 MB/);
+
+  const unauthenticated = await app.request('/api/auth/login', {
+    method: 'POST',
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(MAX_API_BODY_BYTES + 1));
+        controller.close();
+      },
+    }),
+    headers: { 'content-type': 'application/json' },
+    duplex: 'half',
+  } as RequestInit);
+  assert.equal(unauthenticated.status, 413, 'a streamed body without a length is counted too');
+
+  // Swift's JSONEncoder writes each '/' as '\\/', and one base64 character in 64 is a slash.
+  const chars = Math.ceil(MAX_FILE_BYTES / 3) * 4;
+  const slashes = Math.ceil(chars / 64);
+  const largest = `{"name":"big.bin","base64":"${'A'.repeat(chars - slashes)}${'\\/'.repeat(slashes)}"}`;
+  const fits = await app.request('/api/agents/nobody/uploads', {
+    method: 'POST',
+    body: largest,
+    headers: { 'content-type': 'application/json', cookie },
+  });
+  assert.notEqual(fits.status, 413, `a full 25 MB share is ${largest.length} bytes on the wire`);
 });
 
 test('logging out invalidates the session it was issued with', async () => {
   const { app } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   assert.equal((await app.request('/api/settings', { headers: { cookie } })).status, 200);
   await post(app, '/api/auth/logout', {}, cookie);
   assert.equal((await app.request('/api/settings', { headers: { cookie } })).status, 401);
@@ -273,7 +516,7 @@ test('logging out invalidates the session it was issued with', async () => {
 
 test('settings round-trip and the api key is stored encrypted, never returned', async () => {
   const { app, db, masterKey } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   const apiKey = 'sk-live-shouldnevershowup';
 
   const written = await app.request('/api/settings', {
@@ -293,6 +536,8 @@ test('settings round-trip and the api key is stored encrypted, never returned', 
     extraBody: '',
     searchUrl: '',
     searchKeySet: false,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    imageRetentionDays: 30,
     push: { keyId: '', teamId: '', bundleId: '', keySet: false, sandbox: false },
   });
 
@@ -303,7 +548,7 @@ test('settings round-trip and the api key is stored encrypted, never returned', 
 
 test('the search key is stored encrypted and never returned, and an empty url means the default', async () => {
   const { app, db, masterKey } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   const searchKey = 'brave-shouldnevershowup';
 
   const written = await app.request('/api/settings', {
@@ -328,7 +573,7 @@ test('the search key is stored encrypted and never returned, and an empty url me
 
 test('settings rejects a search url that is not http(s)', async () => {
   const { app } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   const res = await app.request('/api/settings', {
     method: 'PUT',
     body: JSON.stringify({ searchUrl: 'file:///etc/passwd' }),
@@ -339,7 +584,7 @@ test('settings rejects a search url that is not http(s)', async () => {
 
 test('settings rejects a base url that is not http(s)', async () => {
   const { app } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   const res = await app.request('/api/settings', {
     method: 'PUT',
     body: JSON.stringify({ baseUrl: 'file:///etc/passwd' }),
@@ -348,18 +593,26 @@ test('settings rejects a base url that is not http(s)', async () => {
   assert.equal(res.status, 400);
 });
 
-test('a password verifies only against its own hash', () => {
-  const stored = hashPassword(PASSWORD);
-  assert.notEqual(stored, hashPassword(PASSWORD));
-  assert.ok(verifyPassword(PASSWORD, stored));
-  assert.ok(!verifyPassword('wrong', stored));
-  assert.ok(!verifyPassword(PASSWORD, 'garbage'));
-  assert.ok(!verifyPassword(PASSWORD, `${stored}$extra`));
+test('a password verifies only against its own hash', async () => {
+  const stored = await hashPassword(PASSWORD);
+  assert.notEqual(stored, await hashPassword(PASSWORD));
+  assert.match(stored, /^scrypt\$16384\$8\$1\$[^$]+\$[^$]+$/);
+  assert.ok(await verifyPassword(PASSWORD, stored));
+  assert.ok(!(await verifyPassword('wrong', stored)));
+  assert.ok(!(await verifyPassword(PASSWORD, 'garbage')));
+  assert.ok(!(await verifyPassword(PASSWORD, `${stored}$extra`)));
+});
+
+test('a hash stored by the synchronous scrypt still verifies', async () => {
+  const salt = Buffer.from('0123456789abcdef');
+  const hash = scryptSync(PASSWORD, salt, 32, { N: 16384, r: 8, p: 1 });
+  const stored = ['scrypt', 16384, 8, 1, salt.toString('base64'), hash.toString('base64')].join('$');
+  assert.ok(await verifyPassword(PASSWORD, stored));
 });
 
 test('creating an agent allocates a display and gives it a desktop', async () => {
   const { app, spawned } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
 
   const created = await post(app, '/api/agents', { name: 'alpha' }, cookie);
   assert.equal(created.status, 201);
@@ -385,7 +638,7 @@ test('creating an agent allocates a display and gives it a desktop', async () =>
 
 test('agent creation refuses a name that could reach a shell, and a duplicate', async () => {
   const { app, spawned } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
 
   for (const name of ['Alpha', 'has space', 'rm -rf /', '../escape', '$(id)', '']) {
     const res = await post(app, '/api/agents', { name }, cookie);
@@ -399,7 +652,7 @@ test('agent creation refuses a name that could reach a shell, and a duplicate', 
 
 test('an agent carries the free-text name the owner gave it, and can be renamed', async () => {
   const { app, spawned } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
 
   const created = await post(app, '/api/agents', { name: 'alpha', label: 'Bob the Builder' }, cookie);
   assert.equal(created.status, 201);
@@ -430,7 +683,7 @@ test('an agent carries the free-text name the owner gave it, and can be renamed'
 
 test('the agent list says how full each own thread is against the compaction budget', async () => {
   const f = fixture();
-  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   const alpha = await json(await post(f.app, '/api/agents', { name: 'alpha', profile: PROFILED }, cookie));
   await post(f.app, '/api/agents', { name: 'bravo', profile: PROFILED }, cookie);
   const fullness = async () =>
@@ -456,9 +709,99 @@ test('the agent list says how full each own thread is against the compaction bud
   assert.equal((await fullness())['bravo'], 0);
 });
 
+test('the agent list projects a thread once per change, and stays right after appends, a compaction, a rewind and a rename', async () => {
+  const f = fixture();
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
+  const alpha = await json(await post(f.app, '/api/agents', { name: 'alpha', profile: PROFILED }, cookie));
+  await post(f.app, '/api/agents', { name: 'bravo', profile: PROFILED }, cookie);
+  const poll = async () => {
+    const before = fullnessStats.projections;
+    const list = (await json(await f.app.request('/api/agents', { headers: { cookie } }))) as unknown as Agent[];
+    return { alpha: list.find((agent) => agent.name === 'alpha')?.contextFullness, projected: fullnessStats.projections - before };
+  };
+  const tenth = 'x'.repeat(MAX_TRANSCRIPT_CHARS / 10);
+  const thread = conversationFor(f.db, Number(alpha['id']));
+
+  const first = appendMessage(f.db, thread, { role: 'user', content: tenth });
+  assert.deepEqual(await poll(), { alpha: 10, projected: 1 });
+  assert.deepEqual(await poll(), { alpha: 10, projected: 0 }, 'an unchanged thread is not projected again');
+
+  const second = appendMessage(f.db, thread, { role: 'user', content: tenth + tenth });
+  assert.deepEqual(await poll(), { alpha: 30, projected: 1 }, 'an append');
+
+  const reply = appendMessage(f.db, thread, { role: 'assistant', content: 'ok', sender: 'alpha' });
+  appendSummary(f.db, { conversationId: thread, sender: 'alpha', content: 's', fromMessageId: first.id, throughMessageId: reply.id });
+  assert.deepEqual(await poll(), { alpha: 0, projected: 1 }, 'a compaction');
+
+  rewindConversation(f.db, thread, second.id);
+  assert.equal(latestSummary(f.db, thread, 'alpha'), undefined);
+  assert.deepEqual(await poll(), { alpha: 10, projected: 1 }, 'a rewind drops the rows and the summary');
+  assert.deepEqual(await poll(), { alpha: 10, projected: 0 });
+
+  appendMessage(f.db, thread, { role: 'user', content: 'x'.repeat(MAX_TRANSCRIPT_CHARS / 20), sender: 'bravo' });
+  const withBravo = await poll();
+  assert.equal(withBravo.projected, 1);
+  assert.equal((await patch(f.app, '/api/agents/bravo', { name: 'b' }, cookie)).status, 200);
+  assert.equal((await poll()).projected, 1, "another agent's name is part of the text, so a rename projects again");
+
+  appendMessage(f.db, conversationFor(f.db, findAgent(f.db, 'b')!.id), { role: 'user', content: 'hello b' });
+  appendMessage(f.db, thread, { role: 'assistant', content: '', sender: 'alpha', toolCalls: [{ id: 'c1', name: 'computer', arguments: '{}' }] });
+  appendMessage(f.db, thread, {
+    role: 'tool',
+    content: 'Screenshot taken.',
+    sender: 'alpha',
+    toolCallId: 'c1',
+    image: { mediaType: 'image/png', base64: 'iVBORw0KGgo=' },
+  });
+  const shot = await poll();
+  assert.equal(shot.projected, 2, 'alpha appended, b has a thread now');
+  assert.deepEqual(await poll(), { alpha: shot.alpha, projected: 0 });
+  assert.equal(pruneImages(f.db, Date.now() + 31 * 86_400_000, 30).expired, 1);
+  assert.deepEqual(await poll(), { alpha: shot.alpha, projected: 1 }, "an expired screenshot changes alpha's text, and only alpha's");
+  assert.deepEqual(await poll(), { alpha: shot.alpha, projected: 0 });
+
+  deleteConversation(f.db, thread);
+  assert.deepEqual(await poll(), { alpha: 0, projected: 0 }, 'a cleared thread has no conversation to read');
+
+  const indexes = f.db.$client.prepare("PRAGMA index_list('messages')").all() as { name: string }[];
+  assert.ok(indexes.some((index) => index.name === 'messages_sender_idx'), 'messages.sender is indexed');
+  const plan = f.db.$client.prepare('EXPLAIN QUERY PLAN SELECT max(id) FROM messages WHERE sender = ?').all('alpha') as { detail: string }[];
+  assert.match(plan.map((row) => row.detail).join('\n'), /messages_sender_idx/);
+});
+
+test('a pruned screenshot is served as an expired placeholder, and the retention window is a setting', async () => {
+  const f = fixture();
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
+  const alpha = await json(await post(f.app, '/api/agents', { name: 'alpha', profile: PROFILED }, cookie));
+  const thread = conversationFor(f.db, Number(alpha['id']));
+  const picture = { mediaType: 'image/jpeg' as const, base64: '/9j/4AAQSkZJRg==' };
+  appendMessage(f.db, thread, { role: 'tool', content: 'Screenshot taken.', sender: 'alpha', toolCallId: 'c1', image: { mediaType: 'image/png', base64: 'iVBORw0KGgo=' } });
+  appendMessage(f.db, thread, { role: 'user', content: 'mine', image: picture });
+  const images = async (query = '') =>
+    ((await json(await f.app.request(`/api/agents/alpha/messages${query}`, { headers: { cookie } }))) as unknown as Message[]).map((m) => m.image);
+  const put = (body: unknown) =>
+    f.app.request('/api/settings', { method: 'PUT', body: JSON.stringify(body), headers: { 'content-type': 'application/json', cookie } });
+
+  assert.deepEqual(await images(), [{ mediaType: 'image/png', base64: 'iVBORw0KGgo=' }, picture]);
+
+  for (const bad of [-1, 1.5, '7', 3651, null]) assert.equal((await put({ imageRetentionDays: bad })).status, 400, String(bad));
+  const saved = await put({ imageRetentionDays: 7 });
+  assert.equal(saved.status, 200);
+  assert.equal((await json(saved))['imageRetentionDays'], 7);
+  assert.equal((await json(await f.app.request('/api/settings', { headers: { cookie } })))['imageRetentionDays'], 7);
+
+  pruneImages(f.db, Date.now() + 8 * 86_400_000, 7);
+  assert.deepEqual(await images(), [{ mediaType: 'image/png', base64: '', expired: true }, picture], "the owner's picture stays");
+  assert.deepEqual(
+    await images('?images=0'),
+    [{ mediaType: 'image/png', base64: '', expired: true }, { ...picture, base64: '' }],
+    'without bytes, expired still tells gone from omitted',
+  );
+});
+
 test('an agent can move to a new name, taking its history, its user and its desktop along', async () => {
   const f = fixture();
-  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   const alpha = await json(await post(f.app, '/api/agents', { name: 'alpha', label: 'Bob', profile: PROFILED }, cookie));
   await post(f.app, '/api/agents', { name: 'charlie' }, cookie);
   const thread = conversationFor(f.db, Number(alpha['id']));
@@ -489,9 +832,36 @@ test('an agent can move to a new name, taking its history, its user and its desk
   assert.equal(f.moved.length, 1);
 });
 
+test('an agent whose Linux user will not go keeps its row, so deleting it again can finish', async () => {
+  const { app, db, removed } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
+  await post(app, '/api/agents', { name: 'unremovable', profile: PROFILED }, cookie);
+
+  const failed = await app.request('/api/agents/unremovable', { method: 'DELETE', headers: { cookie } });
+  assert.equal(failed.status, 500);
+  assert.match(String((await json(failed))['error']), /try again/);
+  assert.equal(findAgent(db, 'unremovable')?.name, 'unremovable', 'a new agent cannot take the name and inherit the home');
+  assert.deepEqual(removed, []);
+});
+
+test('an approved delete whose Linux user will not go tells the asker it is still there', async () => {
+  const { app, db, removed } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
+  await post(app, '/api/agents', { name: 'alpha', profile: PROFILED }, cookie);
+  await post(app, '/api/agents', { name: 'unremovable', profile: PROFILED }, cookie);
+  const alpha = findAgent(db, 'alpha') as Agent;
+  const thread = conversationFor(db, alpha.id);
+  const asked = insertApproval(db, alpha, thread, { kind: 'agent', target: 'unremovable', reason: 'done' });
+
+  assert.equal((await post(app, `/api/approvals/${asked.id}`, { approve: true }, cookie)).status, 200);
+  assert.equal(findAgent(db, 'unremovable')?.name, 'unremovable');
+  assert.deepEqual(removed, []);
+  assert.match(String(listMessages(db, thread).at(-1)?.content), /could not be deleted after all/);
+});
+
 test('an agent whose desktop will not start is not left half-created', async () => {
   const { app } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
 
   assert.equal((await post(app, '/api/agents', { name: 'unspawnable' }, cookie)).status, 500);
   assert.deepEqual(await json(await app.request('/api/agents', { headers: { cookie } })), []);
@@ -503,7 +873,7 @@ test('an agent whose desktop will not start is not left half-created', async () 
 
 test('the agent routes are behind the session guard', async () => {
   const { app } = fixture();
-  await post(app, '/api/auth/setup', { password: PASSWORD });
+  await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN });
   assert.equal((await app.request('/api/agents')).status, 401);
   assert.equal((await post(app, '/api/agents', { name: 'alpha' })).status, 401);
   assert.equal((await post(app, '/api/agents/alpha/computer', { action: 'screenshot' })).status, 401);
@@ -514,7 +884,7 @@ test('the agent routes are behind the session guard', async () => {
 
 test('taking control stands every other input down until it is returned', async () => {
   const { app, db, ran } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
 
   const idle = await app.request('/api/agents/alpha/control', { headers: { cookie } });
@@ -558,7 +928,7 @@ test('taking control stands every other input down until it is returned', async 
 
 test('there is no control to take of an agent that has no desktop', async () => {
   const { app } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   for (const method of ['GET', 'POST', 'DELETE']) {
     const res = await app.request('/api/agents/nobody/control', { method, headers: { cookie } });
     assert.equal(res.status, 404, `${method} on an unknown agent`);
@@ -567,7 +937,7 @@ test('there is no control to take of an agent that has no desktop', async () => 
 
 test('the tool routes run as the agent, 404 an unknown one and 400 a malformed request', async () => {
   const { app, ran } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
 
   const shot = await post(app, '/api/agents/alpha/computer', { action: 'screenshot' }, cookie);
@@ -611,16 +981,16 @@ test('the tool routes run as the agent, 404 an unknown one and 400 a malformed r
 
 test('an unknown agent is refused before the daemon shells out at all', async () => {
   const { app, ran } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents/nobody/command', { command: 'id' }, cookie);
   assert.deepEqual(ran, []);
 });
 
 async function configured(
-  caps: Partial<Pick<AppDeps, 'maxLoops' | 'connect' | 'pushSend' | 'presence'>> = {},
+  caps: Partial<Pick<AppDeps, 'db' | 'masterKey' | 'maxLoops' | 'connect' | 'pushSend' | 'presence'>> = {},
 ): Promise<{ f: ReturnType<typeof fixture>; cookie: string }> {
   const f = fixture(caps);
-  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await f.app.request('/api/settings', {
     method: 'PUT',
     body: JSON.stringify({ baseUrl: 'https://api.example.com/v1', model: 'm', apiKey: 'sk-x' }),
@@ -710,7 +1080,7 @@ test('a description is read into a suggestion that only keeps what holds up', as
 
 test('without a model a suggestion is plain', async () => {
   const f = fixture();
-  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   const plain = (await (await post(f.app, '/api/agents/suggest', { description: 'Mind the books.' }, cookie)).json()) as AgentSuggestion;
   assert.deepEqual(plain, { name: 'helper', label: 'Helper', tagline: 'Mind the books.', levels: plain.levels, byModel: false });
   assert.equal(plain.levels.delete_files, 'ask_first');
@@ -791,6 +1161,30 @@ test('posting a message runs a turn whose transcript and events read back', asyn
   assert.doesNotMatch(dumped, /sk-x/);
 });
 
+test('a secret the owner typed into a form is still redacted from a tool result after a restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'schermes-api-'));
+  const path = join(dir, 'schermes.db');
+  const masterKey = loadMasterKey(join(dir, 'master.key'));
+  const before = await configured({ db: openDb(path, MIGRATIONS), masterKey });
+  hideFromAgent(before.f.db, masterKey, (findAgent(before.f.db, 'alpha') as Agent).id, ['s3cret-pass']);
+
+  const f = fixture({ db: openDb(path, MIGRATIONS), masterKey });
+  const cookie = sessionCookie(await post(f.app, '/api/auth/login', { password: PASSWORD }));
+  f.intercept((_file, args) =>
+    args.some((arg) => arg.includes('cat creds'))
+      ? { code: 0, stdout: Buffer.from('password=s3cret-pass\n'), stderr: '', truncated: false }
+      : undefined,
+  );
+  f.replies.push({ toolCalls: [{ id: 'c1', name: 'run_command', arguments: '{"command":"cat creds"}' }] }, { text: 'done' });
+  assert.equal((await post(f.app, '/api/agents/alpha/messages', { text: 'read it' }, cookie)).status, 202);
+  assert.equal(await f.settled('alpha'), 'waiting_for_user');
+
+  const messages = (await getJson(f.app, '/api/agents/alpha/messages', cookie)) as { role: string; content: string }[];
+  const result = messages.find((m) => m.role === 'tool');
+  assert.match(String(result?.content), /password=\[hidden\]/);
+  assert.doesNotMatch(JSON.stringify({ messages, requests: f.requests }), /s3cret-pass/);
+});
+
 test('the conversation routes 404 an unknown agent and refuse an empty message', async () => {
   const { f, cookie } = await configured();
   for (const path of ['/api/agents/nobody/messages', '/api/agents/nobody/events']) {
@@ -803,7 +1197,7 @@ test('the conversation routes 404 an unknown agent and refuse an empty message',
 
 test('a message is refused until the provider is configured', async () => {
   const f = fixture();
-  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(f.app, '/api/agents', { name: 'alpha', profile: PROFILED }, cookie);
 
   const res = await post(f.app, '/api/agents/alpha/messages', { text: 'hi' }, cookie);
@@ -1034,7 +1428,7 @@ test('the owner compacts a thread on demand, everything since the last summary a
 
 test('compaction is refused until the provider is configured', async () => {
   const f = fixture();
-  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(f.app, '/api/agents', { name: 'alpha', profile: PROFILED }, cookie);
   const res = await post(f.app, '/api/agents/alpha/compact', {}, cookie);
   assert.equal(res.status, 400);
@@ -1070,7 +1464,31 @@ test('a conversation id that is not a number is a 404, never a query', async () 
   }
 });
 
-test('a message above the loop cap is refused with an error that names the cap', async () => {
+test('a rewind with retry at the loop cap waits for a loop and then asks again', async () => {
+  const { f, cookie } = await configured({ maxLoops: 1 });
+  await post(f.app, '/api/agents', { name: 'bravo', profile: PROFILED }, cookie);
+  f.replies.push({ text: 'first answer' });
+  await post(f.app, '/api/agents/alpha/messages', { text: 'question' }, cookie);
+  assert.equal(await f.settled('alpha'), 'waiting_for_user');
+  const thread = conversationFor(f.db, (findAgent(f.db, 'alpha') as Agent).id);
+  const answer = listMessages(f.db, thread).at(-1);
+  assert.equal(answer?.content, 'first answer');
+
+  const release = f.hold();
+  await post(f.app, '/api/agents/bravo/messages', { text: 'hold the loop' }, cookie);
+  // Nothing new is written for a retry, so the read mark alone would call this answered.
+  const retried = await post(f.app, '/api/agents/alpha/rewind', { from: answer?.id, retry: true }, cookie);
+  assert.equal(retried.status, 200);
+  assert.deepEqual(listMessages(f.db, thread).map((m) => m.content), ['question']);
+
+  f.replies.push({ text: 'bravo done' }, { text: 'second answer' });
+  release();
+  assert.equal(await f.settled('bravo'), 'waiting_for_user');
+  for (let i = 0; i < 200 && listMessages(f.db, thread).length < 2; i += 1) await new Promise((done) => setTimeout(done, 5));
+  assert.deepEqual(listMessages(f.db, thread).map((m) => m.content), ['question', 'second answer']);
+});
+
+test('a message above the loop cap is taken and waits for a loop, then runs', async () => {
   const { f, cookie } = await configured({ maxLoops: 1 });
   await post(f.app, '/api/agents', { name: 'bravo', profile: PROFILED }, cookie);
   const release = f.hold();
@@ -1078,22 +1496,17 @@ test('a message above the loop cap is refused with an error that names the cap',
   const first = await post(f.app, '/api/agents/alpha/messages', { text: 'take your time' }, cookie);
   assert.equal(first.status, 202, "alpha's turn holds the only loop this daemon allows");
 
-  const refused = await post(f.app, '/api/agents/bravo/messages', { text: 'and me?' }, cookie);
-  assert.equal(refused.status, 429);
-  assert.match(String((await json(refused))['error']), /at most 1 agent loops can run at once/);
+  const queued = await post(f.app, '/api/agents/bravo/messages', { text: 'and me?' }, cookie);
+  assert.equal(queued.status, 202, 'never a 429: the turn waits in the queue');
+  const stored = (await getJson(f.app, '/api/agents/bravo/messages', cookie)) as { content: string }[];
+  assert.deepEqual(stored.map((m) => m.content), ['and me?']);
 
-  // Refused before it was stored: the owner was told, so nothing is left waiting for a turn.
-  const stored = (await getJson(f.app, '/api/agents/bravo/messages', cookie)) as unknown[];
-  assert.deepEqual(stored, []);
-
-  f.replies.push({ text: 'done' });
+  f.replies.push({ text: 'done' }, { text: 'here' });
   release();
   assert.equal(await f.settled('alpha'), 'waiting_for_user');
-
-  f.replies.push({ text: 'here' });
-  const taken = await post(f.app, '/api/agents/bravo/messages', { text: 'now?' }, cookie);
-  assert.equal(taken.status, 202, 'and taken once the loop is free again');
   assert.equal(await f.settled('bravo'), 'waiting_for_user');
+  const answered = (await getJson(f.app, '/api/agents/bravo/messages', cookie)) as { content: string }[];
+  assert.deepEqual(answered.map((m) => m.content), ['and me?', 'here'], 'the queued turn ran once the loop was free');
 });
 
 function patch(app: App, path: string, body: unknown, cookie: string) {
@@ -1106,7 +1519,7 @@ function patch(app: App, path: string, body: unknown, cookie: string) {
 
 test('the owner can list, create, pause and cancel an agent\'s schedules', async () => {
   const { app } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
 
   assert.deepEqual(await json(await app.request('/api/agents/alpha/schedules', { headers: { cookie } })), []);
@@ -1142,7 +1555,7 @@ test('the owner can list, create, pause and cancel an agent\'s schedules', async
 
 test('the schedule routes refuse a bad body, an unknown agent and another agent\'s id', async () => {
   const { app } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
   await post(app, '/api/agents', { name: 'bravo' }, cookie);
 
@@ -1179,7 +1592,7 @@ test('the schedule routes refuse a bad body, an unknown agent and another agent\
 
 test('MCP servers are stored encrypted and come back without their secrets', async () => {
   const { app, db, masterKey } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
 
   const written = await app.request('/api/mcp/servers', {
     method: 'PUT',
@@ -1207,7 +1620,7 @@ test('MCP servers are stored encrypted and come back without their secrets', asy
 
 test('a server list the daemon could not run is a 400 that changes nothing', async () => {
   const { app, db, masterKey } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
 
   const res = await app.request('/api/mcp/servers', {
     method: 'PUT',
@@ -1228,7 +1641,7 @@ function put(app: App, path: string, body: unknown, cookie?: string) {
 
 test('one server is added, changed and removed without retyping the list or its secrets', async () => {
   const { app, db, masterKey } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
 
   // Appended onto an empty list, and the name in the path wins over the one in the body.
   const added = await put(
@@ -1286,7 +1699,7 @@ test('one server is added, changed and removed without retyping the list or its 
 
 test('a per-server write the daemon could not run is a 400 that changes nothing', async () => {
   const { app, db, masterKey } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   assert.equal((await put(app, '/api/mcp/servers/files', { command: 'npx', env: { TOKEN: 'keep-me' } }, cookie)).status, 200);
 
   // Neither a command nor a url, so there is nothing to start.
@@ -1308,7 +1721,7 @@ test('a per-server write the daemon could not run is a 400 that changes nothing'
 
 test('testing a server that cannot be reached is an answer, not a failed request', async () => {
   const { app } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
   // Port 1 refuses at once, so this exercises the route without a spawn or a timeout.
   await app.request('/api/mcp/servers', {
@@ -1329,8 +1742,8 @@ test('testing a server that cannot be reached is an answer, not a failed request
 });
 
 test('deleting an agent takes its workers, threads, routines and history with it', async () => {
-  const { app, db, stopped } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const { app, db, stopped, removed } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
   await post(app, '/api/agents', { name: 'bravo' }, cookie);
 
@@ -1346,7 +1759,8 @@ test('deleting an agent takes its workers, threads, routines and history with it
 
   const gone = await app.request('/api/agents/alpha', { method: 'DELETE', headers: { cookie } });
   assert.equal(gone.status, 200);
-  assert.deepEqual(stopped, ['alpha'], 'the desktop is stopped before the row goes');
+  assert.deepEqual(removed, ['alpha'], 'the user, home and sandbox go before the row does');
+  assert.deepEqual(stopped, []);
 
   assert.equal(findAgent(db, 'alpha'), undefined);
   assert.equal(findAgent(db, 'alpha-w1'), undefined, 'its workers go with it');
@@ -1389,7 +1803,7 @@ test('an agent in the middle of a turn is not deleted out from under its own loo
 
 test('an agent asks the owner before anything is deleted, and is told either way', async () => {
   const { app, db } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
   await post(app, '/api/agents', { name: 'bravo' }, cookie);
   const alpha = findAgent(db, 'alpha') as Agent;
@@ -1430,7 +1844,7 @@ test('an agent asks the owner before anything is deleted, and is told either way
 
 test('approving one request leaves an unrelated question waiting', async () => {
   const { app, db } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
   await post(app, '/api/agents', { name: 'bravo' }, cookie);
   const alpha = findAgent(db, 'alpha') as Agent;
@@ -1453,7 +1867,7 @@ test('approving one request leaves an unrelated question waiting', async () => {
 
 test('rules are read and written per agent, and passwords and security cannot be delegated', async () => {
   const { app, db } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
   const alpha = findAgent(db, 'alpha') as Agent;
   insertWorker(db, alpha, 'alpha-1', conversationFor(db, alpha.id));
@@ -1490,7 +1904,7 @@ test('rules are read and written per agent, and passwords and security cannot be
 
 test('idle settings are read and written per permanent agent', async () => {
   const { app, db } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha', profile: PROFILED }, cookie);
   const alpha = findAgent(db, 'alpha') as Agent;
   insertWorker(db, alpha, 'alpha-1', conversationFor(db, alpha.id));
@@ -1529,7 +1943,7 @@ test('the idle window may wrap midnight and is checked once', () => {
 test('the idle pre-check makes no model call, skips when nothing matched and matches new feedback alone', async () => {
   const f = fixture();
   const { app, db, requests, ran } = f;
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha', profile: PROFILED }, cookie);
   await post(app, '/api/agents', { name: 'bravo', profile: PROFILED }, cookie);
   const alpha = findAgent(db, 'alpha') as Agent;
@@ -1749,7 +2163,7 @@ test('idle outputs: memory undo, a routine turned on, wasted passes and back-off
 
 test('Always allow approves and puts the origin on the pre-approved list', async () => {
   const { app, db } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
   const alpha = findAgent(db, 'alpha') as Agent;
   const thread = conversationFor(db, alpha.id);
@@ -1793,7 +2207,7 @@ test('Always allow approves and puts the origin on the pre-approved list', async
 
 test('an agent can ask to be deleted itself, and the request goes with it', async () => {
   const { app, db } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(app, '/api/agents', { name: 'alpha' }, cookie);
   const alpha = findAgent(db, 'alpha') as Agent;
   const asked = insertApproval(db, alpha, conversationFor(db, alpha.id), {
@@ -1965,7 +2379,7 @@ test('the event log can be asked for its tail', async () => {
 
 test('an agent carries the look a client gave it, so every device draws the same avatar', async () => {
   const { app } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   const created = await json(await post(app, '/api/agents', { name: 'alpha', label: 'Al', look: 'blob:red' }, cookie));
   assert.equal(created['look'], 'blob:red');
 
@@ -2138,7 +2552,7 @@ test('the owner rates a reply; a thumbs down reaches the answering agent\'s memo
 
 test('the provider settings can be tested with one model call', async () => {
   const { app, replies } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   assert.equal((await post(app, '/api/settings/test', {}, cookie)).status, 400, 'nothing stored yet');
 
   await app.request('/api/settings', {
@@ -2198,7 +2612,7 @@ test('a question is read into filters by the model and answered from the index w
 
 test('without a model, or when it fails, a search is plain words over the same index', async () => {
   const f = fixture();
-  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(f.app, '/api/agents', { name: 'ledger', profile: PROFILED }, cookie);
   const ledger = findAgent(f.db, 'ledger')!;
   const thread = conversationFor(f.db, ledger.id);
@@ -2238,7 +2652,7 @@ test('without a model, or when it fails, a search is plain words over the same i
 
 test('the index pass lists each home and reads screenshot text, and skips OCR without tesseract', async () => {
   const f = fixture();
-  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   await post(f.app, '/api/agents', { name: 'ledger', profile: PROFILED }, cookie);
   const thread = conversationFor(f.db, findAgent(f.db, 'ledger')!.id);
   appendMessage(f.db, thread, {
@@ -2283,12 +2697,36 @@ test('the index pass lists each home and reads screenshot text, and skips OCR wi
   assert.match(shots[0]?.snippet ?? '', /Order total 42 EUR/);
 });
 
+test('OCR marks an expired screenshot as read without reading it, so the pass moves on', async () => {
+  const f = fixture();
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
+  await post(f.app, '/api/agents', { name: 'ledger', profile: PROFILED }, cookie);
+  const thread = conversationFor(f.db, findAgent(f.db, 'ledger')!.id);
+  const kept = appendMessage(f.db, thread, { role: 'tool', content: 'shot', toolCallId: 'c1', sender: 'ledger', image: { mediaType: 'image/png', base64: 'b2xk' } });
+  const expired = appendMessage(f.db, thread, { role: 'tool', content: 'shot', toolCallId: 'c2', sender: 'ledger', image: { mediaType: 'image/png', base64: 'bmV3' } });
+  f.db.$client.prepare('UPDATE messages SET created_at = 1 WHERE id = ?').run(expired.id);
+  assert.equal(pruneImages(f.db, Date.now(), 30).expired, 1);
+  const inputs: unknown[] = [];
+  const exec: Exec = (file, args, options) => {
+    if (file === 'getent') return Promise.resolve({ code: 0, stdout: Buffer.from('agent-ledger:x:1001:1001::/home/agent-ledger:/bin/bash\n'), stderr: '', truncated: false });
+    if (file !== 'sh' && args.at(-1) !== FILES_SCRIPT) inputs.push(options?.input);
+    return Promise.resolve({ code: 0, stdout: Buffer.from('words'), stderr: '', truncated: false });
+  };
+
+  await indexPass(f.db, exec);
+  assert.deepEqual(inputs, ['b2xk'], 'the expired one is not handed to tesseract, and does not stop the one before it');
+  const marked = f.db.$client.prepare('SELECT rowid AS id FROM screenshots_fts ORDER BY rowid').all() as { id: number }[];
+  assert.deepEqual(marked.map((row) => row.id), [kept.id, expired.id]);
+  await indexPass(f.db, exec);
+  assert.deepEqual(inputs, ['b2xk'], 'a second pass has nothing to read');
+});
+
 
 const P8 = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
 
 test('the push settings round-trip with the key stored encrypted, and devices register by token', async () => {
   const { app, db } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   const put = (body: unknown) =>
     app.request('/api/settings', { method: 'PUT', body: JSON.stringify(body), headers: { 'content-type': 'application/json', cookie } });
 
@@ -2490,7 +2928,7 @@ async function addModel(
 
 test('providers hold one key for many models; keys never come back', async () => {
   const { app, db, masterKey } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   assert.deepEqual(await getJson(app, '/api/providers', cookie), []);
 
   assert.equal((await post(app, '/api/providers', { name: 'x', baseUrl: 'ftp://x' }, cookie)).status, 400);
@@ -2523,7 +2961,7 @@ test('providers hold one key for many models; keys never come back', async () =>
 
 test('models are created, listed, updated, made default or backup and deleted', async () => {
   const { app, db, masterKey } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   assert.deepEqual(await getJson(app, '/api/models', cookie), []);
   const provider = (await (await post(app, '/api/providers', { name: 'P', baseUrl: 'https://x/v1', apiKey: 'k' }, cookie)).json()) as ProviderEntry;
 
@@ -2556,6 +2994,31 @@ test('models are created, listed, updated, made default or backup and deleted', 
   assert.equal((await put(app, '/api/models/backup', { id: null }, cookie)).status, 200);
   entries = (await getJson(app, '/api/models', cookie)) as ModelEntry[];
   assert.deepEqual(entries.map((entry) => [entry.name, entry.isDefault, entry.isBackup]), [['Backup', true, false]]);
+});
+
+test('a model has a context window and a vision flag, and a body without them leaves them alone', async () => {
+  const { app, db, masterKey } = fixture();
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
+  const provider = (await (await post(app, '/api/providers', { name: 'P', baseUrl: 'https://x/v1', apiKey: 'k' }, cookie)).json()) as ProviderEntry;
+
+  const plain = (await (await post(app, '/api/models', { name: 'Old app', providerId: provider.id, model: 'm' }, cookie)).json()) as ModelEntry;
+  assert.deepEqual([plain.contextWindow, plain.vision], [null, true], 'what an older app creates: unknown window, sees');
+
+  const made = await post(app, '/api/models', { name: 'Local', providerId: provider.id, model: 'qwen', contextWindow: 32_768, vision: false }, cookie);
+  assert.equal(made.status, 201);
+  const local = (await made.json()) as ModelEntry;
+  assert.deepEqual([local.contextWindow, local.vision], [32_768, false]);
+  assert.equal(modelConfig(db, masterKey, local.id)?.vision, false, 'and the request builder hears it');
+
+  const renamed = (await (await put(app, `/api/models/${local.id}`, { name: 'Local 32k' }, cookie)).json()) as ModelEntry;
+  assert.deepEqual([renamed.contextWindow, renamed.vision], [32_768, false], 'an older app renaming keeps both');
+  const cleared = (await (await put(app, `/api/models/${local.id}`, { contextWindow: null, vision: true }, cookie)).json()) as ModelEntry;
+  assert.deepEqual([cleared.contextWindow, cleared.vision], [null, true]);
+  assert.equal(modelConfig(db, masterKey, local.id)?.vision, undefined, 'seeing is the default, so it is left out');
+
+  for (const bad of [{ contextWindow: 0 }, { contextWindow: 1.5 }, { contextWindow: '32k' }, { vision: 'no' }]) {
+    assert.equal((await put(app, `/api/models/${local.id}`, bad, cookie)).status, 400, JSON.stringify(bad));
+  }
 });
 
 test('models carrying their own endpoint and key move onto shared providers once', () => {
@@ -2675,7 +3138,7 @@ async function troubleStub() {
 async function onStub(retryBaseMs: number, keys: { main: string; backup?: string }) {
   const stub = await troubleStub();
   const f = fixture({ retryBaseMs, makeProvider: openAiProvider });
-  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(f.app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   const main = await addModel(f.app, cookie, { name: 'Main', baseUrl: stub.baseUrl, model: 'm', apiKey: keys.main });
   if (keys.backup !== undefined) {
     const spare = await addModel(f.app, cookie, { name: 'Spare', baseUrl: stub.baseUrl, model: 'm', apiKey: keys.backup });
@@ -2765,6 +3228,28 @@ test('a refused key is not retried and shows once for every agent on it, until t
     const after = (await getJson(f.app, '/api/needs-you', cookie)) as NeedsYouItem[];
     assert.deepEqual(after.map((item) => item.kind), ['failure', 'failure'], 'each failed turn can be retried now');
   } finally {
+    stub.close();
+  }
+});
+
+test('a backup whose key is refused fails the turn, is reported, and is not offered again', async () => {
+  const { f, cookie, stub } = await onStub(60_000, { main: 'limited', backup: 'bad' });
+  try {
+    await post(f.app, '/api/agents/alpha/messages', { text: 'hi' }, cookie);
+    assert.equal((await waiting(f.app, 'alpha', cookie, 2)).backup, 'Spare');
+    assert.equal((await post(f.app, '/api/agents/alpha/retry', { action: 'backup' }, cookie)).status, 200);
+    assert.equal(await f.settled('alpha'), 'failed');
+    assert.equal(stub.calls.get('bad'), 1, 'not retried');
+    const needs = (await getJson(f.app, '/api/needs-you', cookie)) as NeedsYouItem[];
+    assert.ok(needs.some((item) => item.kind === 'provider_auth' && /Spare/.test(String(item.title))));
+
+    await post(f.app, '/api/agents/alpha/messages', { text: 'again' }, cookie);
+    assert.equal((await waiting(f.app, 'alpha', cookie, 2)).backup, undefined, 'a refused backup is not offered');
+    assert.equal((await post(f.app, '/api/agents/alpha/retry', { action: 'backup' }, cookie)).status, 409);
+    assert.equal(stub.calls.get('bad'), 1);
+  } finally {
+    await post(f.app, '/api/agents/alpha/stop', {}, cookie);
+    await f.settled('alpha');
     stub.close();
   }
 });
@@ -3459,7 +3944,8 @@ test('goals: listed, a temporary helper kept, finish removes the rest, delete ke
   const finished = (await done.json()) as Goal;
   assert.equal(finished.state, 'done');
   assert.deepEqual(finished.helpers.map((helper) => helper.name), ['h1']);
-  assert.deepEqual(f.stopped, ['h2', 'alpha:50']);
+  assert.deepEqual(f.stopped, ['alpha:50']);
+  assert.deepEqual(f.removed, ['h2'], 'a temporary helper goes with its Linux user');
   assert.equal(findAgent(f.db, 'h2'), undefined);
   assert.ok((findAgent(f.db, 'alpha-w1')?.display ?? 0) > 999);
   assert.equal((await post(f.app, `/api/goals/${goal.id}/finish`, {}, cookie)).status, 409);
@@ -3479,17 +3965,28 @@ test('goals: listed, a temporary helper kept, finish removes the rest, delete ke
 });
 
 /** A home as `path → "size mtime"` and its snapshots, behind the snapshot script's modes. */
-function fakeSnapshots(f: ReturnType<typeof fixture>, home: Map<string, string>) {
+function fakeSnapshots(f: ReturnType<typeof fixture>, home: Map<string, string>, disk = new Map<string, { inode: number; size: number }>()) {
   const taken = new Map<string, Map<string, string>>();
+  const listing = () =>
+    [...taken.keys()]
+      .map((name, i) => {
+        const tar = disk.get(name) ?? { inode: 1_000 + i, size: 1 };
+        return `${2_000 + i} 1 ${name}.list\n${tar.inode} ${tar.size} ${name}.tgz\n`;
+      })
+      .join('');
   const records = (files: Map<string, string>) => [...files].map(([path, meta]) => `${meta}.5 ${path}\0`).join('');
   const answer = (stdout: string, code = 0): ExecResult => ({ code, stdout: Buffer.from(stdout), stderr: '', truncated: false });
   f.intercept((file, args, options) => {
     const at = args.indexOf(SNAPSHOTS);
     if (file !== 'sudo' || at === -1) return undefined;
-    const [mode, arg = ''] = args.slice(at + 1);
-    if (mode === 'snapshot') taken.set(arg, new Map(home));
+    const [mode, arg = '', ...more] = args.slice(at + 1);
+    if (mode === 'snapshot') {
+      taken.set(arg, new Map(home));
+      return answer(listing());
+    }
+    if (mode === 'sizes') return answer(listing());
+    if (mode === 'remove') for (const name of [arg, ...more]) taken.delete(name);
     if (mode === 'list') return answer([...taken.keys()].map((name) => `${name}.list\n`).join(''));
-    if (mode === 'prune') for (const name of taken.keys()) if (Number(name.split('-')[1]) < Number(arg)) taken.delete(name);
     const snapshot = taken.get(arg);
     if (mode === 'diff') return snapshot === undefined ? answer('', 3) : answer(`${records(snapshot)}\0${records(home)}`);
     if (mode === 'restore') {
@@ -3592,6 +4089,69 @@ test('a rewind with files and no snapshot from before that point changes nothing
   assert.equal(taken.size, 0);
 });
 
+test('snapshot retention takes the oldest first, counts a shared tar once and keeps the newest', () => {
+  const now = Date.now();
+  let inodes = 100;
+  const file = (name: string, inode: number, size: number): SnapshotFile[] => [
+    { inode: String(inodes++), size: 1, name },
+    { inode: String(inode), size, name },
+  ];
+  const at = (mark: number, ago: number) => `${mark}-${now - ago}`;
+  const four = [...file(at(10, 400), 1, 100), ...file(at(20, 300), 2, 100), ...file(at(30, 200), 2, 100), ...file(at(40, 100), 3, 100)];
+
+  assert.deepEqual(snapshotsToPrune(four, now, { count: 10, bytes: 10_000 }), [], 'under both caps');
+  assert.deepEqual(snapshotsToPrune(four, now, { count: 2, bytes: 10_000 }), [at(10, 400), at(20, 300)], 'count cap, oldest first');
+  assert.deepEqual(snapshotsToPrune(four, now, { count: 10, bytes: 202 }), [at(10, 400), at(20, 300)], 'the second shares its tar, so dropping it frees only its manifest');
+  assert.deepEqual(snapshotsToPrune(four, now, { count: 10, bytes: 201 }), [at(10, 400), at(20, 300), at(30, 200)], 'the shared tar is freed once both are gone');
+  assert.deepEqual(
+    snapshotsToPrune(four, now, { count: 1, bytes: 1 }),
+    [at(10, 400), at(20, 300), at(30, 200)],
+    'the newest stays even over both caps',
+  );
+  const stale = [...file(at(5, KEEP_SNAPSHOTS_MS + 1_000), 9, 1), ...four];
+  assert.deepEqual(snapshotsToPrune(stale, now, { count: 10, bytes: 10_000 }), [at(5, KEEP_SNAPSHOTS_MS + 1_000)], 'past the age limit');
+  assert.deepEqual(snapshotsToPrune(file(at(5, KEEP_SNAPSHOTS_MS + 1_000), 9, 1), now), [at(5, KEEP_SNAPSHOTS_MS + 1_000)], 'age takes even the newest');
+  const newestByMark = [...file(`50-${now - 500}`, 4, 100), ...file(at(40, 100), 3, 100)];
+  assert.deepEqual(snapshotsToPrune(newestByMark, now, { count: 1, bytes: 10_000 }), [at(40, 100)], 'newest is the highest mark, the one pickSnapshot takes last');
+  assert.deepEqual(parseSnapshotSizes('tool output\n12 5 1-2.tgz\n13 5 ../1-2.tgz\n14 x 1-3.list\n'), [{ inode: '12', size: 5, name: '1-2' }]);
+});
+
+test('a turn prunes snapshots past the byte cap from the listing its snapshot returns, and the newest still rewinds', async () => {
+  const { f, cookie } = await configured();
+  const home = new Map([['a.txt', '1 100']]);
+  const disk = new Map<string, { inode: number; size: number }>();
+  const taken = fakeSnapshots(f, home, disk);
+  const agent = findAgent(f.db, 'alpha');
+  assert.ok(agent !== undefined);
+  const thread = conversationFor(f.db, agent.id);
+  const old = Date.now() - 60_000;
+  for (const [i, name] of [`1-${old}`, `2-${old + 1}`, `3-${old + 2}`].entries()) {
+    taken.set(name, new Map(home));
+    disk.set(name, { inode: 50 + i, size: KEEP_SNAPSHOT_BYTES / 2 });
+  }
+
+  f.replies.push({ text: 'done' });
+  const sent = (await json(await post(f.app, '/api/agents/alpha/messages', { text: 'go' }, cookie)))['message'] as Message;
+  await f.settled('alpha');
+  const removes = f.ran.filter((argv) => argv.includes(SNAPSHOTS) && argv.includes('remove'));
+  assert.equal(removes.length, 1, 'one remove, no separate listing call');
+  assert.equal(f.ran.filter((argv) => argv.includes(SNAPSHOTS) && argv.includes('sizes')).length, 0);
+  assert.equal(taken.size, 2, 'two half-cap tars plus the new one: the oldest two go');
+  assert.ok(taken.has(`3-${old + 2}`));
+  home.set('b.txt', '1 1');
+  const preview = (await getJson(f.app, `/api/agents/alpha/rewind?from=${sent.id}`, cookie)) as RewindPreview;
+  assert.deepEqual(preview.noSnapshot, []);
+  assert.deepEqual(preview.files[0]?.added, ['b.txt']);
+  assert.equal(listMessages(f.db, thread).length, 2);
+
+  const recent = Array.from({ length: KEEP_SNAPSHOTS_COUNT + 5 }, (_, i) => `${100 + i}-${Date.now() + 1_000 + i}`);
+  for (const name of recent) taken.set(name, new Map(home));
+  disk.clear();
+  await pruneSnapshots(f.db, f.exec, Date.now());
+  assert.equal(taken.size, KEEP_SNAPSHOTS_COUNT, 'the hourly pass applies the count cap');
+  assert.deepEqual([...taken.keys()], recent.slice(-KEEP_SNAPSHOTS_COUNT), 'the oldest went, the earlier turn among them');
+});
+
 test('a manifest diff compares whole seconds and drops paths that leave the home', () => {
   const then = ['4 100.75 a.txt', '4 100.0 gone', '3 5.0 ../up'].map((r) => `${r}\0`).join('');
   const now = ['4 100.0 a.txt', '4 100.0 new file\nline', '9 5.0 /etc/x'].map((r) => `${r}\0`).join('');
@@ -3600,7 +4160,7 @@ test('a manifest diff compares whole seconds and drops paths that leave the home
 
 test('read marks are shared across devices and only ever move forward', async () => {
   const { app } = fixture();
-  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD }));
+  const cookie = sessionCookie(await post(app, '/api/auth/setup', { password: PASSWORD, setupToken: SETUP_TOKEN }));
   assert.deepEqual(await getJson(app, '/api/read', cookie), {});
   assert.equal((await put(app, '/api/read', { thread: 'agent:ada', messageId: 7 }, cookie)).status, 200);
   assert.equal((await put(app, '/api/read', { thread: 'agent:ada', messageId: 3 }, cookie)).status, 200);
@@ -3608,4 +4168,143 @@ test('read marks are shared across devices and only ever move forward', async ()
   assert.deepEqual(await getJson(app, '/api/read', cookie), { 'agent:ada': 7, 'conversation:2': 9 });
   assert.equal((await put(app, '/api/read', { thread: 'nonsense', messageId: 1 }, cookie)).status, 400);
   assert.equal((await put(app, '/api/read', { thread: 'agent:ada', messageId: '8' }, cookie)).status, 400);
+});
+
+const AMSTERDAM = 'Europe/Amsterdam';
+const NEW_YORK = 'America/New_York';
+const utc = (iso: string) => Date.parse(iso);
+
+test('schedules fire in the owner\'s timezone across a DST change, and a zone change moves them', async () => {
+  const { f, cookie } = await configured();
+  const alpha = findAgent(f.db, 'alpha') as Agent;
+  const daemonZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  assert.equal(((await getJson(f.app, '/api/settings', cookie)) as { timezone: string }).timezone, daemonZone, 'unset is the daemon\'s zone');
+  for (const timezone of ['Mars/Olympus', '', 5, 'Europe/Amsterdam; rm -rf /']) {
+    assert.equal((await put(f.app, '/api/settings', { timezone, model: 'never-written' }, cookie)).status, 400, String(timezone));
+  }
+  assert.notEqual(((await getJson(f.app, '/api/settings', cookie)) as { model: string }).model, 'never-written', 'a bad zone applies nothing');
+  assert.equal((await put(f.app, '/api/settings', { timezone: AMSTERDAM }, cookie)).status, 200);
+  assert.equal(((await getJson(f.app, '/api/settings', cookie)) as { timezone: string }).timezone, AMSTERDAM);
+
+  const job = insertSchedule(f.db, alpha, { cron: '0 9 * * *', prompt: 'Morning check.' }, utc('2026-10-23T12:00:00Z'));
+  assert.ok(!('error' in job));
+  assert.equal(job.nextRunAt, utc('2026-10-24T07:00:00Z'), '09:00 CEST is 07:00 UTC');
+  const nextRunAt = () => listSchedules(f.db, alpha)[0]?.nextRunAt;
+  f.replies.push({ text: 'Checked.' }, { text: 'Checked.' }, { text: 'Checked.' }, { text: 'Checked.' });
+  assert.equal(runDue(f.db, f.runner, utc('2026-10-24T07:00:00Z')), 1);
+  assert.equal(nextRunAt(), utc('2026-10-25T08:00:00Z'), 'clocks go back on 25 October: 09:00 CET is 08:00 UTC');
+  await f.settled('alpha');
+  assert.equal(runDue(f.db, f.runner, utc('2026-10-25T07:00:00Z')), 0, 'not at the summer hour');
+  assert.equal(runDue(f.db, f.runner, utc('2026-10-25T08:00:00Z')), 1);
+  assert.equal(nextRunAt(), utc('2026-10-26T08:00:00Z'));
+  await f.settled('alpha');
+
+  const paused = insertSchedule(f.db, alpha, { cron: '30 6 * * *', prompt: 'Paused one.' }, utc('2026-10-23T12:00:00Z'));
+  assert.ok(!('error' in paused));
+  f.db.update(schedulesTable).set({ paused: true }).where(eq(schedulesTable.id, paused.id)).run();
+  assert.equal((await put(f.app, '/api/settings', { timezone: NEW_YORK }, cookie)).status, 200);
+  const moved = nextRunAt() ?? 0;
+  assert.deepEqual([wallClock(moved, NEW_YORK).hour, wallClock(moved, NEW_YORK).minute], [9, 0], 'the change recomputed the row in the new zone');
+  assert.ok(moved > Date.now() - 1_000);
+  assert.equal(listSchedules(f.db, alpha)[1]?.nextRunAt, paused.nextRunAt, 'a paused row waits for its resume');
+
+  assert.equal(rescheduleAll(f.db, utc('2026-10-30T12:00:00Z')), 1);
+  assert.equal(nextRunAt(), utc('2026-10-30T13:00:00Z'), '09:00 EDT is 13:00 UTC');
+  assert.equal(runDue(f.db, f.runner, utc('2026-10-31T13:00:00Z')), 1);
+  assert.equal(nextRunAt(), utc('2026-11-01T14:00:00Z'), 'New York goes back on 1 November: 09:00 EST is 14:00 UTC');
+  await f.settled('alpha');
+  assert.match(f.requests.at(-1) ?? '', /Cron expressions are read in the owner's timezone, America\/New_York\./);
+});
+
+test('the idle budget\'s day and window follow the owner\'s timezone', async () => {
+  const { f, alpha } = await idleAgent();
+  const pass = (startedAt: number, tokens: number) =>
+    f.db.insert(idlePassesTable).values({ agentId: alpha.id, startedAt, endedAt: startedAt, matched: '[]', outcome: 'ran', tokens }).run();
+  pass(utc('2026-10-24T21:59:00Z'), 100);
+  pass(utc('2026-10-24T22:01:00Z'), 7);
+  assert.equal(tokensToday(f.db, alpha, utc('2026-10-25T10:00:00Z'), AMSTERDAM), 7, 'Amsterdam\'s day began at 22:00 UTC, in summer time');
+  assert.equal(tokensToday(f.db, alpha, utc('2026-10-25T03:00:00Z'), NEW_YORK), 107, 'New York\'s 24th began at 04:00 UTC');
+  assert.equal(tokensToday(f.db, alpha, utc('2026-10-25T04:30:00Z'), NEW_YORK), 0);
+
+  const night = { ...DEFAULT_IDLE, startHour: 22, endHour: 6 };
+  assert.equal(windowOpenedAt(night, utc('2026-10-25T04:30:00Z'), AMSTERDAM), utc('2026-10-24T20:00:00Z'), 'opened at 22:00 CEST');
+  assert.equal(windowOpenedAt(night, utc('2026-10-25T05:30:00Z'), AMSTERDAM), undefined, 'closed at 06:00 CET: nine hours that night');
+  assert.equal(windowOpenedAt(night, utc('2026-11-01T10:30:00Z'), NEW_YORK), utc('2026-11-01T02:00:00Z'), 'opened 22:00 EDT, open at 05:30 EST');
+  assert.equal(windowOpenedAt(night, utc('2026-11-01T11:30:00Z'), NEW_YORK), undefined, 'closed at 06:00 EST: ten hours that night');
+  assert.equal(windowOpenedAt(night, utc('2026-11-01T10:30:00Z'), AMSTERDAM), undefined, '11:30 CET');
+});
+
+test('an idle pass cut short by a restart still counts what it spent, and is closed as interrupted', async () => {
+  const { f, alpha, thread } = await idleAgent();
+  appendMessage(f.db, thread, { role: 'user', content: 'hello' });
+  f.replies.push({
+    toolCalls: [tool('probe', 'run_command', { command: 'echo restart-probe' })],
+    usage: { promptTokens: 30, completionTokens: 10 },
+  });
+  let release: (() => void) | undefined;
+  f.intercept((_file, args) => {
+    if (release === undefined && args.some((arg) => String(arg).includes('restart-probe'))) release = f.hold();
+    return undefined;
+  });
+  const t0 = Date.now();
+  const [due] = await runIdleChecks(f.db, f.exec, f.runner, t0);
+  for (let attempt = 0; attempt < 200 && f.requests.length < 2; attempt += 1) await new Promise((done) => setTimeout(done, 5));
+  assert.equal(f.requests.length, 2, 'the second model call is parked: the daemon dies here');
+  const row = () => f.db.select().from(idlePassesTable).where(eq(idlePassesTable.id, due!.id)).get();
+  assert.deepEqual([row()?.outcome, row()?.tokens, row()?.endedAt], ['due', 40, null], 'spent tokens are on the row before the pass ends');
+
+  assert.equal(closeInterruptedPasses(f.db, t0 + 10), 1);
+  const rebooted = fixture({ db: f.db, masterKey: f.masterKey });
+  assert.equal(tokensToday(rebooted.db, alpha, t0 + 20), 40, 'the budget counts the interrupted pass');
+  assert.deepEqual([row()?.outcome, row()?.reason, row()?.endedAt, row()?.tokens], ['interrupted', INTERRUPTED_REASON, t0 + 10, 40]);
+  assert.equal(closeInterruptedPasses(f.db, t0 + 30), 0, 'closed once');
+  const [listed] = listIdlePasses(f.db, t0);
+  assert.equal(listed?.outcome, 'interrupted');
+  assert.deepEqual(await runIdleChecks(rebooted.db, rebooted.exec, rebooted.runner, t0 + 40), [], 'the window had its pass');
+});
+
+test('one hung trigger check delays no other, and running out of time is that trigger\'s last error', async () => {
+  const { f } = await configured();
+  const alpha = findAgent(f.db, 'alpha') as Agent;
+  const exec: Exec = (file, args, options) =>
+    args.some((arg) => String(arg).includes('hang-forever')) ? new Promise(() => undefined) : f.exec(file, args, options);
+  const propose = (kind: 'imap' | 'command', config: Record<string, unknown>) => {
+    const row = proposeTrigger(f.db, alpha, { kind, config, reason: `Watch ${kind}.`, maxPerHour: 6 }, 0);
+    assert.ok(!('error' in row));
+    return row;
+  };
+  const mailbox = propose('imap', { host: 'imap.mail.test', port: 993, mailbox: 'INBOX', everyMinutes: 1 });
+  const stuck = propose('command', { command: 'hang-forever', everyMinutes: 1 });
+  const watch = propose('command', { command: 'curl -s example.test/status', everyMinutes: 1 });
+  f.db.update(triggersTable).set({ state: 'on' }).run();
+  f.db.update(triggersTable)
+    .set({ login: encryptForTest(f.masterKey, JSON.stringify({ username: 'u', password: 'p' })) })
+    .where(eq(triggersTable.id, mailbox.id))
+    .run();
+  f.db.update(triggersTable).set({ cursor: 'an older output' }).where(eq(triggersTable.id, watch.id)).run();
+  f.replies.push({ text: 'Seen.' });
+  const silent = { masterKey: f.masterKey, open: () => new PassThrough() };
+
+  const LIMIT_MS = 1_000;
+  const startedAt = Date.now();
+  let timer: NodeJS.Timeout | undefined;
+  const fired = await Promise.race([
+    runTriggerChecks(f.db, exec, f.runner, startedAt, silent, LIMIT_MS),
+    new Promise<string>((done) => {
+      timer = setTimeout(() => done('the pass never ended'), 10 * LIMIT_MS);
+    }),
+  ]);
+  clearTimeout(timer);
+  assert.equal(fired, 1);
+  const tookMs = Date.now() - startedAt;
+  assert.ok(tookMs < 2 * LIMIT_MS, `the pass waits for one limit, not one per hung check (${tookMs} ms)`);
+  const firedLine = listMessages(f.db, conversationFor(f.db, alpha.id)).find((m) => m.sender === TRIGGER_SENDER && /check command `curl/.test(m.content));
+  assert.ok(firedLine !== undefined && firedLine.createdAt - startedAt < LIMIT_MS / 2, 'the healthy trigger fired without waiting');
+
+  const rows = new Map(f.db.select().from(triggersTable).all().map((row) => [row.id, row]));
+  assert.equal(rows.get(stuck.id)?.lastError, 'the check did not answer within 1 s');
+  assert.match(rows.get(mailbox.id)?.lastError ?? '', /did not answer/);
+  assert.deepEqual([rows.get(watch.id)?.lastError, rows.get(watch.id)?.firedInWindow], [null, 1]);
+  assert.equal(rows.get(stuck.id)?.cursor, null, 'a timed-out check moves no cursor');
+  await f.settled('alpha');
 });

@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// An agent's standing jobs, which the reference calls Routines. The agent writes these too, so
-/// the list is polled on the web UI's 5 s tick rather than trusted to stay as the owner left it.
+/// the list is polled on a 5 s tick rather than trusted to stay as the owner left it.
 struct RoutinesView: View {
     let session: Session
     let agent: Agent
@@ -10,6 +10,7 @@ struct RoutinesView: View {
     @State private var cron = ""
     @State private var prompt = ""
     @State private var trouble: String?
+    @Environment(\.pollPhase) private var pollPhase
     @State private var adding = false
 
     private var ready: Bool {
@@ -83,12 +84,9 @@ struct RoutinesView: View {
                 Text("A cron is read on the daemon's clock. Next runs are shown on yours.")
             }
         }
-        .task(id: agent.name) {
-            while !Task.isCancelled {
-                if let rows = try? await session.run({ try await $0.schedules(agent: agent.name) }) {
-                    schedules = rows
-                }
-                try? await Task.sleep(for: .seconds(5))
+        .task(id: PollKey(value: agent.name, phase: pollPhase)) {
+            await session.poll(every: .seconds(5), pollPhase, failed: { session.note($0, in: &trouble) }) {
+                schedules = try await session.run { try await $0.schedules(agent: agent.name) }
             }
         }
     }
@@ -202,6 +200,7 @@ struct RoutinesSummary: View {
     @State private var routinesOpen = false
     @State private var asking = false
     @State private var trouble: String?
+    @Environment(\.pollPhase) private var pollPhase
 
     var body: some View {
         let palette = looks[agent.name].palette(dark: scheme == .dark)
@@ -244,13 +243,10 @@ struct RoutinesSummary: View {
                 Text(trouble).font(.caption).foregroundStyle(Theme.failed)
             }
         }
-        .task(id: agent.name) {
-            while !Task.isCancelled {
-                async let polledSchedules = try? session.run { try await $0.schedules(agent: agent.name) }
-                async let polledTriggers = try? session.run { try await $0.triggers(agent: agent.name) }
-                if let rows = await polledSchedules { schedules = rows }
-                if let rows = await polledTriggers { triggers = rows }
-                try? await Task.sleep(for: .seconds(5))
+        .task(id: PollKey(value: agent.name, phase: pollPhase)) {
+            await session.poll(every: .seconds(5), pollPhase, failed: { session.note($0, in: &trouble) }) {
+                schedules = try await session.run { try await $0.schedules(agent: agent.name) }
+                triggers = try await session.run { try await $0.triggers(agent: agent.name) }
             }
         }
         .sheet(isPresented: $routinesOpen) {
@@ -286,6 +282,7 @@ struct RoutinesSummary: View {
         case .proposed: trigger.needsLogin ? "waiting for the login" : "proposed"
         case .on: "on"
         case .off: "off"
+        case .unknown: "in a state this app does not know"
         }
     }
 

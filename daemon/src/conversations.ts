@@ -1,6 +1,7 @@
 import {
   and,
   asc,
+  count,
   desc,
   eq,
   getTableColumns,
@@ -26,7 +27,8 @@ import type {
 } from '@schermes/shared';
 import { AGENT_NAME, findAgent, listAgents } from './agents.ts';
 import type { Db } from './db.ts';
-import type { Image, ToolDef } from './provider.ts';
+import { imageEpoch, resolveImage, storeImage } from './images.ts';
+import type { Echo, Image, ToolDef } from './provider.ts';
 import {
   agents,
   approvals,
@@ -36,6 +38,7 @@ import {
   forms,
   messages,
   summaries,
+  turnQueue,
 } from './schema.ts';
 
 const MAX_MESSAGE_CHARS = 8_192;
@@ -59,7 +62,11 @@ export type NewMessage = {
   toolCallId?: string;
   image?: Image;
   kind?: MessageKind;
+  echo?: Echo;
 };
+
+/** A row as the loop replays it: with what the endpoint wants back, which no client is sent. */
+export type StoredMessage = Message & { echo?: Echo };
 
 export type MessageKind = 'request' | 'reply';
 
@@ -94,6 +101,7 @@ export function deleteConversation(db: Db, conversationId: number): void {
   db.delete(forms).where(eq(forms.conversationId, conversationId)).run();
   db.delete(messages).where(eq(messages.conversationId, conversationId)).run();
   db.delete(summaries).where(eq(summaries.conversationId, conversationId)).run();
+  db.delete(turnQueue).where(eq(turnQueue.conversationId, conversationId)).run();
   db
     .delete(conversationParticipants)
     .where(eq(conversationParticipants.conversationId, conversationId))
@@ -156,9 +164,9 @@ function parse<T>(raw: string | null): T | undefined {
   return raw === null ? undefined : (JSON.parse(raw) as T);
 }
 
-function toMessage(row: typeof messages.$inferSelect): Message {
+function toMessage(db: Db, row: typeof messages.$inferSelect): Message {
   const toolCalls = parse<ToolCall[]>(row.toolCalls);
-  const image = parse<Image>(row.image);
+  const image = resolveImage(db, row.image, row.imageRef);
   return {
     id: row.id,
     role: row.role as MessageRole,
@@ -169,6 +177,11 @@ function toMessage(row: typeof messages.$inferSelect): Message {
     ...(image === undefined ? {} : { image }),
     createdAt: row.createdAt,
   };
+}
+
+function toStored(db: Db, row: typeof messages.$inferSelect): StoredMessage {
+  const echo = parse<Echo>(row.echo);
+  return echo === undefined ? toMessage(db, row) : { ...toMessage(db, row), echo };
 }
 
 /** Who the daemon's own lines are from: not the owner, so they answer nothing that waits on the owner. */
@@ -184,45 +197,54 @@ export function appendMessage(db: Db, conversationId: number, message: NewMessag
       sender: message.sender ?? null,
       toolCalls: message.toolCalls === undefined ? null : JSON.stringify(message.toolCalls),
       toolCallId: message.toolCallId ?? null,
-      image: message.image === undefined ? null : JSON.stringify(message.image),
+      imageRef: message.image === undefined ? null : storeImage(db, message.image),
       kind: message.kind ?? null,
+      echo: message.echo === undefined ? null : JSON.stringify(message.echo),
       createdAt: Date.now(),
     })
     .returning()
     .get();
-  return toMessage(row);
+  return toMessage(db, row);
 }
 
 export function findMessage(db: Db, id: number): Message | undefined {
   const row = db.select().from(messages).where(eq(messages.id, id)).get();
-  return row === undefined ? undefined : toMessage(row);
+  return row === undefined ? undefined : toMessage(db, row);
 }
 
-export function listMessages(db: Db, conversationId: number, after = 0): Message[] {
+export function listMessages(db: Db, conversationId: number, after = 0): StoredMessage[] {
   return db
     .select()
     .from(messages)
     .where(and(eq(messages.conversationId, conversationId), gt(messages.id, after)))
     .orderBy(asc(messages.id))
     .all()
-    .map(toMessage);
+    .map((row) => toStored(db, row));
 }
 
 /**
- * `listMessages` for a measurement polled with the agent list: an image keeps its presence, which
- * changes the text a transcript carries, but not its bytes, which nothing measured counts.
+ * `listMessages` for a measurement polled with the agent list: an image keeps its presence and
+ * whether it expired, which change the text a transcript carries, but not its bytes, which
+ * nothing measured counts.
  */
 export function listMessagesWithoutImages(db: Db, conversationId: number, after = 0): Message[] {
   return db
     .select({
       ...getTableColumns(messages),
-      image: sql<string | null>`CASE WHEN ${messages.image} IS NULL THEN NULL ELSE '{}' END`,
+      marker: sql<string | null>`CASE
+        WHEN ${messages.image} IS NOT NULL THEN '{}'
+        WHEN ${messages.imageRef} IS NULL THEN NULL
+        WHEN json_extract(${messages.imageRef}, '$.expired') IS NOT NULL THEN '{"expired":true}'
+        ELSE '{}' END`,
     })
     .from(messages)
     .where(and(eq(messages.conversationId, conversationId), gt(messages.id, after)))
     .orderBy(asc(messages.id))
     .all()
-    .map(toMessage);
+    .map(({ marker, ...row }) => {
+      const message = toMessage(db, { ...row, image: null, imageRef: null });
+      return marker === null ? message : { ...message, image: JSON.parse(marker) as Image };
+    });
 }
 
 /** A window onto a thread: the newest `limit` messages, the ones just before `before`, or the
@@ -254,7 +276,7 @@ export function pageMessages(db: Db, conversationId: number, page: MessagePage):
       .orderBy(asc(messages.id))
       .limit(page.limit)
       .all()
-      .map(toMessage);
+      .map((row) => toMessage(db, row));
   }
   const scope = page.before === undefined ? mine : and(mine, lt(messages.id, page.before));
   return db
@@ -265,7 +287,7 @@ export function pageMessages(db: Db, conversationId: number, page: MessagePage):
     .limit(page.limit)
     .all()
     .toReversed()
-    .map(toMessage);
+    .map((row) => toMessage(db, row));
 }
 
 export type Summary = {
@@ -306,6 +328,31 @@ export function latestSummary(
     .orderBy(desc(summaries.id))
     .limit(1)
     .get();
+}
+
+/**
+ * Changes whenever what `sender`'s reading of a thread can project to changes: a row added or
+ * removed (ids are AUTOINCREMENT, so a cleared thread never repeats one), a summary written or
+ * dropped, any agent renamed, since other agents' names are part of the text, or a screenshot in
+ * it expired. Rows are edited in place only by that rename, by an expiry (counted per thread by
+ * `imageEpoch`), and by the move of a picture's bytes into a file, which leaves the transcript's
+ * text as it was.
+ */
+export function threadFingerprint(db: Db, conversationId: number, sender: string): string {
+  const rows = db
+    .select({ newest: max(messages.id), total: count() })
+    .from(messages)
+    .where(eq(messages.conversationId, conversationId))
+    .get();
+  const summary = latestSummary(db, conversationId, sender)?.id ?? 0;
+  const names = db.select({ id: agents.id, name: agents.name }).from(agents).orderBy(asc(agents.id)).all();
+  return JSON.stringify([
+    rows?.newest ?? 0,
+    rows?.total ?? 0,
+    summary,
+    imageEpoch(db, conversationId),
+    names.map((a) => `${a.id}:${a.name}`),
+  ]);
 }
 
 /** The high-water mark a turn measures arrivals against. Message ids are one global sequence,
@@ -521,4 +568,23 @@ export function listEvents(db: Db, agentId: number, limit?: number): ExecutionEv
       data: JSON.parse(row.data) as Record<string, unknown>,
       createdAt: row.createdAt,
     }));
+}
+
+/** The agents still owing this one an answer: a request it sent sits past their answered mark. */
+export function awaitedAgents(db: Db, sender: string): number[] {
+  return [
+    ...new Set(
+      db
+        .select({ agentId: agents.id })
+        .from(messages)
+        .innerJoin(
+          conversationParticipants,
+          eq(conversationParticipants.conversationId, messages.conversationId),
+        )
+        .innerJoin(agents, eq(agents.id, conversationParticipants.agentId))
+        .where(and(eq(messages.kind, 'request'), eq(messages.sender, sender), gt(messages.id, agents.answeredThrough)))
+        .all()
+        .map((row) => row.agentId),
+    ),
+  ];
 }

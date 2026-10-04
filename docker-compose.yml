@@ -13,6 +13,11 @@ services:
     # profile denies. Relaxing the container is preferable to running Chromium --no-sandbox.
     security_opt:
       - seccomp=unconfined
+    # Each agent runs in its own unprivileged user-namespace sandbox: fuse-overlayfs gives it a
+    # writable root and pasta its network. Devices only; no capabilities, not --privileged.
+    devices:
+      - /dev/fuse
+      - /dev/net/tun
     # The web port is the only thing schermes exposes. Loopback by default; a server sets
     # SCHERMES_BIND=0.0.0.0 in .env.
     ports:
@@ -28,6 +33,8 @@ services:
       - schermes-data:/var/lib/schermes
       - schermes-homes:/home
       - schermes-shared:/srv/schermes
+      # Every sandbox's writable layer, so what an agent installed survives a rebuild.
+      - schermes-sandboxes:/var/lib/schermes-sandboxes
       # The APNs key, when SCHERMES_APNS_KEY in .env names the AuthKey_<KEYID>.p8 on the host.
       # Without it /dev/null is mounted, which the daemon reads as no key.
       - "${SCHERMES_APNS_KEY:-/dev/null}:/run/secrets/apns.p8:ro"
@@ -55,4 +62,5 @@ volumes:
   schermes-data:
   schermes-homes:
   schermes-shared:
+  schermes-sandboxes:
   caddy-data:

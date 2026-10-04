@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Spawn (or adopt) an agent's Xvnc display with its window manager, wallpaper and dock. Runs as
-# schermes or root. A third argument names a helper's extra display on the same user, which keeps
-# its own log and pidfile.
+# Spawn (or adopt) an agent's Xvnc display with its window manager, wallpaper and dock, inside the
+# agent's sandbox. Runs as schermes or root. A third argument names a helper's extra display on
+# the same user, in the same sandbox, which keeps its own log and pidfile.
 set -euo pipefail
 
 name=${1:?usage: start-desktop.sh <name> <display> [tag]}
@@ -20,13 +20,18 @@ state_dir=${SCHERMES_STATE_DIR:-/var/lib/schermes}
 log="$state_dir/logs/$tag.log"
 pidfile="$state_dir/desktops/$tag.pid"
 
+as_user() { sudo -n -u "$user" -- "$here/sandbox.sh" "$@"; }
+
 as_agent() {
-  sudo -n -u "$user" env --chdir="$home" \
+  as_user enter env --chdir="$home" \
     HOME="$home" USER="$user" LOGNAME="$user" \
     DISPLAY=":$display" XAUTHORITY="$home/.Xauthority" "$@"
 }
 
 mkdir -p "$state_dir/logs" "$state_dir/desktops"
+
+as_user start
+as_user forward "$display"
 
 if as_agent xdpyinfo >/dev/null 2>&1; then
   if [ "$(as_agent xdpyinfo | awk '/dimensions:/ {print $2}')" = "$geometry" ]; then

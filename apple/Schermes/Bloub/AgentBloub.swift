@@ -15,7 +15,7 @@ extension AgentState {
         case .waiting_for_agent, .waiting_for_task_worker: .wide
         case .failed: .failed
         case .completed: .sleep
-        case .idle: .idle
+        case .idle, .unknown: .idle
         }
     }
 }

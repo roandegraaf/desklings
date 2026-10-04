@@ -45,8 +45,9 @@ final class ShareViewController: UIViewController {
         throw ShareError.nothing
     }
 
-    /// The copy `loadFileRepresentation` hands over is gone once its handler returns, so the
-    /// bytes are read inside it. Photos gives no filename; the name is then made from the type.
+    /// The copy `loadFileRepresentation` hands over is gone once its handler returns, so it is
+    /// cloned inside it to a file of the extension's own, which is then mapped rather than read.
+    /// Photos gives no filename; the name is then made from the type.
     private nonisolated static func file(from provider: NSItemProvider) async throws -> SharedItem {
         let type = provider.registeredContentTypes.first { $0.conforms(to: .data) } ?? .data
         let suggested = provider.suggestedName
@@ -62,7 +63,12 @@ final class ShareViewController: UIViewController {
                     return
                 }
                 do {
-                    let data = try Data(contentsOf: url)
+                    let kept = FileManager.default.temporaryDirectory.appending(path: "shared-\(url.lastPathComponent)")
+                    try? FileManager.default.removeItem(at: kept)
+                    try FileManager.default.copyItem(at: url, to: kept)
+                    let data = try mappedFile(kept)
+                    // The mapping holds the file open; the name is no longer needed.
+                    try? FileManager.default.removeItem(at: kept)
                     var name = suggested ?? url.lastPathComponent
                     if (name as NSString).pathExtension.isEmpty, let ext = type.preferredFilenameExtension {
                         name += ".\(ext)"

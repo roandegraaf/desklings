@@ -32,7 +32,12 @@ struct ScreenshotView: View {
     }
 
     var body: some View {
-        if let hit = decoded ?? Self.cached(image, maxPixels: maxPixels) {
+        if image.expired == true {
+            Label("screenshot expired", systemImage: "clock.badge.xmark")
+                .font(.caption)
+                .foregroundStyle(Theme.muted)
+                .accessibilityLabel("Screenshot expired")
+        } else if let hit = decoded ?? Self.cached(image, maxPixels: maxPixels) {
             let frame = frame(hit.size)
             Button { previewing = try? imageFile(image) } label: {
                 Image(decorative: hit.image, scale: 1)

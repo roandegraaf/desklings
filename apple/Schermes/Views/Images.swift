@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -68,16 +69,21 @@ nonisolated func imageSize(_ image: Base64Image) -> CGSize? {
     return rotated ? CGSize(width: height, height: width) : CGSize(width: width, height: height)
 }
 
-/// On disk, because Quick Look, the pasteboard and a save all take a file. A folder per image keeps
-/// the name plain for a save and makes opening it again overwrite rather than pile up.
+/// On disk, because Quick Look, the pasteboard and a save all take a file. A folder per image,
+/// named by its bytes, keeps the name plain for a save and makes opening it again, in this launch
+/// or the next, overwrite rather than pile up.
 nonisolated func imageFile(_ image: Base64Image) throws -> URL {
     guard let data = Data(base64Encoded: image.base64) else { throw CocoaError(.fileReadCorruptFile) }
     let ext = UTType(mimeType: image.mediaType)?.preferredFilenameExtension ?? "png"
-    let folder = FileManager.default.temporaryDirectory.appending(path: "images-\(abs(image.base64.hashValue))")
+    let folder = FileManager.default.temporaryDirectory.appending(path: imageFolderName(data))
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     let url = folder.appending(path: "Image.\(ext)")
     try data.write(to: url, options: .atomic)
     return url
+}
+
+nonisolated func imageFolderName(_ data: Data) -> String {
+    "images-" + SHA256.hash(data: data).prefix(8).map { String(format: "%02x", $0) }.joined()
 }
 
 /// Whether a picked file is an image by its extension, which is what decides between inline

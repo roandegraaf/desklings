@@ -67,6 +67,29 @@ func uploadFilename(_ name: String) -> String {
     return String(cleaned.dropLast(ext.count + 1).prefix(127 - ext.count)) + "." + ext
 }
 
+/// `{"name": …, "base64": …}` for the uploads route, encoded `chunk` bytes at a time. A whole
+/// number of 3-byte groups per chunk, so no `=` padding lands mid-stream.
+nonisolated func writeUploadBody(name: String, data: Data, to file: URL, chunk: Int = 3 * 64 * 1024) throws {
+    precondition(chunk > 0 && chunk % 3 == 0)
+    FileManager.default.createFile(atPath: file.path(percentEncoded: false), contents: nil)
+    let handle = try FileHandle(forWritingTo: file)
+    defer { try? handle.close() }
+    try handle.write(contentsOf: Data(#"{"name":"#.utf8) + JSONEncoder().encode(name) + Data(#","base64":""#.utf8))
+    var start = data.startIndex
+    while start < data.endIndex {
+        let end = data.index(start, offsetBy: chunk, limitedBy: data.endIndex) ?? data.endIndex
+        try autoreleasepool { try handle.write(contentsOf: data[start..<end].base64EncodedData()) }
+        start = end
+    }
+    try handle.write(contentsOf: Data(#""}"#.utf8))
+}
+
+/// Mapped rather than read: the pages are the file's own and the system can drop them under
+/// pressure, where a copy in memory would count against the share extension's limit.
+nonisolated func mappedFile(_ url: URL) throws -> Data {
+    try Data(contentsOf: url, options: .alwaysMapped)
+}
+
 /// A file goes into the recipient's `~/uploads` first, so the message can say where it is.
 func deliverShare(_ item: SharedItem, to target: ShareTarget, instruction: String, client: SchermesClient) async throws {
     var path: String?
@@ -78,8 +101,9 @@ func deliverShare(_ item: SharedItem, to target: ShareTarget, instruction: Strin
 }
 
 /// A client off the stored address, for a caller with no `Session`: a background launch, the
-/// share extension, a Service. The cookie store carries the login; a 401 spends the stored
-/// password once, like `Session.run`.
+/// share extension, a Service. The cookie store carries the login, the app's own on an iPhone
+/// too (see `SchermesClient.cookieStore`); a 401 spends the stored password once, like
+/// `Session.run`. With TOTP on that cannot pass, and the owner is sent to the app to sign in.
 enum StoredDaemon {
     /// The iPhone app mirrors its address into the group for the extension. The Mac keeps to its
     /// own defaults: touching a group container it is not entitled to can raise a privacy panel.
@@ -95,14 +119,14 @@ enum StoredDaemon {
         defaults.string(forKey: addressKey).flatMap(Session.parse).map { SchermesClient(baseURL: $0) }
     }
 
-    static func run(_ client: SchermesClient, _ call: (SchermesClient) async throws -> Void) async throws {
+    static func run(
+        _ client: SchermesClient, credentials: Credentials = .keychain, _ call: (SchermesClient) async throws -> Void
+    ) async throws {
         do {
             try await call(client)
         } catch SchermesError.unauthorized {
-            let loggedIn = await Session.reLogin(client) { daemon in
-                await Task.detached { Keychain.read(for: daemon) }.value
-            }
-            guard loggedIn else { throw SchermesError.unauthorized }
+            let loggedIn = await Session.reLogin(client, stored: credentials.read)
+            guard loggedIn else { throw SchermesError.signInInApp }
             try await call(client)
         }
     }
@@ -324,7 +348,7 @@ final class ShareService: NSObject {
             guard url.isFileURL else { return .link(url) }
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             guard size <= maxShareBytes else { throw ShareError.tooBig }
-            return .file(name: url.lastPathComponent, data: try Data(contentsOf: url))
+            return .file(name: url.lastPathComponent, data: try mappedFile(url))
         }
         if let text = pasteboard.string(forType: .string), !text.isEmpty { return .text(text) }
         throw ShareError.nothing

@@ -2,8 +2,6 @@ import Foundation
 import Testing
 @testable import Schermes
 
-/// The same cases as `ui/src/thread.test.ts`, against the Swift mirror of those helpers.
-
 private func message(_ id: Int, role: MessageRole = .user, content: String? = nil,
                      toolCallId: String? = nil, toolCalls: [ToolCall]? = nil) -> Message {
     Message(
@@ -547,4 +545,73 @@ private func triggerLine(_ id: Int, _ content: String) -> Message {
     #expect(!message(10, role: .assistant, content: line.content).isRestoreLine)
     #expect(retryStart([message(1), message(2, role: .assistant), line], failure: 2) == 2,
             "a restore line after the failure is not the owner writing since")
+}
+
+// MARK: - Walking back
+
+private func page(from first: Int, count: Int) -> [Message] {
+    (first..<(first + count)).map { message($0) }
+}
+
+@Test func aFailedOlderPageWaitsOnRetryInsteadOfStoppingTheWalkForGood() {
+    var paging = OlderPages()
+    let newest = page(from: 100, count: PAGE)
+    paging.opened(newest)
+    #expect(paging.more)
+
+    #expect(paging.begin(newest) == 100)
+    #expect(paging.phase == .loading)
+    #expect(paging.begin(newest) == nil) // One page at a time.
+
+    paging.failed("The network connection was lost.")
+    #expect(paging.failure == "The network connection was lost.")
+    #expect(paging.more)
+    // The spinner's load is keyed on the oldest row, which the failure left alone, so nothing
+    // starts again until Retry.
+    #expect(paging.begin(newest) == nil)
+
+    paging.retry()
+    #expect(paging.failure == nil)
+    #expect(paging.begin(newest) == 100)
+
+    paging.landed(page(from: 50, count: PAGE))
+    #expect(paging.phase == .idle)
+    #expect(paging.more)
+}
+
+@Test func aCancelledOlderPageIsNotAFailureAndAShortPageEndsTheWalk() {
+    var paging = OlderPages()
+    let newest = page(from: 100, count: PAGE)
+    paging.opened(newest)
+
+    _ = paging.begin(newest)
+    paging.failed(nil)
+    #expect(paging.phase == .idle)
+    #expect(paging.begin(newest) == 100)
+
+    paging.landed(page(from: 90, count: 10))
+    #expect(!paging.more)
+    #expect(paging.begin(newest) == nil)
+}
+
+@Test func reopeningAThreadClearsAnOlderPageFailure() {
+    var paging = OlderPages()
+    let newest = page(from: 100, count: PAGE)
+    paging.opened(newest)
+    _ = paging.begin(newest)
+    paging.failed("Bad gateway")
+
+    paging.opened(newest)
+    #expect(paging.phase == .idle)
+    #expect(paging.begin(newest) == 100)
+}
+
+@Test func aThreadShorterThanAPageHasNothingOlderToAskFor() {
+    var paging = OlderPages()
+    let all = page(from: 1, count: 3)
+    paging.opened(all)
+    #expect(!paging.more)
+    #expect(paging.begin(all) == nil)
+    paging.retry()
+    #expect(paging.phase == .idle)
 }

@@ -7,6 +7,9 @@ nonisolated enum DesktopInputEvent: Sendable {
     case button(PointerButton, down: Bool, at: CGPoint)
     case wheel(WheelDirection, at: CGPoint)
     case key(UInt32, down: Bool)
+    /// A Command editing chord, to be sent as Control (`Keysym.controlShortcut`). Paste carries the
+    /// owner's clipboard over first.
+    case shortcut(UInt32)
 }
 
 private nonisolated let wheelStep: CGFloat = 16
@@ -48,6 +51,7 @@ final class DesktopInputNSView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.makeFirstResponder(self)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
         guard let window else { return }
         // Cmd-tabbing away leaves the desktop holding whatever was down, and nothing else would
         // ever tell it otherwise: a stuck Command on an agent's screen outlives the window.
@@ -117,13 +121,16 @@ final class DesktopInputNSView: NSView {
         event.charactersIgnoringModifiers?.first.flatMap(Keysym.of)
     }
 
+    /// Command never goes down on its own (see `modifierKeysyms`), so a Command chord is built
+    /// here: Super around a tap, because AppKit delivers no `keyUp` for a key pressed while Command
+    /// is down and a release that is never reported cannot be waited on.
     override func keyDown(with event: NSEvent) {
         guard let keysym = keysym(of: event) else { return }
-        // AppKit delivers no `keyUp` for a key pressed while Command is down, so a Command chord is
-        // sent as a tap rather than left waiting on a release that is never reported.
         guard !event.modifierFlags.contains(.command) else {
+            send(.key(Keysym.meta, down: true))
             send(.key(keysym, down: true))
             send(.key(keysym, down: false))
+            send(.key(Keysym.meta, down: false))
             return
         }
         downKeys[event.keyCode] = keysym
@@ -136,6 +143,28 @@ final class DesktopInputNSView: NSView {
         guard let keysym = downKeys.removeValue(forKey: event.keyCode) else { return }
         send(.key(keysym, down: false))
     }
+
+    /// The editing chords are taken before the menu bar sees them, so ⌘C copies on the agent's
+    /// desktop rather than nowhere in this window; ⌘Q, ⌘W and the rest still reach the menu.
+    /// Only while this view has the keyboard, since every view in the window is asked.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard event.type == .keyDown,
+              window?.firstResponder === self,
+              flags.contains(.command),
+              flags.isDisjoint(with: [.control, .option]),
+              let character = event.charactersIgnoringModifiers?.first,
+              let keysym = Keysym.controlShortcut(character, shift: flags.contains(.shift))
+        else { return super.performKeyEquivalent(with: event) }
+        send(.shortcut(keysym))
+        return true
+    }
+
+    /// The Edit menu's items, for a click rather than a key.
+    @objc func copy(_ sender: Any?) { send(.shortcut(0x63)) }
+    @objc func cut(_ sender: Any?) { send(.shortcut(0x78)) }
+    @objc func paste(_ sender: Any?) { send(.shortcut(Keysym.v)) }
+    override func selectAll(_ sender: Any?) { send(.shortcut(0x61)) }
 
     override func flagsChanged(with event: NSEvent) {
         let now = event.modifierFlags
@@ -160,11 +189,12 @@ final class DesktopInputNSView: NSView {
     }
 }
 
+/// Command is missing on purpose: held down on the agent it would turn ⌘C, sent as Control+C,
+/// into Control+Super+C. It is pressed around each Command chord instead, in `keyDown`.
 private nonisolated let modifierKeysyms: [(NSEvent.ModifierFlags, UInt32)] = [
     (.shift, Keysym.shift),
     (.control, Keysym.control),
     (.option, Keysym.alt),
-    (.command, Keysym.meta),
 ]
 
 #else
@@ -302,6 +332,14 @@ final class DesktopInputUIView: UIView, UIKeyInput {
 
     func deleteBackward() { tap(Keysym.backSpace) }
 
+    /// ⌘V on a hardware keyboard and the edit menu. Only while the keyboard is up, because only the
+    /// first responder is asked; the bar's paste button is the path that always works.
+    override func paste(_ sender: Any?) { send(.shortcut(Keysym.v)) }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        action == #selector(paste(_:)) || super.canPerformAction(action, withSender: sender)
+    }
+
     private func tap(_ keysym: UInt32) {
         send(.key(keysym, down: true))
         send(.key(keysym, down: false))
@@ -319,6 +357,16 @@ final class DesktopInputUIView: UIView, UIKeyInput {
         guard let key = press.key else { return false }
         let usage = key.keyCode.rawValue
         guard !Keysym.isModifier(usage) else { return true }
+
+        if key.modifierFlags.contains(.command),
+           key.modifierFlags.isDisjoint(with: [.control, .alternate]),
+           let character = key.charactersIgnoringModifiers.first,
+           let mapped = Keysym.controlShortcut(character, shift: key.modifierFlags.contains(.shift)) {
+            // ⌘V is the system's paste action, below, which reads the clipboard without a prompt.
+            guard !Keysym.isPaste(mapped) else { return false }
+            chord(key.modifierFlags.intersection(.shift)) { send(.shortcut(mapped)) }
+            return true
+        }
 
         let chorded = !key.modifierFlags.intersection([.control, .alternate, .command]).isEmpty
         let typed = chorded ? key.charactersIgnoringModifiers.first.flatMap(Keysym.of) : nil

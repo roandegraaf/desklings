@@ -3,6 +3,65 @@ export type HealthResponse = {
   setupRequired: boolean;
 };
 
+/** A 401 from login. `totpRequired` means the password was right and a code is still owed. */
+export type LoginError = {
+  error: string;
+  totpRequired?: true;
+};
+
+/** One signed-in client. `handle` names it for a revoke; the session id itself is the cookie
+ * and is never returned. */
+export type SessionEntry = {
+  handle: string;
+  createdAt: number;
+  lastSeenAt: number | null;
+  userAgent: string | null;
+  current: boolean;
+};
+
+export type TotpStatus = {
+  enabled: boolean;
+  pending: boolean;
+  recoveryCodesLeft: number;
+};
+
+export type TotpSetup = {
+  /** Base32, for typing into an authenticator by hand. */
+  secret: string;
+  uri: string;
+};
+
+export type TotpConfirmed = {
+  /** Shown once: only their hashes are kept. */
+  recoveryCodes: string[];
+};
+
+export type AuditAction =
+  | 'setup'
+  | 'login'
+  | 'login_failed'
+  | 'logout'
+  | 'password_changed'
+  | 'password_change_failed'
+  | 'session_revoked'
+  | 'totp_enabled'
+  | 'totp_disabled'
+  | 'recovery_code_used'
+  | 'settings_changed'
+  | 'provider_changed'
+  | 'model_changed'
+  | 'mcp_changed'
+  | 'rules_changed';
+
+export type AuditEvent = {
+  id: number;
+  at: number;
+  action: AuditAction;
+  ip: string | null;
+  userAgent: string | null;
+  detail: Record<string, unknown> | null;
+};
+
 export type ProviderSettings = {
   baseUrl: string;
   model: string;
@@ -38,6 +97,26 @@ export type PushSettings = {
   bundleId: string;
   keySet: boolean;
   sandbox: boolean;
+};
+
+/** The owner's clock: the IANA zone schedules and the idle window are read in. It defaults to
+ * the daemon's own zone. */
+export type TimeSettings = {
+  timezone: string;
+};
+
+export type TimeSettingsUpdate = {
+  timezone?: string;
+};
+
+/** How many days an agent's screenshots are kept before they expire. Zero keeps them forever.
+ * Pictures the owner sent are never pruned. */
+export type ImageSettings = {
+  imageRetentionDays: number;
+};
+
+export type ImageSettingsUpdate = {
+  imageRetentionDays?: number;
 };
 
 export type PushSettingsUpdate = {
@@ -131,17 +210,25 @@ export type ModelEntry = {
   apiKeySet: boolean;
   /** A JSON object merged under every request to this model, or empty. */
   extraBody: string;
+  /** In tokens, or null when unknown. Compaction sizes the replay from it. */
+  contextWindow: number | null;
+  /** False keeps every image out of its requests; each one becomes a line of text. */
+  vision: boolean;
   isDefault: boolean;
   isBackup: boolean;
   createdAt: number;
 };
 
-/** `POST /api/models` needs name, providerId and model; `PUT /api/models/:id` takes any of them. */
+/** `POST /api/models` needs name, providerId and model; `PUT /api/models/:id` takes any of them.
+ * A field left out keeps its value (a new model: no window, vision on); `contextWindow: null`
+ * clears the window. */
 export type ModelUpdate = {
   name?: string;
   providerId?: number;
   model?: string;
   extraBody?: string;
+  contextWindow?: number | null;
+  vision?: boolean;
 };
 
 export type ProviderTestResult = {
@@ -397,8 +484,9 @@ export type ComputerAction =
   | { action: 'key'; keys: string }
   | { action: 'clipboard_write'; text: string };
 
-/** An image on the wire: a screenshot the daemon took, or a picture the owner sent. */
-export type ImageAttachment = { mediaType: 'image/png' | 'image/jpeg'; base64: string };
+/** An image on the wire: a screenshot the daemon took, or a picture the owner sent. A screenshot
+ * pruned past the retention window keeps its media type, has empty `base64` and `expired: true`. */
+export type ImageAttachment = { mediaType: 'image/png' | 'image/jpeg'; base64: string; expired?: true };
 
 /** A screenshot travels as base64 in JSON; see docs/architecture.md for why. */
 export type ComputerResult = {
@@ -553,8 +641,9 @@ export type IdleSettings = {
 /** `PUT /api/agents/:name/idle`: what is left out keeps its value. */
 export type IdleSettingsUpdate = Partial<Omit<IdleSettings, 'pausedReason'>>;
 
-/** `due` is a pass whose pre-check matched and that has not run yet. */
-export type IdlePassOutcome = 'skipped' | 'due' | 'ran' | 'wasted';
+/** `due` is a pass whose pre-check matched and that has not run yet. `interrupted` is one a
+ * daemon restart cut short; the tokens it had spent by then are counted. */
+export type IdlePassOutcome = 'skipped' | 'due' | 'ran' | 'wasted' | 'interrupted';
 
 export type IdlePass = {
   id: number;
@@ -564,7 +653,7 @@ export type IdlePass = {
   outcome: IdlePassOutcome;
   tokens: number;
   endedAt: number | null;
-  /** Why a matched pass did not run (budget, busy, no model). */
+  /** Why a matched pass did not run (budget, busy, no model), or why it stopped early. */
   reason: string | null;
   outputs: IdleOutput[];
 };

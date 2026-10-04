@@ -32,8 +32,26 @@ docker compose exec schermes /opt/schermes/infra/desktop/check.sh
 docker compose logs -f schermes
 ```
 
-Point the app at `http://<host>:7777`, set the owner password, store the provider settings,
-create an agent.
+On a fresh daemon `smoke.sh` claims the owner itself, with `SCHERMES_SMOKE_PASSWORD`, reading
+the first-run setup token from the logs. To claim it with your own password, do it before
+running smoke. A daemon with no owner prints the token in its log, and setup needs it:
+
+```sh
+docker compose logs schermes | grep 'first-run setup token'
+# {"ts":"…","level":"info","msg":"first-run setup token","code":"<token>"}
+```
+
+Every boot without an owner prints a new one, so use the newest line. On a bare Debian host it
+is in `journalctl -u schermes`. The app's setup screen asks for the password and that code.
+Without the app, setup is one POST:
+
+```sh
+curl -sS http://<host>:7777/api/auth/setup -H 'content-type: application/json' \
+  -d '{"password":"<at least 8 characters>","setupToken":"<token>"}'
+```
+
+Then point the app at `http://<host>:7777`, sign in, store the provider settings, and create an
+agent.
 
 ### Unraid
 
@@ -49,15 +67,25 @@ the Docker tab, **Add Container**, switch to advanced view, and fill in:
 | Path | container `/var/lib/schermes`, host `/mnt/cache/appdata/schermes/data` |
 | Path | container `/home`, host `/mnt/cache/appdata/schermes/home` |
 | Path | container `/srv/schermes`, host `/mnt/cache/appdata/schermes/shared` |
+| Path | container `/var/lib/schermes-sandboxes`, host `/mnt/cache/appdata/schermes/sandboxes` |
 | Path (push, optional) | container `/run/secrets/AuthKey_<KEYID>.p8`, host `/mnt/cache/appdata/schermes/AuthKey_<KEYID>.p8`, read only |
 | Variable (push, optional) | `SCHERMES_APNS_KEY_FILE` = `/run/secrets/AuthKey_<KEYID>.p8` |
-| Extra parameters | `--hostname=schermes --init --shm-size=1g --security-opt=seccomp=unconfined` |
+| Extra parameters | `--hostname=schermes --init --shm-size=1g --security-opt=seccomp=unconfined --device=/dev/fuse --device=/dev/net/tun` |
 
-The extra parameters are the four load-bearing compose settings below, spelled for `docker
-run`. The paths are plain bind mounts: the entrypoint fixes their ownership on every start, so
+The extra parameters are the load-bearing compose settings below, spelled for `docker run`.
+Without the two devices every agent's sandbox fails to start, and every agent command fails
+with it: an agent never falls back to running outside its sandbox. The sandboxes path holds
+each agent's writable root layer and needs a filesystem with user xattrs. A btrfs or xfs pool
+is fine; `/mnt/user` is not. The kernel must allow unprivileged user namespaces. See
+[Architecture § Per-agent sandbox](architecture.md#per-agent-sandbox).
+
+The paths are plain bind mounts: the entrypoint fixes their ownership on every start, so
 an empty appdata directory is fine. Keep them on the pool (`/mnt/cache/...`, or whatever the
 pool is called) rather than under `/mnt/user/...`: that path is a FUSE filesystem, and SQLite
 memory-maps its WAL index, which FUSE handles badly. Updates are Unraid's own update button.
+
+On first start the container's log (the Docker tab, the container's icon, **Logs**) has a
+`first-run setup token` line. Claim the owner with its `code`, using the curl call above.
 
 For push, drop the `AuthKey_<KEYID>.p8` from the developer portal into the appdata directory
 (the `appdata` SMB share, or `cat > ... <<'EOF'` in the web terminal) and map it under its own
@@ -66,8 +94,9 @@ The daemon runs as `schermes`, not root, so the file has to be world-readable (`
 appdata directory is what keeps it private. The boot log says `push key loaded`, or `push key
 not read` with the reason.
 
-Five settings in the `schermes` service are load-bearing and have to survive any rewrite: the
-three named volumes, `hostname`, `init` and `seccomp=unconfined`.
+Seven settings in the `schermes` service are load-bearing and have to survive any rewrite: the
+four named volumes, `hostname`, `init`, `seccomp=unconfined` and the `/dev/fuse` and
+`/dev/net/tun` devices.
 [Architecture § Docker](architecture.md#docker) says why each one is there.
 
 ### Upgrading
@@ -82,9 +111,10 @@ migration step. The daemon runs from TypeScript source — Node 24 strips the ty
 there is no build step for it either. Everything durable lives in the named volumes, so the
 container is disposable.
 
-A replaced container does lose the running agent desktops, because they live in its pid
-namespace. The daemon respawns them on boot from the database, recreates the Linux users over
-their persisted homes, and an agent caught mid tool call has that call marked interrupted and
+A replaced container does lose the running agent desktops and sandboxes, because they live in
+its pid namespace. The daemon respawns them on boot from the database, recreates the Linux users
+over their persisted homes, restarts each sandbox over its persisted layer (so packages an agent
+installed are still there), and an agent caught mid tool call has that call marked interrupted and
 answered, and is left waiting for you rather than resuming on its own.
 
 ## Bare Debian 13, without Docker
@@ -95,8 +125,8 @@ git clone <this repository> /opt/schermes
 systemctl start schermes
 ```
 
-`/opt/schermes` is not a preference. The sudoers rule the script writes names
-`/opt/schermes/infra/desktop/create-agent-user.sh` literally, and the daemon resolves the
+`/opt/schermes` is not a preference. The sudoers rules the script writes name the scripts in
+`/opt/schermes/infra/desktop` literally, and the daemon resolves the
 desktop scripts relative to its own source path. Install it somewhere else and agent creation
 fails at the first `sudo`.
 
@@ -112,7 +142,7 @@ script again (it is idempotent, so a second run installs nothing it already has)
 
 ## What to back up
 
-Under Docker, the three named volumes, which hold the paths below:
+Under Docker, the four named volumes, which hold the paths below:
 
 - `schermes-data`, mounted at `/var/lib/schermes`. Both files in it matter: `schermes.db` holds
   the owner, sessions, settings, agents, conversations, messages and events, and `master.key`
@@ -122,6 +152,9 @@ Under Docker, the three named volumes, which hold the paths below:
   uploads and Chromium profiles. A restore without them rebuilds the users and desktops from
   the surviving agent rows, with empty homes.
 - `schermes-shared`, mounted at `/srv/schermes`. The group-writable cross-agent directory.
+- `schermes-sandboxes`, mounted at `/var/lib/schermes-sandboxes`. Each agent's writable root
+  layer (what it installed or changed outside its home) and the subordinate-id block it is
+  owned by. Without it agents start over on a clean image.
 
 The simplest copy is out of the running container, which reads them all as root:
 
@@ -129,9 +162,12 @@ The simplest copy is out of the running container, which reads them all as root:
 docker compose cp schermes:/var/lib/schermes ./backup/data
 docker compose cp schermes:/home ./backup/home
 docker compose cp schermes:/srv/schermes ./backup/shared
+docker compose exec -T schermes tar --xattrs --numeric-owner -C /var/lib -cf - schermes-sandboxes \
+  > ./backup/sandboxes.tar
 ```
 
-On a bare host the same three paths, straight off the disk.
+The layers go through `tar` because they only survive a copy that keeps numeric owners and the
+overlay's xattrs. On a bare host, the same four paths straight off the disk.
 
 ## A linked domain
 
@@ -190,6 +226,7 @@ cookie and the input-ownership state before it pipes a byte.
 anything but the web port is bound outside loopback. Run it after any change to the stack.
 
 Do not put schermes on the public internet without a proxy that authenticates in front of it.
-Agents have passwordless sudo on this machine — that is the product, not an oversight — so the
-owner password is the only thing between a visitor and root. See the
+Agents have passwordless sudo inside their sandboxes — that is the product, not an oversight —
+and the owner can tell any of them to run anything, so the owner password is the only thing
+between a visitor and every agent's machine. See the
 [security model](architecture.md#security-model).
